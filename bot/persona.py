@@ -79,7 +79,7 @@ class Persona:
 
     # ---------- 프롬프트 ----------
     def system_prompt(self, target_name: str, facts: list[str], now: datetime,
-                      scene: str = "", view: str = "") -> str:
+                      scene: str = "", view: str = "", mood: str = "") -> str:
         d = self.data
         name = self.name
         rules = _block(self.common.get("rules")).replace("{name}", name)
@@ -136,6 +136,9 @@ class Persona:
 
 [현재 시각]
 {now_str}
+
+[현재 기분/상태]
+{mood or '- 평온하고 평범한 상태'}
 
 [규칙]
 {rules}"""

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .llm import LLM, LLMResult
 from .memory import Memory
+from .mood import Mood
 from .persona import Persona
 
 log = logging.getLogger("chat")
@@ -96,8 +97,9 @@ MODES = [
 ]
 
 
-def pick_length(text: str, activity: int, priority: bool, free: bool = False) -> LengthMode:
-    """대상 말의 길이/질문 여부, 채팅방 활발함, 멘션 여부로 가중치를 바꿔 랜덤 선택."""
+def pick_length(text: str, activity: int, priority: bool, free: bool = False,
+                bias: tuple = (1.0, 1.0, 1.0, 1.0)) -> LengthMode:
+    """대상 말의 길이/질문 여부, 채팅방 활발함, 멘션 여부, 현재 기분으로 가중치를 바꿔 랜덤 선택."""
     body = re.sub(r"^\(.*?에 답장\)\s*", "", text)
     n = len(body.strip())
     if free:
@@ -118,6 +120,7 @@ def pick_length(text: str, activity: int, priority: bool, free: bool = False) ->
         w = [w[0] * 0.7, w[1], w[2] * 1.3, w[3] * 1.5]
     if priority:                             # 직접 부르면 한 단어로 때우지 않는다
         w = [w[0] * 0.25, w[1], w[2] * 1.3, w[3]]
+    w = [max(0.001, x * b) for x, b in zip(w, bias)]    # 기분 반영 (졸림 → 짧게, 신남 → 길게 등)
     return random.choices(MODES, weights=w, k=1)[0]
 
 
@@ -130,6 +133,7 @@ class ChatEngine:
         self.tz = ZoneInfo(settings.get("timezone", "Asia/Seoul"))
         self.names: dict[int, tuple[str, str | None]] = {}   # user_id -> (실명, 호칭)
         self.views: dict[int, str] = {}                      # user_id -> 캐릭터가 가진 인식
+        self.mood = Mood(memory, persona, self.tz)           # 기분/상태 점수와 감정
         self._bg: set[asyncio.Task] = set()
 
     def now(self) -> datetime:
@@ -139,6 +143,7 @@ class ChatEngine:
     async def load_names(self) -> None:
         self.names = await self.mem.all_real_names()
         self.views = await self.mem.all_views()
+        await self.mood.load()
 
     def label(self, user_id: int, author: str) -> str:
         """프롬프트에서 쓸 이름: 등록된 실명 > 정리한 닉네임"""
@@ -224,7 +229,8 @@ class ChatEngine:
             merged[-1]["content"] += "\n\n" + hint
         else:
             merged.append({"role": "user", "content": hint})
-        system = self.persona.system_prompt(target_label, facts, self.now(), scene, view)
+        system = self.persona.system_prompt(
+            target_label, facts, self.now(), scene, view, self.mood.describe())
         return [{"role": "system", "content": system}] + self.persona.example_messages() + merged
 
     @staticmethod
@@ -280,7 +286,7 @@ class ChatEngine:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, target_id)
         who = self.label(target_id, target_name)
         call = self.call_name(target_id, target_name)
-        mode = pick_length(target_text, activity, priority or dm)
+        mode = pick_length(target_text, activity, priority or dm, bias=self.mood.length_bias)
         own_text, banned = self._own_block(own)
 
         parts = [
@@ -309,14 +315,17 @@ class ChatEngine:
             channel_id, 0, self.persona.name, "assistant", "\n".join(bubbles),
             dm_user_id=target_id if dm else None,
         )
-        await self._record("reply", res, target_id, target_name, channel_id, f"[{mode.label}] " + " / ".join(bubbles))
+        emo = self.mood.current().label
+        await self._record("reply", res, target_id, target_name, channel_id,
+                           f"[{emo}/{mode.label}] " + " / ".join(bubbles))
+        self.mood.on_reply()
         self._schedule_extract(channel_id, target_id, target_name)
         return bubbles
 
     # ---------- 채널이 조용할 때 먼저 말 걸기 ----------
     async def initiate(self, channel_id: int, instruction: str, idle_minutes: int, unanswered: int) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, None)
-        mode = pick_length("", activity, False, free=True)
+        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias)
         own_text, banned = self._own_block(own)
         parts = [
             "[상황 메모 — 이 메모 자체는 절대 언급하지 마라]",
@@ -341,7 +350,7 @@ class ChatEngine:
     async def proactive(self, channel_id: int, user_id: int, user_name: str, idle_hours: float) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, user_id)
         who = self.label(user_id, user_name)
-        mode = pick_length("", activity, False, free=True)
+        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias)
         own_text, banned = self._own_block(own)
         hint = "\n".join([
             "[상황 메모 — 이 메모 자체는 절대 언급하지 마라]",
@@ -374,7 +383,7 @@ class ChatEngine:
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
         text = re.sub(r"^#+\s*", "", text, flags=re.M)
         text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
-        parts = [humanize(p) for p in re.split(r"\n+", text)]
+        parts = [self.mood.filter_text(humanize(p)) for p in re.split(r"\n+", text)]
         parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])
         if len(parts) > limit:
@@ -419,5 +428,5 @@ class ChatEngine:
 
     def typing_delay(self, text: str) -> float:
         t = self.s["typing"]
-        d = len(text) / max(t["chars_per_second"], 1)
-        return min(max(d, t["min_delay"]), t["max_delay"])
+        d = len(text) / max(t["chars_per_second"] * self.mood.speed, 1)     # 신나면 빠르게, 졸리면 느리게
+        return min(max(d, t["min_delay"]), t["max_delay"] * (1.5 if self.mood.speed < 0.8 else 1.0))

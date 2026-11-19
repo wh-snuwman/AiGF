@@ -18,6 +18,7 @@ from .chat import ChatEngine
 from .config import discord_token, load_settings
 from .llm import LLM
 from .memory import Memory
+from .mood import EMO, EMOTIONS
 from .persona import Persona
 
 settings = load_settings()
@@ -217,7 +218,16 @@ async def send_bubbles(
 
 
 def next_cooldown() -> float:
-    return bot.cooldown * (1 + random.random() * gcfg["cooldown_jitter"])
+    # 기분에 따라 쿨다운이 달라진다 (신나면 짧게, 졸리면 길게)
+    return bot.cooldown * engine.mood.cooldown_mult * (1 + random.random() * gcfg["cooldown_jitter"])
+
+
+def is_directed(text: str) -> bool:
+    """멘션이 아니어도 캐릭터 이름/봇 이름을 불렀으면 봇에게 하는 말로 본다."""
+    names = {persona.name, persona.nickname}
+    if bot.user:
+        names.add(bot.user.display_name)
+    return any(n and n in text for n in names)
 
 
 @bot.event
@@ -254,6 +264,7 @@ async def on_message(message: discord.Message) -> None:
         return
     await memory.add_message(message.channel.id, message.author.id, message.author.display_name, "user", text)
     mark_human_activity(message.channel.id)
+    engine.mood.observe(text, directed=mentioned or is_directed(text))
     if bot.paused:
         return
     bot.pending.setdefault(message.channel.id, []).append(
@@ -271,6 +282,7 @@ def mark_human_activity(channel_id: int) -> None:
     if st.sent > 0:
         n = st.sent
         stage = st.stage
+        engine.mood.on_return(n)
         bot.return_note[channel_id] = (
             f"네가 먼저 말을 꺼냈는데 {n}번이나 아무도 답하지 않았고, 한참 뒤에야 사람들이 돌아왔다"
             + (f" (그 사이 단계: {stage}). " if stage > n else ". ")
@@ -287,6 +299,7 @@ async def handle_dm(message: discord.Message, text: str) -> None:
     uid = message.author.id
     await memory.set_dm_channel(uid, message.channel.id)
     await memory.add_message(message.channel.id, uid, message.author.display_name, "user", text)
+    engine.mood.observe(text, directed=True)
     bot.dm_buffer.setdefault(uid, []).append(text)
     t = bot.dm_tasks.get(uid)
     if t and not t.done() and uid not in bot.dm_generating:
@@ -391,7 +404,7 @@ async def group_loop() -> None:
         if prio:
             target = prio[-1]
         else:
-            if random.random() > gcfg["reply_chance"]:
+            if random.random() > min(1.0, gcfg["reply_chance"] * engine.mood.reply_mult):
                 items[:] = [p for p in items if p not in ready]   # 이번 메시지들은 그냥 넘어간다
                 continue
             target = random.choice(ready)
@@ -430,6 +443,7 @@ async def run_idle_event(channel_id: int, st: IdleState, force: bool = False) ->
 
     if name == "silent":
         # 서운해서 일부러 말을 안 한다 (자기도 계속 답장 안 침). 단계만 올라간다.
+        engine.mood.on_ignored(st.stage, "sulk")
         st.stage += 1
         st.next_at = now + rand_minutes(icfg["followup_after_min"]) * growth
         return "silent (이번엔 아무 말도 하지 않음)"
@@ -442,6 +456,8 @@ async def run_idle_event(channel_id: int, st: IdleState, force: bool = False) ->
         st.next_at = now + 600
         return "생성 결과 없음"
     await send_bubbles(channel, bubbles)
+    if st.stage >= 1:                       # 앞서 보낸 말을 무시당한 뒤라서 외로움/서운함이 쌓인다
+        engine.mood.on_ignored(st.stage, name)
     st.stage += 1
     st.sent += 1
     st.day_count += 1
@@ -639,6 +655,7 @@ async def swap_character(
             "없는 캐릭터예요. 목록: " + ", ".join(sorted(ids)), ephemeral=True)
         return
     persona.load(character)
+    engine.mood.reset()                 # 새 캐릭터의 기준 기분으로 시작
     await memory.kv_set("character", persona.char_id)
     if clear_history:
         await memory.clear_all_history()
@@ -669,6 +686,7 @@ async def status(interaction: discord.Interaction) -> None:
         f"- 캐릭터: **{persona.name}** (`{persona.char_id}`)\n"
         f"- 모델: `{llm.model}`\n"
         f"- 상태: {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
+        f"- 기분: {engine.mood.current().label}\n"
         f"- 쿨다운: {bot.cooldown:g}초 (+최대 {int(gcfg['cooldown_jitter'] * 100)}% 랜덤)\n"
         f"- 대화 채널: {ch}\n"
         f"- 대기 중 메시지: {pend}개 | 저장된 기록 {fmt(total_msgs)}개 ({n_ch}개 채널)\n"
@@ -846,6 +864,74 @@ async def manage_views(
     await memory.set_view(user.id, text)
     engine.views[user.id] = text
     await interaction.response.send_message(f"**{who}** = {text}\n(이제부터 이 인식대로 대해요)", ephemeral=True)
+
+
+# ---- 기분/상태 ----
+async def emotion_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    cur = current.lower()
+    return [
+        app_commands.Choice(name=f"{e.label} ({e.id})", value=e.id)
+        for e in EMOTIONS if cur in e.id or cur in e.label
+    ][:25]
+
+
+def bar(value: int, lo: int = 0, hi: int = 100, width: int = 10) -> str:
+    n = round((value - lo) / (hi - lo) * width)
+    n = max(0, min(width, n))
+    return "█" * n + "░" * (width - n)
+
+
+@bot.tree.command(name="기분", description="캐릭터의 기분/상태 점수를 확인하거나 감정을 바꿔요")
+@app_commands.describe(action="보기/설정/초기화/목록", emotion="설정할 감정 (설정 시)", minutes="유지 시간(분, 기본 30)")
+@app_commands.rename(action="동작", emotion="감정", minutes="분")
+@app_commands.choices(action=[
+    app_commands.Choice(name="보기", value="show"),
+    app_commands.Choice(name="설정", value="set"),
+    app_commands.Choice(name="초기화", value="reset"),
+    app_commands.Choice(name="목록", value="list"),
+])
+@app_commands.autocomplete(emotion=emotion_autocomplete)
+async def mood_cmd(
+    interaction: discord.Interaction, action: app_commands.Choice[str],
+    emotion: Optional[str] = None, minutes: Optional[app_commands.Range[int, 1, 720]] = None,
+) -> None:
+    m = engine.mood
+    if action.value == "list":
+        score = " ".join(e.label for e in EMOTIONS if not e.special)
+        event = " ".join(e.label for e in EMOTIONS if e.special)
+        await interaction.response.send_message(
+            f"**감정 30종**\n점수로 정해지는 감정 ({sum(1 for e in EMOTIONS if not e.special)}): {score}\n"
+            f"대화 사건으로 발동하는 감정 ({sum(1 for e in EMOTIONS if e.special)}): {event}", ephemeral=True)
+        return
+    if action.value == "reset":
+        m.reset()
+        await interaction.response.send_message("기분을 기준값으로 되돌렸어요.", ephemeral=True)
+        return
+    if action.value == "set":
+        if not emotion or emotion not in EMO:
+            await interaction.response.send_message(
+                "감정을 골라주세요. (`/기분 동작:목록` 으로 확인)", ephemeral=True)
+            return
+        m.set_emotion(emotion, minutes or 30)
+        await interaction.response.send_message(
+            f"감정을 **{EMO[emotion].label}**(으)로 {minutes or 30}분 동안 설정했어요.", ephemeral=True)
+        return
+    snap = m.snapshot()
+    e, sc = snap["emotion"], snap["scores"]
+    lines = [
+        f"**{persona.name}의 기분: {e.label}** (강도 {int(snap['intensity'] * 100)}%)"
+        + (f" · 고정 {snap['override_min']}분 남음" if snap["override_min"] else ""),
+        "```",
+        f"기분   {bar(sc['mood'], -100, 100)} {sc['mood']:+d}",
+        f"에너지 {bar(sc['energy'])} {sc['energy']}",
+        f"짜증   {bar(sc['irritation'])} {sc['irritation']}",
+        f"외로움 {bar(sc['lonely'])} {sc['lonely']}",
+        f"흥미   {bar(sc['interest'])} {sc['interest']}",
+        "```",
+        f"말투: {e.tone}",
+        f"-# 타이핑 속도 x{e.speed:g} · 끼어들기 x{e.reply:g} · 쿨다운 x{e.cooldown:g}",
+    ]
+    await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
 
 
 # ---- 11. 혼잣말 (조용할 때 먼저 말 걸기) ----
