@@ -143,7 +143,7 @@ class GirlBot(discord.Client):
         await memory.init()
         await self.load_state()
         await engine.load_names()
-        await self.tree.sync()
+        # 슬래시 명령 동기화는 on_ready 에서 서버별로 한다 (바로 반영되고, 옛 전역 명령과 중복 표시되지 않음)
         # 대화가 바쁠 때는 기억 추출을 미룬다 (GPU 양보)
         engine.busy_check = lambda: bool(self.busy) or any(self.pending.values()) or self.gpu_lock.locked()
         group_loop.start()
@@ -329,9 +329,49 @@ def msg_text_plain(msg: discord.Message) -> str:
     return (msg.clean_content or "").strip()
 
 
+_ALL_COMMANDS: list = []       # 전역에서 비우기 전에 보관해 두는 명령 목록 (새 서버에 들어갈 때 사용)
+_cmds_synced = False
+_synced_guilds: set[int] = set()
+
+
+async def sync_commands() -> None:
+    """슬래시 명령을 봇이 들어가 있는 모든 서버에 즉시 동기화한다.
+    전역 등록은 반영이 늦고 옛 목록이 캐시되는 경우가 있어서, 서버별로 등록하고 전역 명령은 비워서 중복을 막는다."""
+    global _cmds_synced
+    if not _ALL_COMMANDS:
+        _ALL_COMMANDS.extend(bot.tree.get_commands())
+    try:
+        for g in bot.guilds:
+            if g.id in _synced_guilds:                 # 재접속(on_ready 반복) 때 다시 동기화하지 않는다 (호출 제한 방지)
+                continue
+            bot.tree.copy_global_to(guild=g)
+            synced = await bot.tree.sync(guild=g)
+            _synced_guilds.add(g.id)
+            log.info("슬래시 명령 %d개 동기화: 서버 '%s' → %s", len(synced), g.name, ", ".join(c.name for c in synced))
+        if not _cmds_synced:
+            bot.tree.clear_commands(guild=None)       # 전역 명령(옛 버전 포함)을 비운다
+            await bot.tree.sync()
+        _cmds_synced = True
+    except Exception:  # noqa: BLE001
+        log.exception("슬래시 명령 동기화 실패 — 봇 초대 시 applications.commands 권한을 선택했는지 확인하세요")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild) -> None:
+    """새 서버에 초대되면 그 서버에도 명령을 등록한다."""
+    for c in _ALL_COMMANDS:
+        bot.tree.add_command(c, guild=guild, override=True)
+    try:
+        await bot.tree.sync(guild=guild)
+        _synced_guilds.add(guild.id)
+    except Exception:  # noqa: BLE001
+        log.exception("새 서버 명령 동기화 실패")
+
+
 @bot.event
 async def on_ready() -> None:
     log.info("로그인: %s | 모델: %s | 캐릭터: %s", bot.user, llm.model, persona.name)
+    await sync_commands()
     refresh_emojis()
     asyncio.create_task(warmup_and_report())   # 첫 응답이 느리지 않도록 모델을 미리 올리고 GPU 적재 상태를 점검한다
 
