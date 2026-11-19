@@ -76,6 +76,7 @@ class ChatEngine:
         self.mem = memory
         self.tz = ZoneInfo(settings.get("timezone", "Asia/Seoul"))
         self.names: dict[int, tuple[str, str | None]] = {}   # user_id -> (실명, 호칭)
+        self.views: dict[int, str] = {}                      # user_id -> 캐릭터가 가진 인식
         self._bg: set[asyncio.Task] = set()
 
     def now(self) -> datetime:
@@ -84,6 +85,7 @@ class ChatEngine:
     # ---------- 이름 ----------
     async def load_names(self) -> None:
         self.names = await self.mem.all_real_names()
+        self.views = await self.mem.all_views()
 
     def label(self, user_id: int, author: str) -> str:
         """프롬프트에서 쓸 이름: 등록된 실명 > 정리한 닉네임"""
@@ -112,7 +114,8 @@ class ChatEngine:
             facts = await self.mem.get_facts(uid, 3)
             extra = f", 부를 때: {call}" if call != lab else ""
             tail = f" / 기억: {'; '.join(facts)}" if facts else ""
-            lines.append(f"- {lab} ({n}회 발언{extra}){tail}")
+            view = f" / 네가 보는 인식: {self.views[uid]}" if uid in self.views else ""
+            lines.append(f"- {lab} ({n}회 발언{extra}){view}{tail}")
 
         flow: list[str] = []
         for h in users[-6:]:
@@ -160,12 +163,12 @@ class ChatEngine:
         return hist, merged, own, scene, activity, facts, known
 
     def _assemble(self, target_label: str, facts: list[str], scene: str,
-                  merged: list[dict[str, str]], hint: str) -> list[dict[str, str]]:
+                  merged: list[dict[str, str]], hint: str, view: str = "") -> list[dict[str, str]]:
         if merged and merged[-1]["role"] == "user":
             merged[-1]["content"] += "\n\n" + hint
         else:
             merged.append({"role": "user", "content": hint})
-        system = self.persona.system_prompt(target_label, facts, self.now(), scene)
+        system = self.persona.system_prompt(target_label, facts, self.now(), scene, view)
         return [{"role": "system", "content": system}] + self.persona.example_messages() + merged
 
     @staticmethod
@@ -204,7 +207,7 @@ class ChatEngine:
             parts.append(f"- 추가 상황: {extra_note}")
         if can_skip:
             parts.append("- 이 말이 너와 상관없고 끼어들 이유도 없으면 다른 말 없이 SKIP 이라고만 출력해라.")
-        msgs = self._assemble(who, facts, scene, merged, "\n".join(parts))
+        msgs = self._assemble(who, facts, scene, merged, "\n".join(parts), self.views.get(target_id, ""))
 
         res = await self.llm.chat(msgs, num_predict=mode.num_predict)
         if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
@@ -257,7 +260,7 @@ class ChatEngine:
             f"- 길이: [{mode.label}] {mode.desc}",
             self._own_block(own),
         ])
-        msgs = self._assemble(who, facts, scene, merged, hint)
+        msgs = self._assemble(who, facts, scene, merged, hint, self.views.get(user_id, ""))
         res = await self.llm.chat(msgs, temperature=1.0, num_predict=mode.num_predict)
         bubbles = self.to_bubbles(res.text, known, mode.max_bubbles)
         if bubbles:

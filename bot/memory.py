@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS user_names (
     call_name TEXT                     -- 부를 때 쓸 호칭 (예: 민수야). 비우면 real_name
 );
 
+CREATE TABLE IF NOT EXISTS user_views (
+    user_id INTEGER PRIMARY KEY,
+    view TEXT NOT NULL                 -- 캐릭터가 그 사람에 대해 가진 인식/이미지 (관리자가 수정)
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -128,6 +133,25 @@ class Memory:
         assert self.db
         cur = await self.db.execute("SELECT user_id, real_name, call_name FROM user_names")
         return {u: (r, c) for u, r, c in await cur.fetchall()}
+
+    # ---------- 캐릭터가 가진 '인식' ----------
+    async def set_view(self, user_id: int, view: str) -> None:
+        assert self.db
+        await self.db.execute(
+            "INSERT INTO user_views(user_id, view) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET view=excluded.view", (user_id, view))
+        await self.db.commit()
+
+    async def del_view(self, user_id: int) -> bool:
+        assert self.db
+        cur = await self.db.execute("DELETE FROM user_views WHERE user_id=?", (user_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def all_views(self) -> dict[int, str]:
+        assert self.db
+        cur = await self.db.execute("SELECT user_id, view FROM user_views")
+        return {u: v for u, v in await cur.fetchall()}
 
     async def last_message_ts(self, channel_id: int) -> float | None:
         assert self.db

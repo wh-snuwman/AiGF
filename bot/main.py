@@ -735,7 +735,57 @@ async def manage_names(
         ephemeral=True)
 
 
-# ---- 10. 혼잣말 (조용할 때 먼저 말 걸기) ----
+# ---- 10. 인식 (캐릭터가 그 사람을 어떻게 보는지) ----
+@bot.tree.command(name="인식", description="캐릭터가 각 유저를 어떻게 생각하는지(인식)를 설정해요. 예: 대호 = 멍청한 개발자")
+@app_commands.describe(action="설정/삭제/보기/목록", user="대상 유저",
+                       view="캐릭터가 그 유저에 대해 가진 인식 (예: 멍청한 개발자. 버그만 만들고 허세 부림)")
+@app_commands.rename(action="동작", user="유저", view="내용")
+@app_commands.choices(action=[
+    app_commands.Choice(name="설정", value="set"),
+    app_commands.Choice(name="삭제", value="del"),
+    app_commands.Choice(name="보기", value="show"),
+    app_commands.Choice(name="목록", value="list"),
+])
+async def manage_views(
+    interaction: discord.Interaction, action: app_commands.Choice[str],
+    user: Optional[discord.User] = None, view: Optional[str] = None,
+) -> None:
+    if action.value == "list":
+        if not engine.views:
+            await interaction.response.send_message("설정된 인식이 없어요.", ephemeral=True)
+            return
+        def nm(uid: int) -> str:
+            u = bot.get_user(uid)
+            return engine.label(uid, u.display_name if u else str(uid))
+
+        body = "\n".join(f"{nm(uid)} (<@{uid}>) = {v}" for uid, v in engine.views.items())
+        await interaction.response.send_message(f"**{persona.name}의 인식**\n{body}"[:1990], ephemeral=True)
+        return
+    if user is None:
+        await interaction.response.send_message("유저를 지정해주세요.", ephemeral=True)
+        return
+    who = engine.label(user.id, user.display_name)
+    if action.value == "show":
+        v = engine.views.get(user.id)
+        await interaction.response.send_message(
+            f"{who} = {v}" if v else f"{who}에 대한 인식이 설정돼 있지 않아요.", ephemeral=True)
+        return
+    if action.value == "del":
+        removed = await memory.del_view(user.id)
+        engine.views.pop(user.id, None)
+        await interaction.response.send_message(
+            f"{who}에 대한 인식을 지웠어요." if removed else "설정된 인식이 없어요.", ephemeral=True)
+        return
+    if not view or not view.strip():
+        await interaction.response.send_message("인식 내용을 입력해주세요.", ephemeral=True)
+        return
+    text = view.strip()[:300]
+    await memory.set_view(user.id, text)
+    engine.views[user.id] = text
+    await interaction.response.send_message(f"**{who}** = {text}\n(이제부터 이 인식대로 대해요)", ephemeral=True)
+
+
+# ---- 11. 혼잣말 (조용할 때 먼저 말 걸기) ----
 @bot.tree.command(name="혼잣말", description="채널이 조용할 때 혼자 말 거는 기능을 켜고 끄거나, 지금 바로 시험해요")
 @app_commands.describe(action="켜기/끄기/지금/상태", channel="'지금'을 실행할 채널 (생략하면 현재 채널)")
 @app_commands.rename(action="동작", channel="채널")
@@ -787,7 +837,7 @@ async def idle_cmd(
     await interaction.followup.send(f"실행 결과: {result}", ephemeral=True)
 
 
-# ---- 11. 리로드 ----
+# ---- 12. 리로드 ----
 @bot.tree.command(name="리로드", description="캐릭터/공통 규칙 yaml 파일을 다시 불러와요")
 async def reload_persona(interaction: discord.Interaction) -> None:
     persona.reload()

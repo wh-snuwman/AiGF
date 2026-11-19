@@ -78,7 +78,8 @@ class Persona:
         return self.data.get("greeting", "")
 
     # ---------- 프롬프트 ----------
-    def system_prompt(self, target_name: str, facts: list[str], now: datetime, scene: str = "") -> str:
+    def system_prompt(self, target_name: str, facts: list[str], now: datetime,
+                      scene: str = "", view: str = "") -> str:
         d = self.data
         name = self.name
         rules = _block(self.common.get("rules")).replace("{name}", name)
@@ -95,6 +96,8 @@ class Persona:
             turn_line = (f'- 지금은 "{target_name}"의 말에 대답할 차례다. 필요하면 이름을 부르고, '
                          "다른 사람들이 하던 이야기의 흐름도 자연스럽게 반영한다.")
             facts_section = f"\n[{target_name}에 대해 기억하고 있는 것]\n{facts_block}\n"
+            if view:
+                facts_section += f"\n[{target_name}에 대해 네가 가진 인식(평소 이미지)]\n{view}\n"
         else:  # 아무도 말을 걸지 않아서 캐릭터가 먼저 말을 꺼내는 상황
             turn_line = "- 지금은 누구의 말에 대답하는 게 아니라, 네가 먼저 채널에 말을 꺼내는 상황이다."
             facts_section = ""
@@ -125,6 +128,7 @@ class Persona:
 {turn_line}
 - 사람처럼 대화의 흐름에 자연스럽게 끼어들어서 말한다.
 - 사람을 부를 때는 [현재 대화 상황]에 적힌 이름/호칭(진짜 이름)을 쓴다. 디스코드 닉네임 대신 그 이름을 쓴다.
+- 각 사람에 대해 '인식'(네가 그 사람에게 가진 평소 이미지)이 적혀 있으면, 그 인식대로 그 사람을 대한다. 말투와 반응(놀리기, 존중, 걱정 등)에 자연스럽게 녹이되 인식을 그대로 읊거나 매번 언급하지 않는다.
 
 [현재 대화 상황]
 {scene or '(대화가 막 시작됨)'}
