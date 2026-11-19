@@ -42,11 +42,51 @@ intents.message_content = True
 intents.dm_messages = True
 
 
+icfg = settings["idle"]
+
+
 @dataclass
 class Pending:
     message: discord.Message
     ts: float          # time.monotonic()
     priority: bool     # 멘션 또는 봇 메시지에 대한 답장
+
+
+@dataclass
+class IdleState:
+    """채널별 '아무도 말을 안 할 때 혼자 말 거는' 상태"""
+    last_activity: float          # 마지막으로 사람이 말한 시각 (time.time())
+    next_at: float                # 다음 이벤트가 가능한 시각
+    stage: int = 0                # 답 없이 지나간 이벤트 횟수 (침묵 이벤트 포함)
+    sent: int = 0                 # 그중 실제로 보낸 메시지 수
+    day: str = ""
+    day_count: int = 0
+
+
+def rand_minutes(rng: list) -> float:
+    return random.uniform(float(rng[0]), float(rng[1])) * 60
+
+
+# 단계별 이벤트: (이름, 가중치, 지시문). silent 는 메시지를 보내지 않고 삐진 채 넘어간다.
+IDLE_EVENTS: dict[int, list[tuple[str, float, str]]] = {
+    0: [
+        ("start", 1.0,
+         "조용한 채널에 자연스럽게 말을 꺼내라. 심심하다는 투정, 방금 한 일이나 본 것, 갑자기 떠오른 생각, "
+         "누군가의 근황이 궁금하다는 말 등 아무 화제나 좋다. 기억하는 사람 이름을 불러도 된다."),
+    ],
+    1: [
+        ("nag", 3.0, "아까 말을 꺼냈는데 반응이 없었다. 가볍게 다시 불러본다. (예: 다들 어디 갔는지 궁금해하기, 누가 있는지 확인하기)"),
+        ("sulk", 3.0, "아무도 답하지 않아서 살짝 서운하다. 과하지 않게, 캐릭터답게 서운함을 표현한다."),
+        ("self_talk", 2.0, "답이 없으니 혼잣말을 한다. 지금 혼자 뭘 하고 있는지 중얼거리는 식으로."),
+        ("silent", 2.0, ""),
+    ],
+    2: [
+        ("sulk_hard", 3.0, "계속 아무도 답하지 않아서 진짜로 삐졌거나 체념한 상태다. 아주 짧게, 토라진 말투로."),
+        ("self_talk", 3.0, "이제 포기하고 혼자 논다. 혼자 노는 이야기를 무심하게 한마디."),
+        ("silent", 3.0, ""),
+        ("bye", 1.0, "아무도 없으니 자러 가거나 잠시 자리를 비우겠다고 짧게 선언한다."),
+    ],
+}
 
 
 class AdminTree(app_commands.CommandTree):
@@ -69,22 +109,30 @@ class GirlBot(discord.Client):
         self.pending: dict[int, list[Pending]] = {}
         self.next_ok: dict[int, float] = {}      # 채널별 다음 발언 가능 시각 (monotonic)
         self.busy: set[int] = set()
+        self.idle: dict[int, IdleState] = {}
+        self.return_note: dict[int, str] = {}    # 사람들이 돌아왔을 때 다음 대답에 넣을 상황 메모
         # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
         self.paused = False
+        self.idle_enabled = bool(icfg["enabled"])
         self.cooldown = float(gcfg["cooldown_sec"])
         self.channels: set[int] = {int(c) for c in dcfg["channel_ids"]}
 
     async def setup_hook(self) -> None:
         await memory.init()
         await self.load_state()
+        await engine.load_names()
         await self.tree.sync()
         group_loop.start()
+        idle_loop.start()
         if pcfg["enabled"]:
             proactive_loop.change_interval(minutes=pcfg["check_interval_min"])
             proactive_loop.start()
 
     async def load_state(self) -> None:
         self.paused = (await memory.kv_get("paused", "0")) == "1"
+        ie = await memory.kv_get("idle_enabled")
+        if ie is not None:
+            self.idle_enabled = ie == "1"
         cd = await memory.kv_get("cooldown")
         if cd:
             self.cooldown = float(cd)
@@ -119,10 +167,17 @@ def clean_text(message: discord.Message) -> str:
     text = message.clean_content.strip()
     if bot.user:
         text = text.replace(f"@{bot.user.display_name}", "").strip()
+    for m in message.mentions:          # 다른 사람 멘션은 진짜 이름으로 바꿔서 보여준다
+        if bot.user and m.id == bot.user.id:
+            continue
+        text = text.replace(f"@{m.display_name}", engine.label(m.id, m.display_name))
     ref = message.reference
     if text and ref and isinstance(ref.resolved, discord.Message):
         target = ref.resolved
-        who = persona.name if (bot.user and target.author.id == bot.user.id) else target.author.display_name
+        if bot.user and target.author.id == bot.user.id:
+            who = persona.name
+        else:
+            who = engine.label(target.author.id, target.author.display_name)
         quoted = target.clean_content.replace("\n", " ").strip()
         quoted = quoted if len(quoted) <= 30 else quoted[:29] + "…"
         text = f'({who}의 "{quoted}"에 답장) {text}'
@@ -185,11 +240,33 @@ async def on_message(message: discord.Message) -> None:
     if not (in_channel or mentioned):
         return
     await memory.add_message(message.channel.id, message.author.id, message.author.display_name, "user", text)
+    mark_human_activity(message.channel.id)
     if bot.paused:
         return
     bot.pending.setdefault(message.channel.id, []).append(
         Pending(message, time.monotonic(), priority=mentioned)
     )
+
+
+def mark_human_activity(channel_id: int) -> None:
+    """사람이 말하면 혼자말 걸기 상태를 리셋하고, 무시당했던 경험이 있으면 다음 대답에 반영한다."""
+    st = bot.idle.get(channel_id)
+    now = time.time()
+    if st is None:
+        bot.idle[channel_id] = IdleState(now, now + rand_minutes(icfg["first_after_min"]))
+        return
+    if st.sent > 0:
+        n = st.sent
+        stage = st.stage
+        bot.return_note[channel_id] = (
+            f"네가 먼저 말을 꺼냈는데 {n}번이나 아무도 답하지 않았고, 한참 뒤에야 사람들이 돌아왔다"
+            + (f" (그 사이 단계: {stage}). " if stage > n else ". ")
+            + "서운했다면 서운한 티를 내거나, 반가워하거나, 아무 일 없던 척하는 등 캐릭터답게 자연스럽게 반응해도 좋다."
+        )
+    st.last_activity = now
+    st.stage = 0
+    st.sent = 0
+    st.next_at = now + rand_minutes(icfg["first_after_min"])
 
 
 async def handle_dm(message: discord.Message, text: str) -> None:
@@ -219,10 +296,16 @@ async def respond_group(channel_id: int, target: Pending) -> None:
     try:
         async with bot.gpu_lock:
             async with channel.typing():
+                note = bot.return_note.get(channel_id)
                 bubbles = await engine.reply(
                     channel_id, msg.author.id, msg.author.display_name, clean_text(msg),
-                    can_skip=not target.priority,   # 멘션/답장이 아니면 끼어들 이유가 없을 때 SKIP 가능
+                    # 멘션/답장이 아니고, 돌아온 상황 메모도 없을 때만 SKIP 가능
+                    can_skip=not target.priority and not note,
+                    priority=target.priority,
+                    extra_note=note,
                 )
+                if bubbles and note:
+                    bot.return_note.pop(channel_id, None)
         if bubbles:
             # 그 사이에 다른 메시지가 올라왔으면 '답장'으로 누구에게 하는 말인지 표시
             latest = getattr(channel, "last_message_id", None)
@@ -263,6 +346,82 @@ async def group_loop() -> None:
 
 @group_loop.before_loop
 async def _group_ready() -> None:
+    await bot.wait_until_ready()
+
+
+# ------------------ 채널이 조용할 때 혼자 말 걸기 ------------------
+def pick_event(stage: int) -> tuple[str, str]:
+    table = IDLE_EVENTS[min(stage, 2)]
+    name, _, instr = random.choices(table, weights=[w for _, w, _ in table], k=1)[0]
+    return name, instr
+
+
+async def run_idle_event(channel_id: int, st: IdleState, force: bool = False) -> str:
+    """이벤트 하나를 실행하고 결과 설명을 돌려준다."""
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return "채널을 찾을 수 없음"
+    now = time.time()
+    name, instr = pick_event(st.stage)
+    growth = float(icfg["followup_growth"]) ** st.stage
+
+    if name == "silent":
+        # 서운해서 일부러 말을 안 한다 (자기도 계속 답장 안 침). 단계만 올라간다.
+        st.stage += 1
+        st.next_at = now + rand_minutes(icfg["followup_after_min"]) * growth
+        return "silent (이번엔 아무 말도 하지 않음)"
+
+    idle_min = int((now - st.last_activity) // 60)
+    async with bot.gpu_lock:
+        async with channel.typing():
+            bubbles = await engine.initiate(channel_id, instr, idle_min, st.sent)
+    if not bubbles:
+        st.next_at = now + 600
+        return "생성 결과 없음"
+    await send_bubbles(channel, bubbles)
+    st.stage += 1
+    st.sent += 1
+    st.day_count += 1
+    st.next_at = time.time() + rand_minutes(icfg["followup_after_min"]) * growth
+    return f"{name} 이벤트 전송"
+
+
+@tasks.loop(seconds=60)
+async def idle_loop() -> None:
+    """아무도 말하지 않으면 먼저 말을 꺼내고, 답이 없으면 서운해하거나 혼자 놀거나 입을 닫는 등 단계별로 반응한다."""
+    if bot.paused or not bot.idle_enabled:
+        return
+    now_dt = engine.now()
+    lo, hi = icfg["active_hours"]
+    if not (lo <= now_dt.hour < hi):
+        return
+    today = now_dt.strftime("%Y-%m-%d")
+    now = time.time()
+
+    for ch_id in list(bot.channels):
+        st = bot.idle.get(ch_id)
+        if st is None:
+            last = await memory.last_message_ts(ch_id) or now
+            st = bot.idle[ch_id] = IdleState(last, max(now, last) + rand_minutes(icfg["first_after_min"]))
+        if st.day != today:
+            st.day, st.day_count = today, 0
+        if now < st.next_at or ch_id in bot.busy or bot.pending.get(ch_id):
+            continue
+        if st.stage >= icfg["max_unanswered"] or st.day_count >= icfg["max_per_day"]:
+            continue
+        bot.busy.add(ch_id)
+        try:
+            result = await run_idle_event(ch_id, st)
+            log.info("혼잣말 이벤트 (channel=%s, stage=%s): %s", ch_id, st.stage, result)
+        except Exception:  # noqa: BLE001
+            log.exception("혼잣말 이벤트 실패 (channel=%s)", ch_id)
+            st.next_at = time.time() + 600
+        finally:
+            bot.busy.discard(ch_id)
+
+
+@idle_loop.before_loop
+async def _idle_ready() -> None:
     await bot.wait_until_ready()
 
 
@@ -345,7 +504,7 @@ async def usage_total(interaction: discord.Interaction) -> None:
         f"최근 7일   {fmt(u['week'][1] + u['week'][2])} ({fmt(u['week'][0])}회)```",
     ]
     if u["by_kind"]:
-        names = {"reply": "일반 답변", "memory": "기억 추출", "proactive": "먼저 말걸기"}
+        names = {"reply": "일반 답변", "memory": "기억 추출", "proactive": "DM 먼저", "idle": "혼잣말"}
         lines.append("**용도별**\n```" + "\n".join(
             f"{names.get(k, k):<8} {fmt((pp or 0) + (cc or 0)):>12} 토큰 ({fmt(nn)}회)" for k, nn, pp, cc in u["by_kind"]
         ) + "```")
@@ -532,7 +691,103 @@ async def manage_memory(
         f"**{persona.name}이(가) 기억하는 {user.display_name}**\n{body}"[:1990], ephemeral=True)
 
 
-# ---- 9. 리로드 ----
+# ---- 9. 이름 (닉네임 대신 쓸 진짜 이름 등록) ----
+@bot.tree.command(name="이름", description="유저의 진짜 이름(호칭)을 등록해요. 봇은 닉네임 대신 이 이름으로 불러요")
+@app_commands.describe(action="등록/삭제/목록", user="대상 유저 (등록/삭제 시)", name="진짜 이름 (예: 민수)",
+                       call="부를 때 쓸 호칭 (예: 민수야, 민수형). 생략하면 이름 그대로")
+@app_commands.rename(action="동작", user="유저", name="이름", call="호칭")
+@app_commands.choices(action=[
+    app_commands.Choice(name="등록", value="set"),
+    app_commands.Choice(name="삭제", value="del"),
+    app_commands.Choice(name="목록", value="list"),
+])
+async def manage_names(
+    interaction: discord.Interaction, action: app_commands.Choice[str],
+    user: Optional[discord.User] = None, name: Optional[str] = None, call: Optional[str] = None,
+) -> None:
+    if action.value == "list":
+        if not engine.names:
+            await interaction.response.send_message("등록된 이름이 없어요.", ephemeral=True)
+            return
+        body = "\n".join(
+            f"<@{uid}> → {real}" + (f" (호칭: {c})" if c else "") for uid, (real, c) in engine.names.items()
+        )
+        await interaction.response.send_message(f"**등록된 이름**\n{body}"[:1990], ephemeral=True)
+        return
+    if user is None:
+        await interaction.response.send_message("유저를 지정해주세요.", ephemeral=True)
+        return
+    if action.value == "del":
+        removed = await memory.del_real_name(user.id)
+        engine.names.pop(user.id, None)
+        await interaction.response.send_message(
+            "이름 등록을 지웠어요." if removed else "등록된 이름이 없어요.", ephemeral=True)
+        return
+    if not name or not name.strip():
+        await interaction.response.send_message("등록할 이름을 입력해주세요.", ephemeral=True)
+        return
+    real = name.strip()[:30]
+    call_name = call.strip()[:30] if call and call.strip() else None
+    await memory.set_real_name(user.id, real, call_name)
+    engine.names[user.id] = (real, call_name)
+    await interaction.response.send_message(
+        f"{user.display_name} → **{real}**" + (f" (호칭: {call_name})" if call_name else "") + " 로 등록했어요.",
+        ephemeral=True)
+
+
+# ---- 10. 혼잣말 (조용할 때 먼저 말 걸기) ----
+@bot.tree.command(name="혼잣말", description="채널이 조용할 때 혼자 말 거는 기능을 켜고 끄거나, 지금 바로 시험해요")
+@app_commands.describe(action="켜기/끄기/지금/상태", channel="'지금'을 실행할 채널 (생략하면 현재 채널)")
+@app_commands.rename(action="동작", channel="채널")
+@app_commands.choices(action=[
+    app_commands.Choice(name="켜기", value="on"),
+    app_commands.Choice(name="끄기", value="off"),
+    app_commands.Choice(name="지금", value="now"),
+    app_commands.Choice(name="상태", value="status"),
+])
+async def idle_cmd(
+    interaction: discord.Interaction, action: app_commands.Choice[str], channel: Optional[discord.TextChannel] = None
+) -> None:
+    if action.value in ("on", "off"):
+        bot.idle_enabled = action.value == "on"
+        await memory.kv_set("idle_enabled", "1" if bot.idle_enabled else "0")
+        await interaction.response.send_message(
+            "혼잣말 기능을 켰어요." if bot.idle_enabled else "혼잣말 기능을 껐어요.", ephemeral=True)
+        return
+    if action.value == "status":
+        now = time.time()
+        lines = [f"혼잣말: {'켜짐' if bot.idle_enabled else '꺼짐'} (활동 시간 {icfg['active_hours'][0]}~{icfg['active_hours'][1]}시)"]
+        for ch_id in sorted(bot.channels):
+            st = bot.idle.get(ch_id)
+            if not st:
+                lines.append(f"<#{ch_id}> 아직 상태 없음")
+                continue
+            wait = max(0, int((st.next_at - now) // 60))
+            lines.append(
+                f"<#{ch_id}> 단계 {st.stage}/{icfg['max_unanswered']} · 보낸 메시지 {st.sent} · "
+                f"오늘 {st.day_count}/{icfg['max_per_day']} · 다음 이벤트까지 약 {wait}분")
+        await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
+        return
+    # 지금: 시험용으로 이벤트를 즉시 한 번 실행
+    target = channel or interaction.channel
+    if not isinstance(target, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("텍스트 채널에서 실행해주세요.", ephemeral=True)
+        return
+    if target.id in bot.busy:
+        await interaction.response.send_message("지금 이 채널에서 대답을 만드는 중이에요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    st = bot.idle.get(target.id) or IdleState(time.time() - 1800, time.time())
+    bot.idle[target.id] = st
+    bot.busy.add(target.id)
+    try:
+        result = await run_idle_event(target.id, st, force=True)
+    finally:
+        bot.busy.discard(target.id)
+    await interaction.followup.send(f"실행 결과: {result}", ephemeral=True)
+
+
+# ---- 11. 리로드 ----
 @bot.tree.command(name="리로드", description="캐릭터/공통 규칙 yaml 파일을 다시 불러와요")
 async def reload_persona(interaction: discord.Interaction) -> None:
     persona.reload()

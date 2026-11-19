@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id, id);
 
+CREATE TABLE IF NOT EXISTS user_names (
+    user_id INTEGER PRIMARY KEY,
+    real_name TEXT NOT NULL,           -- 닉네임 대신 쓸 진짜 이름
+    call_name TEXT                     -- 부를 때 쓸 호칭 (예: 민수야). 비우면 real_name
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -101,6 +107,32 @@ class Memory:
             (key, value),
         )
         await self.db.commit()
+
+    # ---------- 실명 등록 ----------
+    async def set_real_name(self, user_id: int, real_name: str, call_name: str | None) -> None:
+        assert self.db
+        await self.db.execute(
+            "INSERT INTO user_names(user_id, real_name, call_name) VALUES (?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET real_name=excluded.real_name, call_name=excluded.call_name",
+            (user_id, real_name, call_name),
+        )
+        await self.db.commit()
+
+    async def del_real_name(self, user_id: int) -> bool:
+        assert self.db
+        cur = await self.db.execute("DELETE FROM user_names WHERE user_id=?", (user_id,))
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def all_real_names(self) -> dict[int, tuple[str, str | None]]:
+        assert self.db
+        cur = await self.db.execute("SELECT user_id, real_name, call_name FROM user_names")
+        return {u: (r, c) for u, r, c in await cur.fetchall()}
+
+    async def last_message_ts(self, channel_id: int) -> float | None:
+        assert self.db
+        cur = await self.db.execute("SELECT MAX(ts) FROM messages WHERE channel_id=?", (channel_id,))
+        return (await cur.fetchone())[0]
 
     # ---------- 대화 기록 ----------
     async def add_message(
