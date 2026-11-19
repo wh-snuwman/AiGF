@@ -240,8 +240,10 @@ async def send_bubbles(
         # 서버 커스텀 이모지 `:이름:` 을 실제 이모지로 바꿔서 보낸다
         text = emojis.render(raw) if ecfg.get("enabled", True) else raw
         if tcfg["enabled"]:
+            # 첫 말풍선은 답을 만드는 동안 이미 '입력 중'이었으니 거의 바로 보내고, 이어지는 말풍선만 짧게 타이핑 연출
+            delay = min(engine.typing_delay(raw), 0.4) if i == 0 else min(engine.typing_delay(raw), 1.5)
             async with channel.typing():
-                await asyncio.sleep(engine.typing_delay(raw))
+                await asyncio.sleep(delay)
         if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id):
             try:
                 await reply_to.reply(text, mention_author=False)
@@ -271,6 +273,30 @@ def is_directed(text: str) -> bool:
     if bot.user:
         names.add(bot.user.display_name)
     return any(n and n in text for n in names)
+
+
+async def gpu_lines() -> list[tuple[str, float, float, float]]:
+    """로드된 모델의 [(이름, 전체 GB, VRAM GB, VRAM 적재율 %)]"""
+    out = []
+    for name, size, vram in await llm.loaded_models():
+        pct = 100.0 * vram / size if size else 100.0
+        out.append((name, size / 1e9, vram / 1e9, pct))
+    return out
+
+
+async def warmup_and_report() -> None:
+    await llm.warmup()
+    try:
+        for name, size, vram, pct in await gpu_lines():
+            if pct < 99:
+                log.warning(
+                    "⚠ %s: VRAM 적재율 %.0f%% (모델 %.1fGB 중 %.1fGB만 GPU) → 나머지가 CPU 에서 돌아서 매우 느립니다. "
+                    "같은 GPU 를 쓰는 다른 프로그램(이미지 생성 서버 등)을 끄거나 num_ctx 를 줄이세요.",
+                    name, pct, size, vram)
+            else:
+                log.info("%s: GPU 100%% 적재 (%.1fGB)", name, size)
+    except Exception as e:  # noqa: BLE001
+        log.warning("GPU 적재 상태 확인 실패: %s", e)
 
 
 def refresh_emojis() -> None:
@@ -307,7 +333,7 @@ def msg_text_plain(msg: discord.Message) -> str:
 async def on_ready() -> None:
     log.info("로그인: %s | 모델: %s | 캐릭터: %s", bot.user, llm.model, persona.name)
     refresh_emojis()
-    asyncio.create_task(llm.warmup())          # 첫 응답이 느리지 않도록 모델을 미리 올린다
+    asyncio.create_task(warmup_and_report())   # 첫 응답이 느리지 않도록 모델을 미리 올리고 GPU 적재 상태를 점검한다
 
 
 @bot.event
@@ -469,6 +495,7 @@ async def respond_group(channel_id: int, target: Pending) -> None:
     uid = target.uid or msg.author.id
     uname = target.uname or msg.author.display_name
     bot.busy.add(channel_id)
+    t0 = time.monotonic()
     try:
         fight = engine.fights.get(channel_id, uid)
         async with bot.gpu_lock:
@@ -488,6 +515,7 @@ async def respond_group(channel_id: int, target: Pending) -> None:
                 )
                 if bubbles and note:
                     bot.return_note.pop(channel_id, None)
+        t_gen = time.monotonic()
         if bubbles:
             bot.last_replied[uid] = time.time()
             bot.last_target[channel_id] = uid
@@ -495,6 +523,10 @@ async def respond_group(channel_id: int, target: Pending) -> None:
             latest = getattr(channel, "last_message_id", None)
             reply_to = msg if (latest and latest != msg.id and target.kind == "msg") else None
             await send_bubbles(channel, bubbles, reply_to)
+            t_end = time.monotonic()
+            # 어디서 시간이 걸리는지 로그로 남긴다: 수신 후 대기(묶음/쿨다운/GPU 대기) · 생성(LLM) · 전송
+            log.info("응답 완료: 메시지 수신 후 %.1fs (대기 %.1fs · 생성 %.1fs · 전송 %.1fs)",
+                     t_end - target.ts, t0 - target.ts, t_gen - t0, t_end - t_gen)
         elif engine.last_skip and target.kind == "msg":
             await maybe_react(msg, ecfg.get("react_on_skip", 0.5), target.text)   # 글로 안 답하면 이모지로라도 반응
     except Exception:  # noqa: BLE001
@@ -518,7 +550,7 @@ def to_candidate(p: Pending, now: float, channel_id: int) -> targeting.Candidate
     )
 
 
-@tasks.loop(seconds=1.5)
+@tasks.loop(seconds=0.5)
 async def group_loop() -> None:
     """채널별로 쿨다운이 끝났으면, 그동안 올라온 메시지 중 점수가 높은 사람을 골라 대답한다."""
     if bot.paused:
@@ -920,9 +952,11 @@ async def swap_character(
 async def status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     try:
-        loaded = await llm.loaded_models()
+        rows = await gpu_lines()
         gpu = "\n".join(
-            f"  {m}: {s / 1e9:.1f}GB (VRAM {v / 1e9:.1f}GB)" for m, s, v in loaded
+            f"  {m}: {s:.1f}GB (VRAM {v:.1f}GB, GPU 적재 {p:.0f}%)"
+            + ("  ⚠ 일부가 CPU 에서 돌아 느립니다!" if p < 99 else "")
+            for m, s, v, p in rows
         ) or "  (현재 로드된 모델 없음)"
     except Exception as e:  # noqa: BLE001
         gpu = f"  Ollama 연결 실패: {e}"

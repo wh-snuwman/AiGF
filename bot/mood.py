@@ -384,19 +384,17 @@ class Mood:
         level = "아주 약하게" if it < 0.25 else "약하게" if it < 0.5 else "뚜렷하게" if it < 0.75 else "매우 강하게"
         sc = self.scores_100()
         lines = [
-            f"- 지금 기분: {e.label} ({level})",
-            f"- 상태 점수(0~100, 기분은 -100~100): 기분 {sc['mood']:+d}, 에너지 {sc['energy']}, "
-            f"짜증 {sc['irritation']}, 외로움 {sc['lonely']}, 흥미 {sc['interest']}",
+            f"- 기분: {e.label}({level}) · 점수 기분{sc['mood']:+d} 에너지{sc['energy']} 짜증{sc['irritation']} "
+            f"외로움{sc['lonely']} 흥미{sc['interest']}",
         ]
         th = self._recent_thoughts()
         if th:
-            lines.append("- 마음속 심정(최근 일, 겉으로 말하지는 않지만 말투에 묻어난다): " + " / ".join(th))
+            lines.append("- 마음속(겉으로 말하진 않고 말투에 묻어남): " + " / ".join(th))
         if uid is not None:
             label, guide = self.aff_label(self.affinity(uid))
-            lines.append(f"- {who or '이 사람'}에 대한 호감도: {label} ({self.affinity(uid):+.2f}) → {guide}")
-        lines.append("- 이 기분이 말투와 글 스타일에 자연스럽게 드러나야 한다: " + e.tone)
-        lines.append("- 지금 말투 조절(이 값대로 말해라): " + "; ".join(self.knobs(uid)))
-        lines.append("- 기분, 점수, 호감도, 심정을 직접 말로 설명하지 마라. 말투, 길이, 반응 속도, 단어 선택으로만 드러낸다.")
+            lines.append(f"- {who or '이 사람'}에 대한 호감도: {label} → {guide}")
+        lines.append("- 말투: " + e.tone + " [" + "; ".join(self.knobs(uid)) + "]")
+        lines.append("- 기분/점수를 직접 말로 설명하지 말고 말투와 길이로만 드러낸다.")
         return "\n".join(lines)
 
     # ---------- 행동에 미치는 영향 ----------
