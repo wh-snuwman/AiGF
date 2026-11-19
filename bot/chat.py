@@ -31,11 +31,15 @@ def clean_name(name: str) -> str:
     return s or name.strip()
 
 
-def humanize(text: str) -> str:
-    """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)"""
+def humanize(text: str, lively: bool = False) -> str:
+    """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)
+    lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다."""
     t = re.sub(r"[…⋯]+|\.{2,}", " ", text)                     # 말줄임표 제거 ("…뭐," → "뭐,")
-    t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)           # ?! → ?
-    t = re.sub(r"([?!？！])\1+", r"\1", t)                      # ??? → ?
+    if lively:
+        t = re.sub(r"([?!？！])\1{2,}", r"\1\1", t)              # ???? → ??  (두 번까지 허용)
+    else:
+        t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)       # ?! → ?
+        t = re.sub(r"([?!？！])\1+", r"\1", t)                  # ??? → ?
     t = re.sub(r"~{2,}", "~", t)
     t = re.sub(r"[ \t]+", " ", t).strip(" -—–·")
     t = re.sub(r"\s+([,?!])", r"\1", t)
@@ -128,7 +132,7 @@ def pick_length(text: str, activity: int, priority: bool, free: bool = False,
         w = [w[0] * 0.25, w[1], w[2] * 1.3, w[3]]
     w = [max(0.001, x * b) for x, b in zip(w, bias)]    # 기분 반영 (졸림 → 짧게, 신남 → 길게 등)
     if engage > 1.0:                                    # 적극성: 한마디로 끝내기보다 말을 더 보탠다
-        k = min(engage, 2.0)
+        k = min(engage, 3.0)                            # 4.0 까지 올려도 길이 쏠림은 3.0 에서 포화
         w = [w[0] / (k ** 1.2), w[1], w[2] * k ** 0.8, w[3] * k ** 1.3]
     return random.choices(MODES, weights=w, k=1)[0]
 
@@ -273,14 +277,14 @@ class ChatEngine:
     async def _generate(
         self, msgs: list[dict[str, str]], mode: LengthMode, banned: list[str],
         known: set[str], can_skip: bool = False, temperature: float | None = None,
-        images: list[bytes] | None = None,
+        images: list[bytes] | None = None, lively: bool = False,
     ) -> tuple[LLMResult, list[str] | None]:
         """생성 → 후처리. 반복 표현이 2개 이상 섞이면 한 번만 다시 생성한다. SKIP 이면 (res, None)."""
         extra = {"temperature": temperature} if temperature else {}
         res = await self.llm.chat(msgs, images=images, num_predict=mode.num_predict, **extra)
         if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
             return res, None
-        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles)
+        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles, lively)
         hits = [p for p in banned if any(p in b for b in bubbles)]
         # 속도: 다시 생성하면 응답 시간이 두 배가 된다. 기본은 꺼두고(프롬프트의 금지어 안내만 사용),
         # settings.yaml 의 quality.regen_on_repeat 를 켜면 심한 반복(3개 이상)일 때만 한 번 다시 생성한다.
@@ -358,6 +362,18 @@ class ChatEngine:
             bias = tuple(b * m for b, m in zip(bias, (0.5, 1.6, 1.1, 0.2)))
         mode = pick_length(safe_text, activity, priority or dm or fight is not None, bias=bias, engage=self.mood.engage)
         own_text, banned = self._own_block(own)
+        if fight is not None:
+            # 싸움 중에는 상황에 맞는 '진짜 감정'을 매 라운드 강제로 깔아서 말투에 터져 나오게 한다
+            # (우세=짜증, 팽팽=화남, 밀림=서럽고 억울함 / 끝나면 승리=의기양양, 패배=서러움, 진정=다정)
+            emo = {"우세": "annoyed", "팽팽": "angry",
+                   "밀림": random.choice(["hurt", "hurt", "sulky", "angry"])}[fight.advantage]
+            if fight.ending in ("bot_win", "timeout_win", "retreat"):
+                emo = "smug"
+            elif fight.ending in ("bot_lose", "timeout_quiet"):
+                emo = "hurt"
+            elif fight.ending == "calmed":
+                emo = "caring"
+            self.mood.set_emotion(emo, 3)
 
         parts = [
             "[상황 메모 — 언급 금지]",
@@ -384,15 +400,19 @@ class ChatEngine:
         msgs = self._assemble(who, facts, scene, merged, "\n".join(parts),
                               self.views.get(target_id, ""), target_id)
 
-        res, bubbles = await self._generate(msgs, mode, banned, known, can_skip, images=images)
+        res, bubbles = await self._generate(
+            msgs, mode, banned, known, can_skip, images=images,
+            temperature=(min(1.25, self.llm.options.get("temperature", 1.0) + 0.15) if fight is not None else None),
+            lively=fight is not None)
         if bubbles is None:
             self.last_skip = True
             await self._record("reply", res, target_id, target_name, channel_id, "(SKIP: 대답하지 않음)")
             return []
         if not bubbles:
             return []
-        # ---- 수위 검사: 비하/혐오/위협/풀 욕설이 나오면 한 번 다시 생성하고, 그래도 안 되면 대체 문구 ----
-        if not self.fights.output_ok(bubbles):
+        # ---- (선택) 수위 필터: 기본은 꺼짐. 앞단에 별도 검열이 있으면 이중 검열이 되어 비효율적이다. ----
+        # settings.yaml 의 fight.filter: true 일 때만 비하/혐오/위협 표현을 걸러서 다시 생성한다.
+        if self.fights.cfg.get("filter", False) and not self.fights.output_ok(bubbles):
             log.warning("금지 표현 감지, 재생성: %r", " / ".join(bubbles)[:60])
             retry = msgs[:-1] + [{
                 "role": "user",
@@ -401,7 +421,7 @@ class ChatEngine:
                   "또는 현재 수위에서 허용되지 않는 욕설)이 있었다. 그런 표현 없이 다시 대답해라.",
             }]
             res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict)
-            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles)
+            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, fight is not None)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens
             res = res2
@@ -485,7 +505,8 @@ class ChatEngine:
         return [line]
 
     # ---------- 후처리 ----------
-    def to_bubbles(self, raw: str, other_names: set[str] | None = None, limit: int | None = None) -> list[str]:
+    def to_bubbles(self, raw: str, other_names: set[str] | None = None, limit: int | None = None,
+                   lively: bool = False) -> list[str]:
         name = re.escape(self.persona.name)
         nick = re.escape(self.persona.nickname)
         text = raw.strip()
@@ -500,7 +521,7 @@ class ChatEngine:
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
         text = re.sub(r"^#+\s*", "", text, flags=re.M)
         text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
-        parts = [self.mood.filter_text(humanize(p)) for p in re.split(r"\n+", text)]
+        parts = [self.mood.filter_text(humanize(p, lively)) for p in re.split(r"\n+", text)]
         parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])
         if len(parts) > limit:

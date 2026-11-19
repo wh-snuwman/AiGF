@@ -79,7 +79,14 @@ class IdleState:
 
 
 def rand_minutes(rng: list) -> float:
-    return random.uniform(float(rng[0]), float(rng[1])) * 60
+    # 적극성이 높을수록 먼저 말 거는 간격이 짧아진다 (4.0 이면 약 1/2.6)
+    scale = max(1.0, engine.mood.engage) ** 0.7
+    return random.uniform(float(rng[0]), float(rng[1])) * 60 / scale
+
+
+def settle_sec() -> float:
+    """연달아 보낸 메시지를 묶기 위한 대기시간. 적극성이 높으면 더 빨리 반응한다."""
+    return max(0.6, gcfg["settle_sec"] / max(1.0, engine.mood.engage) ** 0.5)
 
 
 # 단계별 이벤트: (이름, 가중치, 지시문). silent 는 메시지를 보내지 않고 삐진 채 넘어간다.
@@ -169,7 +176,10 @@ class GirlBot(discord.Client):
             persona.load(char)
         eg = await memory.kv_get("engagement")
         if eg:
-            engine.mood.engage = float(eg)
+            engine.mood.engage = max(0.5, min(4.0, float(eg)))
+        ff = await memory.kv_get("fight_filter")
+        if ff is not None:
+            engine.fights.cfg["filter"] = ff == "1"
         fl = await memory.kv_get("fight_level")
         if fl in ("1", "2", "3"):
             engine.fights.cfg["level"] = int(fl)
@@ -504,7 +514,7 @@ async def dm_worker(channel: discord.DMChannel, author: discord.abc.User) -> Non
     uid = author.id
     try:
         start = time.monotonic()
-        await asyncio.sleep(gcfg["settle_sec"])
+        await asyncio.sleep(settle_sec())
         # 아직 입력 중이면 조금 더 기다린다 (최대 max_settle_wait_sec)
         while (bot.typing_until.get((channel.id, uid), 0) > time.monotonic()
                and time.monotonic() - start < gcfg["max_settle_wait_sec"]):
@@ -616,7 +626,7 @@ async def group_loop() -> None:
                 return True
             u = p.uid or p.message.author.id
             quiet = now - latest[u]
-            if quiet < gcfg["settle_sec"]:
+            if quiet < settle_sec():
                 return False
             typing = bot.typing_until.get((channel_id, u), 0) > now
             return not typing or quiet >= gcfg["max_settle_wait_sec"]
@@ -810,7 +820,7 @@ async def idle_loop() -> None:
             st.day, st.day_count = today, 0
         if now < st.next_at or ch_id in bot.busy or bot.pending.get(ch_id):
             continue
-        if st.stage >= icfg["max_unanswered"] or st.day_count >= icfg["max_per_day"]:
+        if st.stage >= icfg["max_unanswered"] or st.day_count >= icfg["max_per_day"] * max(1.0, engine.mood.engage):
             continue
         bot.busy.add(ch_id)
         try:
@@ -1224,10 +1234,10 @@ LEVEL_DESC = {1: "순화된 말싸움만", 2: "가벼운 욕까지", 3: "센 욕
 
 # ---- 적극성 ----
 @bot.tree.command(name="적극성", description="대화에 얼마나 적극적으로 참여할지 조절해요 (1.0=기본, 높을수록 적극적)")
-@app_commands.describe(level="0.5(느긋)~2.0(매우 적극). 생략하면 현재 값 확인")
+@app_commands.describe(level="0.5(느긋)~1.0(기본)~4.0(폭주). 생략하면 현재 값 확인")
 @app_commands.rename(level="단계")
 async def engagement_cmd(
-    interaction: discord.Interaction, level: Optional[app_commands.Range[float, 0.5, 2.0]] = None
+    interaction: discord.Interaction, level: Optional[app_commands.Range[float, 0.5, 4.0]] = None
 ) -> None:
     m = engine.mood
     if level is None:
@@ -1239,8 +1249,11 @@ async def engagement_cmd(
     await memory.kv_set("engagement", f"{m.engage:g}")
     m.boost_to_baseline()
     await interaction.response.send_message(
-        f"적극성을 **{m.engage:g}**로 바꿨어요. " + ("더 자주, 더 길게, 덜 귀찮아하며 대화에 참여해요." if m.engage > 1.0
-                                                       else "기본 또는 느긋한 모드예요."), ephemeral=True)
+        f"적극성을 **{m.engage:g}**로 바꿨어요. "
+        + ("🔥 폭주 구간이에요. 거의 모든 말에 바로바로 끼어들고, 길게 떠들고, 먼저 말도 자주 걸어요. "
+           "(GPU 사용이 늘어서 응답이 밀리면 값을 낮추세요)" if m.engage > 2.0
+           else "더 자주, 더 길게, 덜 귀찮아하며 대화에 참여해요." if m.engage > 1.0
+           else "기본 또는 느긋한 모드예요."), ephemeral=True)
 
 
 # ---- 싸움 ----
@@ -1254,6 +1267,7 @@ async def engagement_cmd(
     app_commands.Choice(name="수위", value="level"),
     app_commands.Choice(name="시작", value="start"),
     app_commands.Choice(name="중단", value="stop"),
+    app_commands.Choice(name="필터", value="filter"),
 ])
 async def fight_cmd(
     interaction: discord.Interaction, action: app_commands.Choice[str],
@@ -1277,6 +1291,13 @@ async def fight_cmd(
         await interaction.response.send_message(
             f"수위를 **{level}**로 바꿨어요. ({LEVEL_DESC[int(level)]})", ephemeral=True)
         return
+    if action.value == "filter":        # 출력 금지어 필터 켜기/끄기 (전환). 앞단 검열이 있으면 꺼두는 게 효율적
+        fm.cfg["filter"] = not fm.cfg.get("filter", False)
+        await memory.kv_set("fight_filter", "1" if fm.cfg["filter"] else "0")
+        await interaction.response.send_message(
+            "출력 필터를 **켰어요**. 금지 표현이 나오면 다시 생성해요." if fm.cfg["filter"]
+            else "출력 필터를 **껐어요**. 검열 없이 감정 그대로 나가요.", ephemeral=True)
+        return
     if action.value == "stop":
         n = fm.stop_all(interaction.channel_id)
         await interaction.response.send_message(f"이 채널의 말싸움 {n}건을 중단했어요.", ephemeral=True)
@@ -1294,7 +1315,8 @@ async def fight_cmd(
     body = "\n".join(
         f"<#{f.channel_id}> {f.user_name}: 라운드 {f.rounds} · 흐름 {f.advantage}" for f in fights) or "(진행 중인 싸움 없음)"
     await interaction.response.send_message(
-        f"**말싸움** {'켜짐' if fm.cfg['enabled'] else '꺼짐'} · 수위 {fm.cfg['level']}\n{body}", ephemeral=True)
+        f"**말싸움** {'켜짐' if fm.cfg['enabled'] else '꺼짐'} · 수위 {fm.cfg['level']} · "
+        f"출력 필터 {'켜짐' if fm.cfg.get('filter') else '꺼짐'}\n{body}", ephemeral=True)
 
 
 # ---- 11. 혼잣말 (조용할 때 먼저 말 걸기) ----

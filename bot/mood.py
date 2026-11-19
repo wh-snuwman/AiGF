@@ -229,11 +229,16 @@ class Mood:
         b = {k: float(cfg.get(k, v)) for k, v in DEFAULT_BASE.items()}
         e = _clamp(self.engage_amount(), 0.0, 1.0)      # 0(기본)~1(매우 적극)
         energy = ENERGY_BY_HOUR[hour] + float(cfg.get("energy_bias", 0.0))
-        energy = max(energy, self.energy_floor * e)     # 새벽에도 졸림/귀찮음 감정으로 빠지지 않게 바닥을 깐다
+        h = self.hype()                                 # 1.5~4.0 구간의 '폭주' 정도 (0~1)
+        energy = max(energy, self.energy_floor * e + 0.25 * h)   # 새벽에도 졸림/귀찮음 감정으로 빠지지 않게 바닥을 깐다
         b["energy"] = _clamp(energy, 0.02, 1.0)
-        b["mood"] = _clamp(b["mood"] + 0.15 * e, -1.0, 1.0)
-        b["interest"] = _clamp(b["interest"] + 0.12 * e, 0.0, 1.0)
+        b["mood"] = _clamp(b["mood"] + 0.15 * e + 0.10 * h, -1.0, 1.0)
+        b["interest"] = _clamp(b["interest"] + 0.12 * e + 0.10 * h, 0.0, 1.0)
         return b
+
+    def hype(self) -> float:
+        """적극성 1.5 이하→0, 4.0→1. 2.0 이후 '폭주' 구간에서 추가로 더 들뜬다."""
+        return _clamp((self.engage - 1.5) / 2.5, 0.0, 1.0)
 
     def engage_amount(self) -> float:
         """적극성 1.0→0, 1.5 이상→1. 이 값만큼 '게으른 쪽' 보정을 약하게 한다."""
@@ -431,12 +436,12 @@ class Mood:
 
     @property
     def speed(self) -> float:
-        return self._soft(self.current().speed, lazy_side_below=True)
+        return self._soft(self.current().speed, lazy_side_below=True) * (1.0 + 0.5 * self.hype())
 
     @property
     def reply_mult(self) -> float:
         v = self._soft(self.current().reply, lazy_side_below=True)
-        return v * (1.0 + 0.15 * _clamp(self.engage - 1.0, 0.0, 1.0))      # 적극적일수록 더 자주 끼어든다
+        return v * (1.0 + 0.15 * _clamp(self.engage - 1.0, 0.0, 1.0) + 0.25 * self.hype())   # 적극적일수록 더 자주 끼어든다
 
     @property
     def cooldown_mult(self) -> float:
