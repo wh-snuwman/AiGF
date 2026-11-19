@@ -8,7 +8,7 @@ character: "eunlang"          # eunlang / miku / teto
 
 ollama:
   host: "http://127.0.0.1:11434"
-  model: "gemma3:12b-it-qat"   # 메인 대화 모델
+  model: "gemma3:12b"          # 메인 대화 모델
   keep_alive: "30m"            # 모델을 VRAM에 유지하는 시간
   options:
     temperature: 0.9           # 높을수록 창의적/다양, 낮을수록 안정적
