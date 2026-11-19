@@ -78,7 +78,7 @@ class Persona:
         return self.data.get("greeting", "")
 
     # ---------- 프롬프트 ----------
-    def system_prompt(self, target_name: str, facts: list[str], now: datetime) -> str:
+    def system_prompt(self, target_name: str, facts: list[str], now: datetime, scene: str = "") -> str:
         d = self.data
         name = self.name
         rules = _block(self.common.get("rules")).replace("{name}", name)
@@ -117,6 +117,9 @@ class Persona:
 - 지금은 "{target_name}"의 말에 대답할 차례다. 필요하면 이름을 부르고, 다른 사람들이 하던 이야기의 흐름도 자연스럽게 반영한다.
 - 사람처럼 대화의 흐름에 자연스럽게 끼어들어서 말한다.
 
+[현재 대화 상황]
+{scene or '(대화가 막 시작됨)'}
+
 [{target_name}에 대해 기억하고 있는 것]
 {facts_block}
 
@@ -127,9 +130,10 @@ class Persona:
 {rules}"""
 
     def example_messages(self) -> list[dict[str, str]]:
-        who = self.data.get("example_user", "유저")
+        default_who = self.data.get("example_user", "유저")
         msgs: list[dict[str, str]] = []
         for ex in self.data.get("examples", []) or []:
+            who = ex.get("who", default_who)
             msgs.append({"role": "user", "content": f"{who}: {str(ex['user']).strip()}"})
             msgs.append({"role": "assistant", "content": str(ex["assistant"]).strip()})
         return msgs

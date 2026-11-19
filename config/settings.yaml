@@ -11,10 +11,12 @@ ollama:
   model: "gemma3:12b"          # 메인 대화 모델
   keep_alive: "30m"            # 모델을 VRAM에 유지하는 시간
   options:
-    temperature: 0.9           # 높을수록 창의적/다양, 낮을수록 안정적
+    temperature: 1.0           # 높을수록 창의적/다양, 낮을수록 안정적
     top_p: 0.95
     top_k: 64
-    repeat_penalty: 1.1        # 같은 말 반복 방지
+    repeat_penalty: 1.15       # 같은 말 반복 방지
+    repeat_last_n: 256         # 반복을 감시할 최근 토큰 범위 (기본 64 → 넓혀서 말버릇 반복 억제)
+    presence_penalty: 0.2      # 이미 쓴 단어를 다시 쓰는 것에 약한 페널티 (지원 안 하는 버전이면 무시됨)
     num_ctx: 8192              # 컨텍스트 길이 (12GB VRAM이면 8192 권장)
     num_predict: 300           # 답변 최대 토큰 (짧게 유지)
 

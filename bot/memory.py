@@ -135,11 +135,14 @@ class Memory:
     async def recent(self, channel_id: int, limit: int) -> list[dict[str, Any]]:
         assert self.db
         cur = await self.db.execute(
-            "SELECT role, author, content FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT ?",
+            "SELECT role, user_id, author, content, ts FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT ?",
             (channel_id, limit),
         )
         rows = await cur.fetchall()
-        return [{"role": r, "author": a, "content": c} for r, a, c in reversed(rows)]
+        return [
+            {"role": r, "user_id": u, "author": a, "content": c, "ts": t}
+            for r, u, a, c, t in reversed(rows)
+        ]
 
     async def clear_all_history(self) -> None:
         assert self.db

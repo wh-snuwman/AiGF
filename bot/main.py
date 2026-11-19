@@ -115,9 +115,17 @@ def user_allowed(user_id: int) -> bool:
 
 
 def clean_text(message: discord.Message) -> str:
+    """멘션 정리 + 답장이면 '누구의 어떤 말에 답장'인지 앞에 붙인다 (상황 파악용)."""
     text = message.clean_content.strip()
     if bot.user:
         text = text.replace(f"@{bot.user.display_name}", "").strip()
+    ref = message.reference
+    if text and ref and isinstance(ref.resolved, discord.Message):
+        target = ref.resolved
+        who = persona.name if (bot.user and target.author.id == bot.user.id) else target.author.display_name
+        quoted = target.clean_content.replace("\n", " ").strip()
+        quoted = quoted if len(quoted) <= 30 else quoted[:29] + "…"
+        text = f'({who}의 "{quoted}"에 답장) {text}'
     return text
 
 
@@ -195,7 +203,8 @@ async def handle_dm(message: discord.Message, text: str) -> None:
         try:
             async with bot.gpu_lock:
                 async with message.channel.typing():
-                    bubbles = await engine.reply(message.channel.id, uid, message.author.display_name, dm=True)
+                    bubbles = await engine.reply(
+                        message.channel.id, uid, message.author.display_name, text, dm=True)
         except Exception:  # noqa: BLE001
             log.exception("DM 응답 생성 실패")
             return
@@ -210,7 +219,10 @@ async def respond_group(channel_id: int, target: Pending) -> None:
     try:
         async with bot.gpu_lock:
             async with channel.typing():
-                bubbles = await engine.reply(channel_id, msg.author.id, msg.author.display_name)
+                bubbles = await engine.reply(
+                    channel_id, msg.author.id, msg.author.display_name, clean_text(msg),
+                    can_skip=not target.priority,   # 멘션/답장이 아니면 끼어들 이유가 없을 때 SKIP 가능
+                )
         if bubbles:
             # 그 사이에 다른 메시지가 올라왔으면 '답장'으로 누구에게 하는 말인지 표시
             latest = getattr(channel, "last_message_id", None)
