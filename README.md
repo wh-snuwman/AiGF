@@ -27,6 +27,9 @@ scripts/              설치 스크립트, systemd 서비스
 6. `.venv/bin/python -m bot.main` 으로 실행합니다. 봇에게 DM을 보내면 대답합니다.
 7. 상시 구동은 `scripts/aigirl.service` 안의 안내대로 systemd에 등록합니다.
 
+루트 디스크 용량이 부족하면(`no space left on device`) 모델 저장 경로를 다른 디스크로 옮깁니다.
+`bash scripts/move_ollama_to_hdd.sh /mnt/hdd/ollama` 를 실행하면 기존 모델 이동과 systemd 설정(`OLLAMA_MODELS`)까지 처리합니다. 대상은 ext4 같은 리눅스 파일시스템이어야 합니다.
+
 WSL에서 GPU를 쓰려면 Windows에 최신 NVIDIA 드라이버가 깔려 있어야 합니다. WSL 안에서는 `nvidia-smi`로 인식되는지 확인하세요. 상시 운영은 WSL보다 네이티브 우분투가 안정적입니다.
 
 ## 모델 추천 (12GB VRAM)
