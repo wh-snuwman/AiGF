@@ -26,6 +26,59 @@ def clean_name(name: str) -> str:
     return s or name.strip()
 
 
+def humanize(text: str) -> str:
+    """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)"""
+    t = re.sub(r"[…⋯]+|\.{2,}", " ", text)                     # 말줄임표 제거 ("…뭐," → "뭐,")
+    t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)           # ?! → ?
+    t = re.sub(r"([?!？！])\1+", r"\1", t)                      # ??? → ?
+    t = re.sub(r"~{2,}", "~", t)
+    t = re.sub(r"[ \t]+", " ", t).strip(" -—–·")
+    t = re.sub(r"\s+([,?!])", r"\1", t)
+    t = re.sub(r"[.。]+$", "", t)                               # 문장 끝 마침표 제거
+    t = re.sub(r"^[,\s]+", "", t)
+    return t.strip()
+
+
+_STOP = {
+    "그냥", "진짜", "근데", "그리고", "그래서", "이거", "그거", "저거", "나도", "너도", "이제", "아니", "그럼",
+    "뭔가", "너무", "다시", "그게", "이게", "어차피", "일단", "지금", "오늘", "내가", "네가", "니가", "우리",
+    "그런", "이런", "저런", "하는", "하고", "있는", "있어", "없어", "했어", "해서", "해도", "같은", "같아",
+}
+
+
+def _stem(tok: str) -> str:
+    """조사/어미가 붙어도 같은 말로 묶기 위해 앞 두 글자만 쓴다. (레벨은/레벨업 → 레벨)"""
+    return tok if len(tok) <= 2 else tok[:2]
+
+
+def overused_phrases(lines: list[str]) -> list[tuple[str, str]]:
+    """최근 자기 발언에서 반복되는 단어를 찾는다. [(보여줄 단어, 매칭용 어간)]
+    - 최근 14줄 중 3줄 이상, 또는 최근 8줄 중 2줄 이상에 나온 말을 대상으로 한다."""
+    def count(sub: list[str]) -> tuple[Counter[str], dict[str, str]]:
+        c: Counter[str] = Counter()
+        disp: dict[str, str] = {}
+        for ln in sub:
+            toks = [re.sub(r"[^\w]", "", w) for w in ln.split()]
+            toks = [t for t in toks if len(t) >= 2 and t not in _STOP]
+            for t in toks:
+                s = _stem(t)
+                if s not in disp or len(t) < len(disp[s]):
+                    disp[s] = t
+            for s in {_stem(t) for t in toks}:
+                c[s] += 1
+        return c, disp
+
+    c14, d14 = count(lines[-14:])
+    c5, d5 = count(lines[-8:])
+    stems = {s: n for s, n in c14.items() if n >= 3}
+    for s, n in c5.items():
+        if n >= 2:
+            stems[s] = max(stems.get(s, 0), n + 1)
+    disp = {**d14, **d5}
+    ranked = sorted(stems.items(), key=lambda kv: -kv[1])[:8]
+    return [(disp[s], s) for s, _ in ranked]
+
+
 # ---------- 답변 길이: 상황에 따라 랜덤하게 ----------
 @dataclass(frozen=True)
 class LengthMode:
@@ -146,14 +199,17 @@ class ChatEngine:
                 if prev_ts and h["ts"] - prev_ts >= 600:
                     text = f"(약 {int((h['ts'] - prev_ts) // 60)}분 지남)\n" + text
             else:
-                role, text = "assistant", h["content"]
+                # 예전에 남은 '…' 같은 버릇이 모델에게 전염되지 않도록 기록도 정리해서 보여준다
+                cleaned = [humanize(ln) for ln in h["content"].split("\n")]
+                role, text = "assistant", "\n".join(ln for ln in cleaned if ln) or h["content"]
             prev_ts = h["ts"]
             if merged and merged[-1]["role"] == role:
                 merged[-1]["content"] += "\n" + text
             else:
                 merged.append({"role": role, "content": text})
 
-        own = [ln for h in hist if h["role"] == "assistant" for ln in h["content"].split("\n") if ln.strip()]
+        own = [humanize(ln) for h in hist if h["role"] == "assistant" for ln in h["content"].split("\n")]
+        own = [ln for ln in own if ln]
         scene, activity = await self._scene(hist)
         known: set[str] = set()
         for h in hist:
@@ -172,9 +228,42 @@ class ChatEngine:
         return [{"role": "system", "content": system}] + self.persona.example_messages() + merged
 
     @staticmethod
-    def _own_block(own_recent: list[str]) -> str:
+    def _own_block(own_recent: list[str]) -> tuple[str, list[str]]:
         own = "\n".join(f"  · {t}" for t in own_recent[-8:]) or "  (없음)"
-        return f"- 최근에 네가 한 말이다. 이와 비슷한 표현, 시작 단어, 문장 구조, 농담은 쓰지 마라:\n{own}"
+        pairs = overused_phrases(own_recent)
+        text = f"- 최근에 네가 한 말이다. 이와 비슷한 표현, 시작 단어, 문장 구조, 농담은 쓰지 마라:\n{own}"
+        if pairs:
+            text += ("\n- 최근 너무 자주 쓴 표현이다. 이번 답변에서는 이 단어/표현을 절대 쓰지 마라: "
+                     + ", ".join(f"'{d}'" for d, _ in pairs))
+        return text, [s for _, s in pairs]
+
+    async def _generate(
+        self, msgs: list[dict[str, str]], mode: LengthMode, banned: list[str],
+        known: set[str], can_skip: bool = False, temperature: float | None = None,
+    ) -> tuple[LLMResult, list[str] | None]:
+        """생성 → 후처리. 반복 표현이 2개 이상 섞이면 한 번만 다시 생성한다. SKIP 이면 (res, None)."""
+        extra = {"temperature": temperature} if temperature else {}
+        res = await self.llm.chat(msgs, num_predict=mode.num_predict, **extra)
+        if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
+            return res, None
+        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles)
+        hits = [p for p in banned if any(p in b for b in bubbles)]
+        if bubbles and len(hits) >= 2:
+            retry = msgs[:-1] + [{
+                "role": "user",
+                "content": msgs[-1]["content"]
+                + f"\n\n[재작성 지시] 방금 답에 {', '.join(repr(h) for h in hits)} 같은 반복 표현이 있었다. "
+                  "이 표현들을 빼고 완전히 다른 말로 다시 대답해라.",
+            }]
+            base_t = self.llm.options.get("temperature", 1.0)
+            res2 = await self.llm.chat(retry, num_predict=mode.num_predict, temperature=min(1.2, base_t + 0.15))
+            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles)
+            res2.prompt_tokens += res.prompt_tokens
+            res2.completion_tokens += res.completion_tokens
+            if b2:
+                return res2, b2
+            res.prompt_tokens, res.completion_tokens = res2.prompt_tokens, res2.completion_tokens
+        return res, bubbles
 
     async def _record(self, kind: str, res: LLMResult, target_id: int, target_name: str,
                       channel_id: int, snippet: str) -> None:
@@ -192,6 +281,7 @@ class ChatEngine:
         who = self.label(target_id, target_name)
         call = self.call_name(target_id, target_name)
         mode = pick_length(target_text, activity, priority or dm)
+        own_text, banned = self._own_block(own)
 
         parts = [
             "[상황 메모 — 이 메모 자체는 절대 언급하지 마라]",
@@ -201,7 +291,7 @@ class ChatEngine:
             "- 이름: 사람을 부를 때는 위 [현재 대화 상황]에 적힌 진짜 이름/호칭을 쓰되 매번 부르지는 마라. "
             "이전에 나온 이름, 사건, 말을 기억해서 맥락 있게 언급해라.",
             f"- 이번 답변 길이: [{mode.label}] {mode.desc}. 이 길이를 지켜라.",
-            self._own_block(own),
+            own_text,
         ]
         if extra_note:
             parts.append(f"- 추가 상황: {extra_note}")
@@ -209,11 +299,10 @@ class ChatEngine:
             parts.append("- 이 말이 너와 상관없고 끼어들 이유도 없으면 다른 말 없이 SKIP 이라고만 출력해라.")
         msgs = self._assemble(who, facts, scene, merged, "\n".join(parts), self.views.get(target_id, ""))
 
-        res = await self.llm.chat(msgs, num_predict=mode.num_predict)
-        if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
+        res, bubbles = await self._generate(msgs, mode, banned, known, can_skip)
+        if bubbles is None:
             await self._record("reply", res, target_id, target_name, channel_id, "(SKIP: 대답하지 않음)")
             return []
-        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles)
         if not bubbles:
             return []
         await self.mem.add_message(
@@ -228,6 +317,7 @@ class ChatEngine:
     async def initiate(self, channel_id: int, instruction: str, idle_minutes: int, unanswered: int) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, None)
         mode = pick_length("", activity, False, free=True)
+        own_text, banned = self._own_block(own)
         parts = [
             "[상황 메모 — 이 메모 자체는 절대 언급하지 마라]",
             f"- 이 채널은 약 {idle_minutes}분째 아무도 말하지 않고 있다. 네가 먼저 말을 꺼내는 상황이다.",
@@ -238,11 +328,10 @@ class ChatEngine:
         parts += [
             "- 사람 이름을 부를 때는 [현재 대화 상황]에 적힌 진짜 이름/호칭을 쓴다. 특정인을 부르지 않아도 된다.",
             f"- 이번 길이: [{mode.label}] {mode.desc}. 이 길이를 지켜라.",
-            self._own_block(own),
+            own_text,
         ]
         msgs = self._assemble("", [], scene, merged, "\n".join(parts))
-        res = await self.llm.chat(msgs, num_predict=mode.num_predict, temperature=1.05)
-        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles)
+        res, bubbles = await self._generate(msgs, mode, banned, known, temperature=1.05)
         if bubbles:
             await self.mem.add_message(channel_id, 0, self.persona.name, "assistant", "\n".join(bubbles))
             await self._record("idle", res, 0, "(혼잣말)", channel_id, f"[{mode.label}] " + " / ".join(bubbles))
@@ -253,16 +342,16 @@ class ChatEngine:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, user_id)
         who = self.label(user_id, user_name)
         mode = pick_length("", activity, False, free=True)
+        own_text, banned = self._own_block(own)
         hint = "\n".join([
             "[상황 메모 — 이 메모 자체는 절대 언급하지 마라]",
             f"- {who}에게 먼저 말을 거는 상황이다. 마지막 대화로부터 약 {idle_hours:.0f}시간이 지났다. "
             "현재 시간대와 기억하는 정보를 바탕으로 자연스럽게 먼저 연락해라.",
             f"- 길이: [{mode.label}] {mode.desc}",
-            self._own_block(own),
+            own_text,
         ])
         msgs = self._assemble(who, facts, scene, merged, hint, self.views.get(user_id, ""))
-        res = await self.llm.chat(msgs, temperature=1.0, num_predict=mode.num_predict)
-        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles)
+        res, bubbles = await self._generate(msgs, mode, banned, known, temperature=1.0)
         if bubbles:
             await self.mem.add_message(
                 channel_id, 0, self.persona.name, "assistant", "\n".join(bubbles), dm_user_id=user_id)
@@ -285,7 +374,8 @@ class ChatEngine:
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
         text = re.sub(r"^#+\s*", "", text, flags=re.M)
         text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
-        parts = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
+        parts = [humanize(p) for p in re.split(r"\n+", text)]
+        parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])
         if len(parts) > limit:
             parts = parts[: limit - 1] + [" ".join(parts[limit - 1:])]
