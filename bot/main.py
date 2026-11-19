@@ -167,8 +167,11 @@ class GirlBot(discord.Client):
         char = await memory.kv_get("character")
         if char:
             persona.load(char)
+        eg = await memory.kv_get("engagement")
+        if eg:
+            engine.mood.engage = float(eg)
         fl = await memory.kv_get("fight_level")
-        if fl in ("1", "2"):
+        if fl in ("1", "2", "3"):
             engine.fights.cfg["level"] = int(fl)
         fe = await memory.kv_get("fight_enabled")
         if fe is not None:
@@ -261,6 +264,7 @@ def crowd_now(channel_id: int) -> tuple[int, int]:
 def next_cooldown(channel_id: int | None = None) -> float:
     """다음 발언까지의 쿨다운. 기분(신나면 짧게)과 대화 인원(많을수록 짧게)이 반영된다."""
     base = bot.cooldown * engine.mood.cooldown_mult * (1 + random.random() * gcfg["cooldown_jitter"])
+    base /= max(0.5, engine.mood.engage)         # 적극성이 높을수록 쿨다운이 짧다
     if channel_id is not None:
         users, msgs = crowd_now(channel_id)
         base *= targeting.crowd_factor(users, msgs, gcfg["crowd_boost"], gcfg["crowd_min_ratio"])
@@ -640,7 +644,8 @@ async def group_loop() -> None:
         if prio:
             pool = prio
         else:
-            chance = gcfg["reply_chance"] + targeting.chance_boost(users, gcfg["crowd_chance_per_user"])
+            chance = (gcfg["reply_chance"] + targeting.chance_boost(users, gcfg["crowd_chance_per_user"])
+                      + 0.2 * (engine.mood.engage - 1.0))      # 적극성이 높을수록 더 많은 말에 대답한다
             if random.random() > min(1.0, chance * engine.mood.reply_mult):
                 # 글로는 대답하지 않지만 이모지 리액션은 달 수 있다
                 for p in ready:
@@ -1015,7 +1020,7 @@ async def status(interaction: discord.Interaction) -> None:
         f"- 캐릭터: **{persona.name}** (`{persona.char_id}`)\n"
         f"- 모델: `{llm.model}`\n"
         f"- 상태: {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
-        f"- 기분: {engine.mood.current().label}\n"
+        f"- 기분: {engine.mood.current().label} · 적극성 {engine.mood.engage:g}\n"
         f"- 쿨다운: {bot.cooldown:g}초 (+최대 {int(gcfg['cooldown_jitter'] * 100)}% 랜덤)\n"
         f"- 대화 채널: {ch}\n"
         f"- 대기 중 메시지: {pend}개 | 저장된 기록 {fmt(total_msgs)}개 ({n_ch}개 채널)\n"
@@ -1214,9 +1219,33 @@ async def mood_cmd(
     await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
 
 
+LEVEL_DESC = {1: "순화된 말싸움만", 2: "가벼운 욕까지", 3: "센 욕설까지 (가족·외모·성적·장애·지역·혐오 비하와 위협은 계속 금지)"}
+
+
+# ---- 적극성 ----
+@bot.tree.command(name="적극성", description="대화에 얼마나 적극적으로 참여할지 조절해요 (1.0=기본, 높을수록 적극적)")
+@app_commands.describe(level="0.5(느긋)~2.0(매우 적극). 생략하면 현재 값 확인")
+@app_commands.rename(level="단계")
+async def engagement_cmd(
+    interaction: discord.Interaction, level: Optional[app_commands.Range[float, 0.5, 2.0]] = None
+) -> None:
+    m = engine.mood
+    if level is None:
+        await interaction.response.send_message(
+            f"현재 적극성: **{m.engage:g}** (1.0=기본). 에너지 바닥 {m.energy_floor * m.engage_amount():.2f}, "
+            f"대답 확률 보너스 +{max(0.0, 0.2 * (m.engage - 1.0)):.2f}, 쿨다운 x{1 / max(0.5, m.engage):.2f}", ephemeral=True)
+        return
+    m.engage = float(level)
+    await memory.kv_set("engagement", f"{m.engage:g}")
+    m.boost_to_baseline()
+    await interaction.response.send_message(
+        f"적극성을 **{m.engage:g}**로 바꿨어요. " + ("더 자주, 더 길게, 덜 귀찮아하며 대화에 참여해요." if m.engage > 1.0
+                                                       else "기본 또는 느긋한 모드예요."), ephemeral=True)
+
+
 # ---- 싸움 ----
 @bot.tree.command(name="싸움", description="말싸움 기능을 관리해요 (켜기/끄기/수위/상태/시작/중단)")
-@app_commands.describe(action="동작", user="'시작'할 때 상대 유저", level="'수위' 설정: 1=순화된 말싸움, 2=가벼운 욕까지")
+@app_commands.describe(action="동작", user="'시작'할 때 상대 유저", level="'수위' 설정: 1=순화된 말싸움, 2=가벼운 욕까지, 3=센 욕설까지")
 @app_commands.rename(action="동작", user="유저", level="수위")
 @app_commands.choices(action=[
     app_commands.Choice(name="상태", value="status"),
@@ -1228,7 +1257,7 @@ async def mood_cmd(
 ])
 async def fight_cmd(
     interaction: discord.Interaction, action: app_commands.Choice[str],
-    user: Optional[discord.User] = None, level: Optional[app_commands.Range[int, 1, 2]] = None,
+    user: Optional[discord.User] = None, level: Optional[app_commands.Range[int, 1, 3]] = None,
 ) -> None:
     fm = engine.fights
     if action.value in ("on", "off"):
@@ -1241,12 +1270,12 @@ async def fight_cmd(
         return
     if action.value == "level":
         if level is None:
-            await interaction.response.send_message(f"현재 수위: {fm.cfg['level']}", ephemeral=True)
+            await interaction.response.send_message(f"현재 수위: {fm.cfg['level']} ({LEVEL_DESC[int(fm.cfg['level'])]})", ephemeral=True)
             return
         fm.cfg["level"] = int(level)
         await memory.kv_set("fight_level", str(level))
         await interaction.response.send_message(
-            f"수위를 **{level}**로 바꿨어요. ({'가벼운 욕까지' if level == 2 else '순화된 말싸움만'})", ephemeral=True)
+            f"수위를 **{level}**로 바꿨어요. ({LEVEL_DESC[int(level)]})", ephemeral=True)
         return
     if action.value == "stop":
         n = fm.stop_all(interaction.channel_id)

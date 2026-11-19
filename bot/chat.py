@@ -104,7 +104,7 @@ MODES = [
 
 
 def pick_length(text: str, activity: int, priority: bool, free: bool = False,
-                bias: tuple = (1.0, 1.0, 1.0, 1.0)) -> LengthMode:
+                bias: tuple = (1.0, 1.0, 1.0, 1.0), engage: float = 1.0) -> LengthMode:
     """대상 말의 길이/질문 여부, 채팅방 활발함, 멘션 여부, 현재 기분으로 가중치를 바꿔 랜덤 선택."""
     body = re.sub(r"^\(.*?에 답장\)\s*", "", text)
     n = len(body.strip())
@@ -127,6 +127,9 @@ def pick_length(text: str, activity: int, priority: bool, free: bool = False,
     if priority:                             # 직접 부르면 한 단어로 때우지 않는다
         w = [w[0] * 0.25, w[1], w[2] * 1.3, w[3]]
     w = [max(0.001, x * b) for x, b in zip(w, bias)]    # 기분 반영 (졸림 → 짧게, 신남 → 길게 등)
+    if engage > 1.0:                                    # 적극성: 한마디로 끝내기보다 말을 더 보탠다
+        k = min(engage, 2.0)
+        w = [w[0] / (k ** 1.2), w[1], w[2] * k ** 0.8, w[3] * k ** 1.3]
     return random.choices(MODES, weights=w, k=1)[0]
 
 
@@ -140,6 +143,10 @@ class ChatEngine:
         self.people = People(CONFIG_DIR / "people.txt", memory)   # 호칭/이미지 (서버의 텍스트 파일)
         self.guard = Guard(settings.get("guard", {}))              # 프롬프트 인젝션 방어
         self.mood = Mood(memory, persona, self.tz)                 # 기분/상태/마음
+        eg = settings.get("engagement", {})                          # 적극성 (settings.yaml engagement)
+        self.mood.engage = float(eg.get("level", 1.0))
+        self.mood.energy_floor = float(eg.get("energy_floor", 0.45))
+        self.mood.s = self.mood.baseline()
         self.fights = FightManager(settings.get("fight", {}))      # 말싸움
         self.emoji_hint = ""                                       # 서버 이모지 안내 (main 이 갱신)
         self.busy_check = lambda: False                            # 대화가 바쁜지 (기억 추출 보류용, main 이 설정)
@@ -310,6 +317,9 @@ class ChatEngine:
     ) -> list[str]:
         who = self.label(target_id, target_name)
         self.last_skip = False
+        # 적극성이 높으면 'SKIP(대답 안 함)' 선택지를 줄여서 더 많은 대화에 참여한다
+        if can_skip and random.random() < max(0.0, (self.mood.engage - 1.0) * 1.2):
+            can_skip = False
         if fight is not None and not fight.ending:   # 말싸움 중이면 이번 라운드의 기세를 계산한다 (종료 조건이면 fight.ending)
             # 봇의 반격 세기: 화가 나 있고 힘이 넘칠수록 강하고, 졸리거나 상대와 친할수록 약하다
             m = self.mood
@@ -346,7 +356,7 @@ class ChatEngine:
         bias = self.mood.length_bias
         if fight is not None:                  # 싸움은 짧고 빠르게 주고받는다
             bias = tuple(b * m for b, m in zip(bias, (0.5, 1.6, 1.1, 0.2)))
-        mode = pick_length(safe_text, activity, priority or dm or fight is not None, bias=bias)
+        mode = pick_length(safe_text, activity, priority or dm or fight is not None, bias=bias, engage=self.mood.engage)
         own_text, banned = self._own_block(own)
 
         parts = [
@@ -387,8 +397,8 @@ class ChatEngine:
             retry = msgs[:-1] + [{
                 "role": "user",
                 "content": msgs[-1]["content"]
-                + "\n\n[재작성 지시] 방금 답에 금지된 표현(비하, 혐오, 위협, 센 욕설)이 있었다. "
-                  "그런 표현 없이 가벼운 비꼼만으로 다시 대답해라.",
+                + "\n\n[재작성 지시] 방금 답에 금지된 표현(가족/외모/성적/장애/지역/혐오 비하, 위협, "
+                  "또는 현재 수위에서 허용되지 않는 욕설)이 있었다. 그런 표현 없이 다시 대답해라.",
             }]
             res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict)
             b2 = self.to_bubbles(res2.text, known, mode.max_bubbles)
@@ -422,7 +432,7 @@ class ChatEngine:
     # ---------- 채널이 조용할 때 먼저 말 걸기 ----------
     async def initiate(self, channel_id: int, instruction: str, idle_minutes: int, unanswered: int) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, None)
-        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias)
+        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias, engage=self.mood.engage)
         own_text, banned = self._own_block(own)
         parts = [
             "[상황 메모 — 언급 금지]",
@@ -447,7 +457,7 @@ class ChatEngine:
     async def proactive(self, channel_id: int, user_id: int, user_name: str, idle_hours: float) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, user_id)
         who = self.label(user_id, user_name)
-        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias)
+        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias, engage=self.mood.engage)
         own_text, banned = self._own_block(own)
         hint = "\n".join([
             "[상황 메모 — 언급 금지]",

@@ -218,6 +218,8 @@ class Mood:
         self.aff: dict[int, float] = {}                              # 유저별 호감도
         self._atm_ts = 0.0
         self._tasks: set[asyncio.Task] = set()
+        self.engage = 1.0                 # 적극성 (1.0=기본, 높을수록 대화에 적극적). settings.yaml engagement.level
+        self.energy_floor = 0.45          # 적극성이 높을 때 에너지가 이 밑으로 떨어지지 않게 하는 바닥값
         self.s: dict[str, float] = self.baseline()
 
     # ---------- 기준값 / 저장 ----------
@@ -225,8 +227,32 @@ class Mood:
         cfg = (self.persona.data.get("mood_baseline") or {}) if self.persona else {}
         hour = datetime.now(self.tz).hour
         b = {k: float(cfg.get(k, v)) for k, v in DEFAULT_BASE.items()}
-        b["energy"] = _clamp(ENERGY_BY_HOUR[hour] + float(cfg.get("energy_bias", 0.0)), 0.02, 1.0)
+        e = _clamp(self.engage_amount(), 0.0, 1.0)      # 0(기본)~1(매우 적극)
+        energy = ENERGY_BY_HOUR[hour] + float(cfg.get("energy_bias", 0.0))
+        energy = max(energy, self.energy_floor * e)     # 새벽에도 졸림/귀찮음 감정으로 빠지지 않게 바닥을 깐다
+        b["energy"] = _clamp(energy, 0.02, 1.0)
+        b["mood"] = _clamp(b["mood"] + 0.15 * e, -1.0, 1.0)
+        b["interest"] = _clamp(b["interest"] + 0.12 * e, 0.0, 1.0)
         return b
+
+    def engage_amount(self) -> float:
+        """적극성 1.0→0, 1.5 이상→1. 이 값만큼 '게으른 쪽' 보정을 약하게 한다."""
+        return _clamp((self.engage - 1.0) / 0.5, 0.0, 1.0)
+
+    def _soft(self, v: float, lazy_side_below: bool) -> float:
+        """감정이 주는 '귀찮은 쪽' 페널티(대답 확률 감소, 쿨다운 증가, 말 느려짐)를 적극성만큼 1.0 쪽으로 되돌린다."""
+        d = self.engage_amount() * 0.7
+        lazy = (v < 1.0) if lazy_side_below else (v > 1.0)
+        return 1.0 + (v - 1.0) * (1.0 - d) if lazy else v
+
+    def boost_to_baseline(self) -> None:
+        """적극성을 올렸을 때 지금 상태에도 바로 반영: 에너지/기분을 새 기준값 이상으로 끌어올리고 처진 감정 고정을 푼다."""
+        base = self.baseline()
+        self.s["energy"] = max(self.s["energy"], base["energy"])
+        self.s["mood"] = max(self.s["mood"], base["mood"])
+        if self.override and self.override[0] in ("sleepy", "tired", "lazy", "listless", "bored", "gloomy"):
+            self.override = None
+        self._save()
 
     async def load(self) -> None:
         raw = await self.mem.kv_get("mood_state")
@@ -400,19 +426,21 @@ class Mood:
     # ---------- 행동에 미치는 영향 ----------
     @property
     def length_bias(self) -> tuple[float, ...]:
-        return self.current().length
+        d = self.engage_amount() * 0.7          # 졸림/피곤 같은 감정의 '짧게 말하기' 쏠림을 적극성만큼 완화
+        return tuple(1.0 + (x - 1.0) * (1.0 - d) for x in self.current().length)
 
     @property
     def speed(self) -> float:
-        return self.current().speed
+        return self._soft(self.current().speed, lazy_side_below=True)
 
     @property
     def reply_mult(self) -> float:
-        return self.current().reply
+        v = self._soft(self.current().reply, lazy_side_below=True)
+        return v * (1.0 + 0.15 * _clamp(self.engage - 1.0, 0.0, 1.0))      # 적극적일수록 더 자주 끼어든다
 
     @property
     def cooldown_mult(self) -> float:
-        return self.current().cooldown
+        return self._soft(self.current().cooldown, lazy_side_below=False)
 
     def filter_text(self, text: str) -> str:
         """기분에 맞지 않는 표현(예: 화났는데 ㅋㅋ)을 제거한다."""
