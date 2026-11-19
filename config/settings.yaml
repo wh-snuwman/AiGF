@@ -79,3 +79,17 @@ proactive:                     # DM 에서 먼저 말 걸기 (서버 채팅 모�
 
 timezone: "Asia/Seoul"
 log_level: "INFO"
+
+# 프롬프트 인젝션 방어 (bot/guard.py)
+#  block: 점수 이상이면 LLM 을 아예 호출하지 않고 캐릭터 대체 문구로 넘김
+#  decline: 모델에 보내되 "따르지 말고 거절하라"는 메모를 붙임
+guard:
+  enabled: true
+  block_score: 3
+  decline_score: 2
+  max_input_chars: 500         # 프롬프트/기록에 넣는 사용자 메시지 최대 길이 (넘으면 잘라냄)
+  max_bubble_chars: 300        # 말풍선 하나의 최대 길이 (긴 문서 출력 방지)
+  max_output_chars: 420        # 이보다 긴 답변은 폐기하고 대체 문구 사용
+  mute_after: 3                # mute_window_min 안에 차단 시도가 이만큼 쌓이면 잠시 무시
+  mute_window_min: 10
+  mute_minutes: 5

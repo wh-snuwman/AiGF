@@ -4,3 +4,4 @@ __pycache__/
 data/
 *.pyc
 AIGF_info.txt
+config/people.txt

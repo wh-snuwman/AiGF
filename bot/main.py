@@ -250,6 +250,9 @@ async def on_message(message: discord.Message) -> None:
     text = clean_text(message)
     if not text:
         return
+    # 명령/주입을 반복 시도한 사람은 잠시 무시한다 (관리자는 제외)
+    if engine.guard.is_muted(message.author.id) and message.author.id not in ADMIN_IDS:
+        return
 
     # ----- DM: 1:1 이므로 바로 대답 -----
     if isinstance(message.channel, discord.DMChannel):
@@ -262,14 +265,29 @@ async def on_message(message: discord.Message) -> None:
     mentioned = dcfg["respond_to_mention"] and is_priority(message)
     if not (in_channel or mentioned):
         return
-    await memory.add_message(message.channel.id, message.author.id, message.author.display_name, "user", text)
+    stored = guard_store_text(message.author, text)
+    await memory.add_message(message.channel.id, message.author.id, message.author.display_name, "user", stored)
     mark_human_activity(message.channel.id)
-    engine.mood.observe(text, directed=mentioned or is_directed(text))
+    engine.mood.observe(stored, directed=mentioned or is_directed(text), uid=message.author.id,
+                        who=engine.label(message.author.id, message.author.display_name))
     if bot.paused:
         return
     bot.pending.setdefault(message.channel.id, []).append(
         Pending(message, time.monotonic(), priority=mentioned)
     )
+
+
+def guard_store_text(author: discord.abc.User, text: str) -> str:
+    """대화 기록에는 무력화한 텍스트만 저장한다. 차단 수준의 시도가 반복되면 잠시 무시(뮤트)한다."""
+    verdict = engine.guard.inspect(text)
+    if verdict.level == "block":
+        log.warning("인젝션 시도 user=%s(%s) score=%s kinds=%s", author.id, author.display_name,
+                    verdict.score, verdict.kinds)
+        if engine.guard.note_attempt(author.id) and author.id not in ADMIN_IDS:
+            minutes = engine.guard.cfg["mute_minutes"]
+            log.warning("반복 시도로 %s분간 무시: %s", minutes, author.id)
+            engine.mood.set_emotion("annoyed", minutes)
+    return engine.guard.history_text(text, verdict)
 
 
 def mark_human_activity(channel_id: int) -> None:
@@ -298,8 +316,9 @@ async def handle_dm(message: discord.Message, text: str) -> None:
     """DM: 연달아 온 메시지를 잠깐 기다렸다가 한 번에 묶어서 처리한다."""
     uid = message.author.id
     await memory.set_dm_channel(uid, message.channel.id)
-    await memory.add_message(message.channel.id, uid, message.author.display_name, "user", text)
-    engine.mood.observe(text, directed=True)
+    stored = guard_store_text(message.author, text)
+    await memory.add_message(message.channel.id, uid, message.author.display_name, "user", stored)
+    engine.mood.observe(stored, directed=True, uid=uid, who=engine.label(uid, message.author.display_name))
     bot.dm_buffer.setdefault(uid, []).append(text)
     t = bot.dm_tasks.get(uid)
     if t and not t.done() and uid not in bot.dm_generating:
@@ -583,7 +602,7 @@ async def usage_total(interaction: discord.Interaction) -> None:
         f"최근 7일   {fmt(u['week'][1] + u['week'][2])} ({fmt(u['week'][0])}회)```",
     ]
     if u["by_kind"]:
-        names = {"reply": "일반 답변", "memory": "기억 추출", "proactive": "DM 먼저", "idle": "혼잣말"}
+        names = {"reply": "일반 답변", "memory": "기억 추출", "proactive": "DM 먼저", "idle": "혼잣말", "guard": "인젝션 차단"}
         lines.append("**용도별**\n```" + "\n".join(
             f"{names.get(k, k):<8} {fmt((pp or 0) + (cc or 0)):>12} 토큰 ({fmt(nn)}회)" for k, nn, pp, cc in u["by_kind"]
         ) + "```")
@@ -772,98 +791,47 @@ async def manage_memory(
         f"**{persona.name}이(가) 기억하는 {user.display_name}**\n{body}"[:1990], ephemeral=True)
 
 
-# ---- 9. 이름 (닉네임 대신 쓸 진짜 이름 등록) ----
-@bot.tree.command(name="이름", description="유저의 진짜 이름(호칭)을 등록해요. 봇은 닉네임 대신 이 이름으로 불러요")
-@app_commands.describe(action="등록/삭제/목록", user="대상 유저 (등록/삭제 시)", name="진짜 이름 (예: 민수)",
-                       call="부를 때 쓸 호칭 (예: 민수야, 민수형). 생략하면 이름 그대로")
-@app_commands.rename(action="동작", user="유저", name="이름", call="호칭")
+# ---- 9. 사람 (호칭/이미지는 서버의 config/people.txt 파일에서 직접 수정) ----
+@bot.tree.command(name="사람", description="config/people.txt 에 설정된 호칭/이미지를 확인하거나 다시 불러와요")
+@app_commands.describe(action="목록/보기/리로드", user="보기 대상 유저")
+@app_commands.rename(action="동작", user="유저")
 @app_commands.choices(action=[
-    app_commands.Choice(name="등록", value="set"),
-    app_commands.Choice(name="삭제", value="del"),
     app_commands.Choice(name="목록", value="list"),
-])
-async def manage_names(
-    interaction: discord.Interaction, action: app_commands.Choice[str],
-    user: Optional[discord.User] = None, name: Optional[str] = None, call: Optional[str] = None,
-) -> None:
-    if action.value == "list":
-        if not engine.names:
-            await interaction.response.send_message("등록된 이름이 없어요.", ephemeral=True)
-            return
-        body = "\n".join(
-            f"<@{uid}> → {real}" + (f" (호칭: {c})" if c else "") for uid, (real, c) in engine.names.items()
-        )
-        await interaction.response.send_message(f"**등록된 이름**\n{body}"[:1990], ephemeral=True)
-        return
-    if user is None:
-        await interaction.response.send_message("유저를 지정해주세요.", ephemeral=True)
-        return
-    if action.value == "del":
-        removed = await memory.del_real_name(user.id)
-        engine.names.pop(user.id, None)
-        await interaction.response.send_message(
-            "이름 등록을 지웠어요." if removed else "등록된 이름이 없어요.", ephemeral=True)
-        return
-    if not name or not name.strip():
-        await interaction.response.send_message("등록할 이름을 입력해주세요.", ephemeral=True)
-        return
-    real = name.strip()[:30]
-    call_name = call.strip()[:30] if call and call.strip() else None
-    await memory.set_real_name(user.id, real, call_name)
-    engine.names[user.id] = (real, call_name)
-    await interaction.response.send_message(
-        f"{user.display_name} → **{real}**" + (f" (호칭: {call_name})" if call_name else "") + " 로 등록했어요.",
-        ephemeral=True)
-
-
-# ---- 10. 인식 (캐릭터가 그 사람을 어떻게 보는지) ----
-@bot.tree.command(name="인식", description="캐릭터가 각 유저를 어떻게 생각하는지(인식)를 설정해요. 예: 대호 = 멍청한 개발자")
-@app_commands.describe(action="설정/삭제/보기/목록", user="대상 유저",
-                       view="캐릭터가 그 유저에 대해 가진 인식 (예: 멍청한 개발자. 버그만 만들고 허세 부림)")
-@app_commands.rename(action="동작", user="유저", view="내용")
-@app_commands.choices(action=[
-    app_commands.Choice(name="설정", value="set"),
-    app_commands.Choice(name="삭제", value="del"),
     app_commands.Choice(name="보기", value="show"),
-    app_commands.Choice(name="목록", value="list"),
+    app_commands.Choice(name="리로드", value="reload"),
 ])
-async def manage_views(
-    interaction: discord.Interaction, action: app_commands.Choice[str],
-    user: Optional[discord.User] = None, view: Optional[str] = None,
+async def people_cmd(
+    interaction: discord.Interaction, action: app_commands.Choice[str], user: Optional[discord.User] = None
 ) -> None:
-    if action.value == "list":
-        if not engine.views:
-            await interaction.response.send_message("설정된 인식이 없어요.", ephemeral=True)
-            return
-        def nm(uid: int) -> str:
-            u = bot.get_user(uid)
-            return engine.label(uid, u.display_name if u else str(uid))
-
-        body = "\n".join(f"{nm(uid)} (<@{uid}>) = {v}" for uid, v in engine.views.items())
-        await interaction.response.send_message(f"**{persona.name}의 인식**\n{body}"[:1990], ephemeral=True)
+    ppl = engine.people
+    if action.value == "reload":
+        n = ppl.reload()
+        msg = f"people.txt 를 다시 불러왔어요. ({n}명)"
+        if ppl.errors:
+            msg += "\n형식 오류:\n" + "\n".join(f"- {e}" for e in ppl.errors[:8])
+        await interaction.response.send_message(msg[:1990], ephemeral=True)
         return
-    if user is None:
-        await interaction.response.send_message("유저를 지정해주세요.", ephemeral=True)
-        return
-    who = engine.label(user.id, user.display_name)
     if action.value == "show":
-        v = engine.views.get(user.id)
+        if user is None:
+            await interaction.response.send_message("유저를 지정해주세요.", ephemeral=True)
+            return
+        name = ppl.names.get(user.id)
+        view = ppl.views.get(user.id)
+        aff = engine.mood.affinity(user.id)
+        label, _ = engine.mood.aff_label(aff)
         await interaction.response.send_message(
-            f"{who} = {v}" if v else f"{who}에 대한 인식이 설정돼 있지 않아요.", ephemeral=True)
+            f"**{user.display_name}** (`{user.id}`)\n- 부르는 이름: {name[0] if name else '(없음, 닉네임 사용)'}\n"
+            f"- 이미지: {view or '(없음)'}\n- 호감도: {label} ({aff:+.2f})", ephemeral=True)
         return
-    if action.value == "del":
-        removed = await memory.del_view(user.id)
-        engine.views.pop(user.id, None)
+    ids = sorted(set(ppl.names) | set(ppl.views))
+    if not ids:
         await interaction.response.send_message(
-            f"{who}에 대한 인식을 지웠어요." if removed else "설정된 인식이 없어요.", ephemeral=True)
+            f"등록된 사람이 없어요. 서버의 `{ppl.path}` 파일에 한 줄씩 적으세요.\n"
+            "형식: `유저아이디:캐릭터가부를이름:사람에대한AI의이미지`", ephemeral=True)
         return
-    if not view or not view.strip():
-        await interaction.response.send_message("인식 내용을 입력해주세요.", ephemeral=True)
-        return
-    text = view.strip()[:300]
-    await memory.set_view(user.id, text)
-    engine.views[user.id] = text
-    await interaction.response.send_message(f"**{who}** = {text}\n(이제부터 이 인식대로 대해요)", ephemeral=True)
+    body = "\n".join(
+        f"<@{uid}> → {(ppl.names.get(uid) or ('-',))[0]} / {ppl.views.get(uid, '(이미지 없음)')}" for uid in ids)
+    await interaction.response.send_message(f"**people.txt ({len(ids)}명)**\n{body}"[:1990], ephemeral=True)
 
 
 # ---- 기분/상태 ----
@@ -929,6 +897,8 @@ async def mood_cmd(
         f"흥미   {bar(sc['interest'])} {sc['interest']}",
         "```",
         f"말투: {e.tone}",
+        "조절: " + " / ".join(snap["knobs"]),
+        "마음속: " + (" / ".join(snap["thoughts"]) if snap["thoughts"] else "(특별한 일 없음)"),
         f"-# 타이핑 속도 x{e.speed:g} · 끼어들기 x{e.reply:g} · 쿨다운 x{e.cooldown:g}",
     ]
     await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
