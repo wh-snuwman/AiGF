@@ -1,10 +1,14 @@
 # ============================================================
-# 봇 동작 설정 (모델, 기억, 말하는 속도, 먼저 말걸기 등)
+# 봇 동작 설정 (모델, 기억, 대화 방식, 타이핑 속도 등)
+# 이 파일은 봇을 재시작해야 반영됩니다. (/리로드 는 캐릭터 yaml 만 다시 읽음)
 # ============================================================
+
+# 시작 시 사용할 캐릭터 (config/characters/<id>.yaml). /캐릭터스왑 으로 바꾸면 그 값이 우선합니다.
+character: "eunlang"          # eunlang / miku / teto
 
 ollama:
   host: "http://127.0.0.1:11434"
-  model: "gemma3:12b"          # 메인 대화 모델 (아래 README의 모델 추천 참고)
+  model: "gemma3:12b-it-qat"   # 메인 대화 모델
   keep_alive: "30m"            # 모델을 VRAM에 유지하는 시간
   options:
     temperature: 0.9           # 높을수록 창의적/다양, 낮을수록 안정적
@@ -15,38 +19,45 @@ ollama:
     num_predict: 300           # 답변 최대 토큰 (짧게 유지)
 
 discord:
-  # 봇이 자동으로 대답할 채널 ID 목록 (비우면 DM과 멘션에만 반응)
+  # 봇이 대화에 참여할 채널 ID 목록. 비워도 되고, 디스코드에서 /채널 추가 로 등록할 수 있음.
+  # (등록한 채널은 DB에 저장되어 이 목록보다 우선합니다)
   channel_ids: []
   respond_to_dm: true
-  respond_to_mention: true
-  # 특정 유저만 허용하려면 ID 입력 (비우면 모두 허용)
-  allowed_user_ids: []
-  # 관리자 (리로드/초기화 등 관리 명령 가능)
-  admin_user_ids: []
+  respond_to_mention: true     # 등록 안 된 채널에서도 멘션/답장하면 대답
+  allowed_user_ids: []         # 비우면 모두 허용
+  # 관리자: 모든 슬래시 명령은 여기 있는 사람만 사용 가능
+  admin_user_ids: [1400842550893608970]
+
+# 서버 채널에서 '캐릭터가 같이 채팅하는' 방식
+group:
+  cooldown_sec: 25             # 대답을 '완전히 끝낸 뒤' 다음 대답까지 쉬는 시간(초) → /쿨다운 으로 변경 가능
+  cooldown_jitter: 0.6         # 쿨다운에 0~60% 랜덤 추가 (너무 기계적이지 않게)
+  reply_chance: 0.9            # 쿨다운 후 올라온 메시지에 대답할 확률 (1.0이면 항상)
+  mention_bypass_cooldown: true  # 멘션/답장은 쿨다운 무시하고 바로 대답 (끄면 멘션도 쿨다운 적용)
+  max_pending_age_sec: 300     # 이 시간보다 오래된 메시지는 대답 후보에서 제외
 
 memory:
   db_path: "data/memory.db"
-  history_turns: 16            # 프롬프트에 넣을 최근 대화 개수(메시지 단위)
-  extract_every: 10            # 유저 메시지 N개마다 장기 기억(사실) 추출
-  max_facts_in_prompt: 25      # 프롬프트에 넣을 장기 기억 최대 개수
+  history_turns: 20            # 프롬프트에 넣을 최근 채널 대화 개수(메시지 단위)
+  extract_every: 10            # 유저에게 N번 대답할 때마다 장기 기억(사실) 추출
+  max_facts_in_prompt: 25
   max_facts_per_user: 200
 
 typing:
   enabled: true
-  chars_per_second: 14         # 타이핑 속도 (글자/초). 클수록 빠름
-  min_delay: 0.8               # 말풍선당 최소 딜레이(초)
+  chars_per_second: 14         # 타이핑 속도 (글자/초)
+  min_delay: 0.8
   max_delay: 5.0
   max_bubbles: 3               # 한 번에 보낼 최대 말풍선 수
-  read_delay: [0.5, 2.0]       # 메시지를 읽는 척 하는 지연(초) 범위
+  read_delay: [0.5, 2.0]       # DM에서 메시지를 읽는 척 하는 지연(초)
 
-proactive:                     # 캐릭터가 먼저 말 걸기
-  enabled: true
-  check_interval_min: 10       # 몇 분마다 검사할지
-  idle_hours_min: 5            # 마지막 대화 후 최소 이 시간 지나야 먼저 연락
-  max_per_day: 2               # 유저당 하루 최대 횟수
-  active_hours: [9, 23]        # 이 시간대(KST)에만 연락
-  dm_only: true                # DM으로만 먼저 연락
-  chance: 0.35                 # 검사 시점마다 연락할 확률 (너무 기계적이지 않게)
+proactive:                     # DM 에서 먼저 말 걸기 (서버 채팅 모드에서는 기본 꺼둠)
+  enabled: false
+  check_interval_min: 10
+  idle_hours_min: 5
+  max_per_day: 2
+  active_hours: [9, 23]
+  chance: 0.35
 
 timezone: "Asia/Seoul"
 log_level: "INFO"

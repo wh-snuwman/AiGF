@@ -1,55 +1,66 @@
-# AI 여친 디스코드 봇 (Ollama, 로컬)
+# 서버 일원 캐릭터 디스코드 봇 (Ollama, 로컬)
 
-블루아카이브 풍 임시 캐릭터 "하루카제 미나"가 들어 있습니다. 캐릭터와 동작은 전부 `config/` 안의 파일로 바꿉니다.
+캐릭터가 디스코드 서버에 놀러 온 멤버처럼 같이 채팅합니다. 은랑(붕괴: 스타레일), 하츠네 미쿠, 카사네 테토가 들어 있고 `/캐릭터스왑`으로 바꿀 수 있습니다.
+
+## 대화 방식
+
+- 등록된 채널의 모든 메시지를 읽어 대화 기록으로 쌓습니다.
+- 대답을 끝낸 시점부터 쿨다운(기본 25초 + 랜덤 0~60%)이 돌고, 끝나면 그동안 올라온 메시지 중 하나를 랜덤으로 골라 대답합니다. 나머지는 대화 맥락으로만 반영됩니다.
+- 봇을 멘션하거나 봇의 메시지에 답장하면 쿨다운을 무시하고 바로 대답합니다. (`mention_bypass_cooldown`)
+- 대답하는 사이에 다른 메시지가 올라왔으면 디스코드 답장 기능으로 누구에게 하는 말인지 표시합니다.
+- DM은 1:1이라 바로 대답합니다.
 
 ## 구조
 
 ```
-config/persona.yaml   캐릭터 (이름/성격/말투/배경/규칙/예시 대화)  ← 가장 중요
-config/settings.yaml  모델, 생성 옵션, 기억, 타이핑 속도, 먼저 말걸기, 채널
-bot/main.py           디스코드 이벤트, 슬래시 명령, 먼저 말걸기 루프
-bot/chat.py           프롬프트 조립, 말풍선 분리, 장기 기억 추출
-bot/llm.py            Ollama 호출
-bot/memory.py         SQLite (대화 기록 + 장기 기억)
-bot/persona.py        persona.yaml → 시스템 프롬프트
-scripts/              설치 스크립트, systemd 서비스
+config/characters/*.yaml  캐릭터 (프로필/성격/말투/호칭/예시 대화)   ← 파일을 추가하면 새 캐릭터
+config/common.yaml        모든 캐릭터에 공통인 규칙 (AI 부인, 짧은 말풍선 등)
+config/settings.yaml      모델, 쿨다운, 기억, 타이핑 속도, 관리자 ID
+bot/main.py               디스코드 이벤트, 쿨다운 루프, 슬래시 명령
+bot/chat.py               프롬프트 조립, 말풍선 분리, 장기 기억 추출
+bot/llm.py                Ollama 호출 (토큰 사용량 포함)
+bot/memory.py             SQLite (대화 기록, 장기 기억, 토큰 사용량, 봇 상태)
+bot/persona.py            캐릭터 yaml → 시스템 프롬프트
+scripts/                  설치, 모델 확인, 모델 경로 이동, systemd
 ```
 
-## 설치 (Ubuntu / WSL)
+## 새 캐릭터 추가
 
-1. 프로젝트 폴더를 우분투로 복사합니다. WSL이면 `cp -r /mnt/c/Users/snowm/Desktop/PR_AIgirl ~/PR_AIgirl` 후 그 폴더에서 진행합니다. `/mnt/c` 위에서 직접 돌리면 느립니다.
-2. `bash scripts/setup_ubuntu.sh` 를 실행합니다. Ollama 설치, 모델 다운로드, venv 구성까지 처리합니다. 다른 모델을 쓰려면 `bash scripts/setup_ubuntu.sh 모델명` 으로 실행합니다.
-3. 디스코드 개발자 포털(https://discord.com/developers/applications)에서 봇을 만듭니다.
-   - Bot 탭에서 **Message Content Intent**를 켜고 토큰을 복사합니다.
-   - OAuth2 → URL Generator에서 `bot`, `applications.commands` 스코프로 서버에 초대합니다.
-4. `.env`에 `DISCORD_TOKEN=...` 을 넣습니다.
-5. `config/settings.yaml`에서 본인 디스코드 ID를 `admin_user_ids`에 넣습니다. 개발자 모드를 켠 뒤 프로필을 우클릭해 ID를 복사합니다.
-6. `.venv/bin/python -m bot.main` 으로 실행합니다. 봇에게 DM을 보내면 대답합니다.
-7. 상시 구동은 `scripts/aigirl.service` 안의 안내대로 systemd에 등록합니다.
+`config/characters/`에 yaml 파일을 하나 복사해서 내용을 고치면 됩니다. 파일 이름이 캐릭터 ID가 되고, `/리로드` 후 `/캐릭터스왑`에 나타납니다. `examples`(예시 대화)를 많이 넣을수록 말투가 안정됩니다.
 
-루트 디스크 용량이 부족하면(`no space left on device`) 모델 저장 경로를 다른 디스크로 옮깁니다.
-`bash scripts/move_ollama_to_hdd.sh /mnt/hdd/ollama` 를 실행하면 기존 모델 이동과 systemd 설정(`OLLAMA_MODELS`)까지 처리합니다. 대상은 ext4 같은 리눅스 파일시스템이어야 합니다.
+## 슬래시 명령 (전부 관리자 전용)
 
-WSL에서 GPU를 쓰려면 Windows에 최신 NVIDIA 드라이버가 깔려 있어야 합니다. WSL 안에서는 `nvidia-smi`로 인식되는지 확인하세요. 상시 운영은 WSL보다 네이티브 우분투가 안정적입니다.
+관리자는 `config/settings.yaml`의 `discord.admin_user_ids`에 등록합니다. 다른 사람이 쓰면 "관리자만 사용할 수 있어요"가 나옵니다.
 
-## 모델 추천 (12GB VRAM)
+| 명령 | 기능 |
+|---|---|
+| `/사용량-총` | 전체 토큰 사용량 (입력/출력, 24시간/7일, 용도별, 캐릭터별) |
+| `/사용량-유저` | 유저별 토큰 순위. `유저`를 고르면 그 유저에게 한 답변 내역(시간, 채널, 캐릭터, 내용)까지 표시 |
+| `/캐릭터스왑` | 캐릭터 변경 (대화 기록 초기화, 첫 인사 옵션) |
+| `/상태` | 캐릭터, 모델, 동작 여부, 쿨다운, 채널, 가동 시간, Ollama 로드/VRAM 상태 |
+| `/일시정지` | 대답을 멈췄다가 재개 (실행할 때마다 전환) |
+| `/쿨다운` | 대답 간격(초) 변경. 값을 생략하면 현재 값 확인 |
+| `/채널` | 대화 참여 채널 추가/제거/목록 |
+| `/기억` | 특정 유저의 기억 보기/초기화 |
+| `/리로드` | 캐릭터와 공통 규칙 yaml 다시 읽기 |
 
-| 모델 | 용량 | 특징 |
-|---|---|---|
-| `gemma3:12b` (기본) | 약 8GB | 한국어가 자연스럽고 롤플레이 말투 유지가 좋음 |
-| `qwen2.5:14b` | 약 9GB | 지시 따르기는 강하지만 한국어 말투가 조금 딱딱함 |
-| `exaone3.5:7.8b` | 약 5GB | 한국어는 좋지만 표현력이 약함. 속도 우선일 때 |
+일시정지, 쿨다운, 채널, 캐릭터 설정은 DB에 저장되어 재시작 후에도 유지됩니다.
 
-모델은 `config/settings.yaml`의 `ollama.model`만 바꾸면 교체됩니다. 말이 너무 얌전하면 `temperature`를 올리고, 같은 말을 반복하면 `repeat_penalty`를 올립니다.
+## 설치 (Ubuntu)
 
-## 캐릭터 품질을 올리는 법
+1. `bash scripts/move_ollama_to_hdd.sh /mnt/hdd/ollama` (루트 디스크가 부족할 때만)
+2. `bash scripts/ensure_model.sh` (설정된 모델이 없으면 받음)
+3. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+4. `.env`에 `DISCORD_TOKEN=...` 입력
+5. 디스코드 개발자 포털에서 **Message Content Intent**를 켜고 봇을 서버에 초대 (`bot`, `applications.commands`)
+6. `.venv/bin/python -m bot.main`
+7. 서버 채널에서 `/채널 동작:추가`로 대화할 채널을 등록
 
-- `persona.yaml`의 `examples`가 가장 효과가 큽니다. 원하는 말투로 예시 대화를 10~20개까지 늘리세요.
-- 캐릭터가 AI처럼 말하면 `rules`에 금지 표현을 구체적으로 적습니다.
-- 수정 후 `/리로드`로 재시작 없이 반영됩니다. `settings.yaml`은 재시작이 필요합니다.
+상시 구동은 `scripts/aigirl.service`를 systemd에 등록합니다.
 
-## 슬래시 명령
+## 튜닝
 
-- `/기억보기`: 캐릭터가 기억하는 내용 확인
-- `/기억초기화`: 내 대화 기록과 기억 삭제
-- `/리로드`: (관리자) persona.yaml 다시 불러오기
+- 말이 너무 얌전하면 `temperature`를 올리고, 같은 말을 반복하면 `repeat_penalty`를 올립니다.
+- 너무 말이 많으면 `/쿨다운`을 늘리거나 `reply_chance`를 낮춥니다.
+- 캐릭터가 AI처럼 말하면 `common.yaml`이나 캐릭터 yaml의 `rules`에 금지 표현을 구체적으로 적습니다.
+- 토큰 입력 수치는 Ollama가 프롬프트 캐시를 쓰면 실제보다 적게 잡힐 수 있습니다.

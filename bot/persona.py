@@ -1,11 +1,14 @@
-"""persona.yaml 을 읽어 시스템 프롬프트와 few-shot 예시를 만든다."""
+"""config/characters/*.yaml 을 읽어 시스템 프롬프트와 few-shot 예시를 만든다."""
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
-from .config import load_yaml
+import yaml
 
+from .config import CONFIG_DIR, load_yaml
+
+CHAR_DIR = CONFIG_DIR / "characters"
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 
 
@@ -23,66 +26,110 @@ def time_of_day(hour: int) -> str:
     return "밤"
 
 
+def _block(value: Any) -> str:
+    return str(value or "").strip()
+
+
 class Persona:
-    def __init__(self) -> None:
+    def __init__(self, char_id: str) -> None:
+        self.char_id = ""
         self.data: dict[str, Any] = {}
-        self.reload()
+        self.common: dict[str, Any] = {}
+        self.load(char_id)
+
+    # ---------- 캐릭터 목록/로드 ----------
+    @staticmethod
+    def available() -> list[tuple[str, str]]:
+        """[(id, 표시 이름), ...]"""
+        out: list[tuple[str, str]] = []
+        for p in sorted(CHAR_DIR.glob("*.yaml")):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    name = (yaml.safe_load(f) or {}).get("name", p.stem)
+            except Exception:  # noqa: BLE001
+                continue
+            out.append((p.stem, str(name)))
+        return out
+
+    def load(self, char_id: str) -> None:
+        ids = [i for i, _ in self.available()]
+        if not ids:
+            raise SystemExit(f"{CHAR_DIR} 에 캐릭터 yaml 파일이 없습니다.")
+        if char_id not in ids:
+            char_id = ids[0]
+        self.data = load_yaml(f"characters/{char_id}.yaml")
+        self.common = load_yaml("common.yaml")
+        self.char_id = char_id
 
     def reload(self) -> None:
-        self.data = load_yaml("persona.yaml")
+        self.load(self.char_id)
 
+    # ---------- 속성 ----------
     @property
     def name(self) -> str:
         return self.data.get("name", "캐릭터")
 
     @property
-    def user_title(self) -> str:
-        return self.data.get("user_title", "너")
+    def nickname(self) -> str:
+        return self.data.get("nickname", self.name)
 
     @property
     def greeting(self) -> str:
-        return self.data.get("greeting", "안녕!")
+        return self.data.get("greeting", "")
 
-    def system_prompt(self, user_name: str, facts: list[str], now: datetime) -> str:
+    # ---------- 프롬프트 ----------
+    def system_prompt(self, target_name: str, facts: list[str], now: datetime) -> str:
         d = self.data
         name = self.name
-        rules = str(d.get("rules", "")).replace("{name}", name)
-        facts_block = "\n".join(f"- {f}" for f in facts) if facts else "(아직 알고 있는 정보가 없음)"
-        now_str = f"{now.month}월 {now.day}일 {WEEKDAYS[now.weekday()]}요일 {time_of_day(now.hour)} {now.hour}시 {now.minute:02d}분"
+        rules = _block(self.common.get("rules")).replace("{name}", name)
+        extra = _block(d.get("rules")).replace("{name}", name)
+        if extra:
+            rules += "\n" + extra
+        facts_block = "\n".join(f"- {f}" for f in facts) if facts else "(아직 아는 게 없음)"
+        now_str = (
+            f"{now.month}월 {now.day}일 {WEEKDAYS[now.weekday()]}요일 "
+            f"{time_of_day(now.hour)} {now.hour}시 {now.minute:02d}분"
+        )
 
-        return f"""너는 "{name}"(이)라는 캐릭터가 되어 디스코드에서 {self.user_title}과 1:1로 채팅하고 있다.
+        return f"""너는 "{name}"(이)라는 캐릭터가 되어, 디스코드 서버에서 여러 사람과 함께 채팅하는 서버 멤버 중 한 명이다.
 이것은 롤플레이이며, 너는 끝까지 {name} 본인으로서만 말한다.
 
 [캐릭터 프로필]
-이름: {name} (애칭: {d.get('nickname', name)})
-나이/소속: {d.get('age', '')} / {d.get('school', '')} / {d.get('club', '')}
-외형: {d.get('appearance', '')}
+이름: {name} (애칭: {self.nickname})
+{_block(d.get('profile'))}
 좋아하는 것: {d.get('likes', '')}
 싫어하는 것: {d.get('dislikes', '')}
 
 [성격]
-{str(d.get('personality', '')).strip()}
+{_block(d.get('personality'))}
 
 [말투]
-{str(d.get('speech_style', '')).strip()}
+{_block(d.get('speech_style'))}
+
+[호칭]
+{_block(d.get('address_style'))}
 
 [배경]
-{str(d.get('backstory', '')).strip()}
+{_block(d.get('backstory'))}
 
-[대화 상대]
-상대는 {self.user_title}이며 디스코드 닉네임은 "{user_name}"이다. 호칭은 기본적으로 "{self.user_title}"을 쓴다.
-네가 기억하고 있는 상대에 대한 정보:
+[대화 환경]
+- 여러 명이 섞여서 대화하며, 대화 기록은 "닉네임: 내용" 형식이다. 너의 답변에는 닉네임 접두어를 붙이지 말고 대사만 쓴다.
+- 지금은 "{target_name}"의 말에 대답할 차례다. 필요하면 이름을 부르고, 다른 사람들이 하던 이야기의 흐름도 자연스럽게 반영한다.
+- 사람처럼 대화의 흐름에 자연스럽게 끼어들어서 말한다.
+
+[{target_name}에 대해 기억하고 있는 것]
 {facts_block}
 
 [현재 시각]
 {now_str}
 
 [규칙]
-{rules.strip()}"""
+{rules}"""
 
     def example_messages(self) -> list[dict[str, str]]:
+        who = self.data.get("example_user", "유저")
         msgs: list[dict[str, str]] = []
         for ex in self.data.get("examples", []) or []:
-            msgs.append({"role": "user", "content": str(ex["user"]).strip()})
+            msgs.append({"role": "user", "content": f"{who}: {str(ex['user']).strip()}"})
             msgs.append({"role": "assistant", "content": str(ex["assistant"]).strip()})
         return msgs
