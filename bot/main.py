@@ -130,7 +130,7 @@ class GirlBot(discord.Client):
         self.dm_generating: set[int] = set()
         self.idle: dict[int, IdleState] = {}
         self.return_note: dict[int, str] = {}    # 사람들이 돌아왔을 때 다음 대답에 넣을 상황 메모
-        self.activity: dict[int, deque] = {}     # 채널별 (시각, 유저) — 인원 규모 계산용
+        self.chan_events: dict[int, deque] = {}     # 채널별 (시각, 유저) — 인원 규모 계산용
         self.last_replied: dict[int, float] = {} # 유저별로 마지막 대답한 시각
         self.last_target: dict[int, int] = {}    # 채널별 직전에 대답한 상대
         # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
@@ -253,7 +253,7 @@ async def send_bubbles(
 
 def crowd_now(channel_id: int) -> tuple[int, int]:
     """최근 대화에 참여한 (사람 수, 메시지 수)"""
-    return targeting.crowd(list(bot.activity.get(channel_id, ())), gcfg["crowd_window_sec"])
+    return targeting.crowd(list(bot.chan_events.get(channel_id, ())), gcfg["crowd_window_sec"])
 
 
 def next_cooldown(channel_id: int | None = None) -> float:
@@ -355,7 +355,7 @@ async def on_message(message: discord.Message) -> None:
     mark_human_activity(ch)
     directed = bool(mentioned) or is_directed(text)
     engine.mood.observe(stored, directed=directed, uid=uid, who=who)
-    bot.activity.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
+    bot.chan_events.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
 
     # ---- 말싸움: 도발/모욕을 받았고 기분이 상했으면 붙는다 ----
     in_fight = engine.fights.get(ch, uid) is not None

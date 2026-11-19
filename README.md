@@ -57,7 +57,7 @@
 ### 속도
 1. **프롬프트 캐시 구조**: 고정 프롬프트와 예시를 앞에, 매번 바뀌는 정보(시각, 기분, 상황, 기억)를 마지막 턴으로 옮겨서 Ollama가 앞부분 KV 캐시를 재사용합니다.
 2. **모델 상주와 웜업**: `keep_alive` 24h, 시작할 때 웜업 호출.
-3. **서버 튜닝**: `bash scripts/tune_ollama.sh` (Flash Attention, KV 캐시 q8_0, 병렬 1).
+3. **서버 튜닝**: systemd 서비스라면 `bash scripts/tune_ollama.sh`, `ollama serve`를 직접 실행한다면 `bash scripts/run_ollama.sh` (Flash Attention, KV 캐시 q8_0, 병렬 1, 모델 경로 자동 지정).
 4. 컨텍스트 6144, 기록 16개, 대기시간 단축(settle 2.5초, 타이핑 20자/초), 기본 쿨다운 18초.
 5. 기억 추출은 대화가 한가할 때만 합니다.
 6. `/상태`에 최근 응답 시간(모델 로드, 프롬프트, 생성)이 표시됩니다.

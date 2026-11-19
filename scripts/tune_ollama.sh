@@ -10,13 +10,14 @@
 # 사용법: bash scripts/tune_ollama.sh
 set -euo pipefail
 
-[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
-
 if ! systemctl list-unit-files 2>/dev/null | grep -q '^ollama.service'; then
-  echo "systemd 의 ollama 서비스가 없습니다. 직접 실행한다면 아래 환경변수를 export 한 뒤 'ollama serve' 하세요:"
-  echo "  OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_KEEP_ALIVE=24h OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1"
-  exit 1
+  echo "systemd 의 ollama 서비스가 없습니다. (ollama serve 를 직접 실행하는 환경)"
+  echo "대신 아래 스크립트로 튜닝 환경변수를 적용해서 시작하세요:"
+  echo "  bash scripts/run_ollama.sh"
+  exit 0
 fi
+
+[ "$(id -u)" -eq 0 ] || exec sudo bash "$0" "$@"
 
 DROPIN_DIR="/etc/systemd/system/ollama.service.d"
 mkdir -p "$DROPIN_DIR"
