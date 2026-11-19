@@ -5,8 +5,10 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -14,8 +16,11 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
+from . import targeting, vision
 from .chat import ChatEngine
 from .config import discord_token, load_settings
+from .emoji import Emojis
+from .fight import Fight
 from .llm import LLM
 from .memory import Memory
 from .mood import EMO, EMOTIONS
@@ -37,6 +42,9 @@ persona = Persona(settings.get("character", ""))
 llm = LLM(settings["ollama"])
 memory = Memory(settings["memory"]["db_path"], settings["memory"]["max_facts_per_user"])
 engine = ChatEngine(settings, persona, llm, memory)
+emojis = Emojis()
+ecfg = settings.get("emoji", {})
+vcfg = settings.get("vision", {})
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -52,6 +60,11 @@ class Pending:
     ts: float          # time.monotonic()
     priority: bool     # 멘션 또는 봇 메시지에 대한 답장
     text: str | None = None   # 같은 사람이 연달아 보낸 메시지를 묶은 텍스트
+    uid: int = 0                                  # 말한 사람 (리액션이면 리액션 단 사람)
+    uname: str = ""
+    images: list = field(default_factory=list)    # 첨부 이미지(바이트)
+    human_reply: bool = False                     # 다른 사람 메시지에 대한 답장인가
+    kind: str = "msg"                             # msg / reaction
 
 
 @dataclass
@@ -117,6 +130,9 @@ class GirlBot(discord.Client):
         self.dm_generating: set[int] = set()
         self.idle: dict[int, IdleState] = {}
         self.return_note: dict[int, str] = {}    # 사람들이 돌아왔을 때 다음 대답에 넣을 상황 메모
+        self.activity: dict[int, deque] = {}     # 채널별 (시각, 유저) — 인원 규모 계산용
+        self.last_replied: dict[int, float] = {} # 유저별로 마지막 대답한 시각
+        self.last_target: dict[int, int] = {}    # 채널별 직전에 대답한 상대
         # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
         self.paused = False
         self.idle_enabled = bool(icfg["enabled"])
@@ -128,8 +144,11 @@ class GirlBot(discord.Client):
         await self.load_state()
         await engine.load_names()
         await self.tree.sync()
+        # 대화가 바쁠 때는 기억 추출을 미룬다 (GPU 양보)
+        engine.busy_check = lambda: bool(self.busy) or any(self.pending.values()) or self.gpu_lock.locked()
         group_loop.start()
         idle_loop.start()
+        fight_loop.start()
         if pcfg["enabled"]:
             proactive_loop.change_interval(minutes=pcfg["check_interval_min"])
             proactive_loop.start()
@@ -148,6 +167,12 @@ class GirlBot(discord.Client):
         char = await memory.kv_get("character")
         if char:
             persona.load(char)
+        fl = await memory.kv_get("fight_level")
+        if fl in ("1", "2"):
+            engine.fights.cfg["level"] = int(fl)
+        fe = await memory.kv_get("fight_enabled")
+        if fe is not None:
+            engine.fights.cfg["enabled"] = fe == "1"
 
     async def save_channels(self) -> None:
         await memory.kv_set("channels", json.dumps(sorted(self.channels)))
@@ -200,15 +225,24 @@ def is_priority(message: discord.Message) -> bool:
     return False
 
 
+def replies_to_human(message: discord.Message) -> bool:
+    """봇이 아닌 다른 사람의 메시지에 대한 답장인가"""
+    ref = message.reference
+    return bool(ref and isinstance(ref.resolved, discord.Message)
+                and bot.user and ref.resolved.author.id != bot.user.id)
+
+
 async def send_bubbles(
     channel: discord.abc.Messageable, bubbles: list[str], reply_to: discord.Message | None = None
 ) -> None:
     tcfg = settings["typing"]
-    for i, text in enumerate(bubbles):
+    for i, raw in enumerate(bubbles):
+        # 서버 커스텀 이모지 `:이름:` 을 실제 이모지로 바꿔서 보낸다
+        text = emojis.render(raw) if ecfg.get("enabled", True) else raw
         if tcfg["enabled"]:
             async with channel.typing():
-                await asyncio.sleep(engine.typing_delay(text))
-        if i == 0 and reply_to is not None:
+                await asyncio.sleep(engine.typing_delay(raw))
+        if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id):
             try:
                 await reply_to.reply(text, mention_author=False)
                 continue
@@ -217,9 +251,18 @@ async def send_bubbles(
         await channel.send(text)
 
 
-def next_cooldown() -> float:
-    # 기분에 따라 쿨다운이 달라진다 (신나면 짧게, 졸리면 길게)
-    return bot.cooldown * engine.mood.cooldown_mult * (1 + random.random() * gcfg["cooldown_jitter"])
+def crowd_now(channel_id: int) -> tuple[int, int]:
+    """최근 대화에 참여한 (사람 수, 메시지 수)"""
+    return targeting.crowd(list(bot.activity.get(channel_id, ())), gcfg["crowd_window_sec"])
+
+
+def next_cooldown(channel_id: int | None = None) -> float:
+    """다음 발언까지의 쿨다운. 기분(신나면 짧게)과 대화 인원(많을수록 짧게)이 반영된다."""
+    base = bot.cooldown * engine.mood.cooldown_mult * (1 + random.random() * gcfg["cooldown_jitter"])
+    if channel_id is not None:
+        users, msgs = crowd_now(channel_id)
+        base *= targeting.crowd_factor(users, msgs, gcfg["crowd_boost"], gcfg["crowd_min_ratio"])
+    return max(1.0, base)
 
 
 def is_directed(text: str) -> bool:
@@ -230,9 +273,46 @@ def is_directed(text: str) -> bool:
     return any(n and n in text for n in names)
 
 
+def refresh_emojis() -> None:
+    if ecfg.get("enabled", True) and ecfg.get("custom", True):
+        emojis.refresh(bot.guilds)
+        engine.emoji_hint = emojis.prompt_block(ecfg.get("max_custom_in_prompt", 40))
+        log.info("서버 커스텀 이모지 %d개 인식", len(emojis.custom))
+    else:
+        engine.emoji_hint = ""
+
+
+async def maybe_react(msg: discord.Message, chance: float, text: str | None = None) -> bool:
+    """대답 대신(또는 대답 없이) 기분에 맞는 이모지 리액션을 단다. LLM 을 쓰지 않는다."""
+    if not ecfg.get("enabled", True) or random.random() > chance:
+        return False
+    pick = emojis.pick_reaction(text if text is not None else msg_text_plain(msg),
+                                engine.mood.current().id, has_image=vision.has_image(msg))
+    try:
+        if isinstance(pick, tuple):
+            name, eid, anim = pick
+            await msg.add_reaction(discord.PartialEmoji(name=name, id=eid, animated=anim))
+        else:
+            await msg.add_reaction(pick)
+        return True
+    except discord.HTTPException:
+        return False
+
+
+def msg_text_plain(msg: discord.Message) -> str:
+    return (msg.clean_content or "").strip()
+
+
 @bot.event
 async def on_ready() -> None:
     log.info("로그인: %s | 모델: %s | 캐릭터: %s", bot.user, llm.model, persona.name)
+    refresh_emojis()
+    asyncio.create_task(llm.warmup())          # 첫 응답이 느리지 않도록 모델을 미리 올린다
+
+
+@bot.event
+async def on_guild_emojis_update(guild: discord.Guild, before, after) -> None:
+    refresh_emojis()
 
 
 @bot.event
@@ -248,8 +328,11 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot or not user_allowed(message.author.id):
         return
     text = clean_text(message)
-    if not text:
+    n_img = sum(1 for a in message.attachments if (a.content_type or "").lower().startswith("image/"))
+    if not text and not n_img:
         return
+    if n_img:                                   # 대화 기록에는 이미지 자체 대신 표시만 남긴다
+        text = (text + " " if text else "") + f"(이미지 {n_img}장 첨부)"
     # 명령/주입을 반복 시도한 사람은 잠시 무시한다 (관리자는 제외)
     if engine.guard.is_muted(message.author.id) and message.author.id not in ADMIN_IDS:
         return
@@ -257,24 +340,40 @@ async def on_message(message: discord.Message) -> None:
     # ----- DM: 1:1 이므로 바로 대답 -----
     if isinstance(message.channel, discord.DMChannel):
         if dcfg["respond_to_dm"] and not bot.paused:
-            await handle_dm(message, text)
+            await handle_dm(message, text, n_img)
         return
 
-    # ----- 서버 채널: 기록해 두고, 쿨다운 후 랜덤하게 골라서 대답 -----
+    # ----- 서버 채널: 기록해 두고, 쿨다운 후 점수로 골라서 대답 -----
     in_channel = message.channel.id in bot.channels
     mentioned = dcfg["respond_to_mention"] and is_priority(message)
     if not (in_channel or mentioned):
         return
+    ch, uid, display = message.channel.id, message.author.id, message.author.display_name
+    who = engine.label(uid, display)
     stored = guard_store_text(message.author, text)
-    await memory.add_message(message.channel.id, message.author.id, message.author.display_name, "user", stored)
-    mark_human_activity(message.channel.id)
-    engine.mood.observe(stored, directed=mentioned or is_directed(text), uid=message.author.id,
-                        who=engine.label(message.author.id, message.author.display_name))
+    await memory.add_message(ch, uid, display, "user", stored)
+    mark_human_activity(ch)
+    directed = bool(mentioned) or is_directed(text)
+    engine.mood.observe(stored, directed=directed, uid=uid, who=who)
+    bot.activity.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
+
+    # ---- 말싸움: 도발/모욕을 받았고 기분이 상했으면 붙는다 ----
+    in_fight = engine.fights.get(ch, uid) is not None
+    if (not in_fight and directed and not bot.paused
+            and engine.guard.inspect(text).level != "block"):
+        m = engine.mood
+        if engine.fights.should_start(ch, uid, text, directed, m.current().id, m.s["irritation"], m.affinity(uid)):
+            engine.fights.start(ch, uid, display)
+            m.on_fight_start(uid, who)
+            in_fight = True
+            log.info("말싸움 시작: channel=%s user=%s(%s)", ch, uid, display)
     if bot.paused:
         return
-    bot.pending.setdefault(message.channel.id, []).append(
-        Pending(message, time.monotonic(), priority=mentioned)
-    )
+    images = await vision.collect_images(message, vcfg) if n_img else []
+    bot.pending.setdefault(ch, []).append(Pending(
+        message, time.monotonic(), priority=bool(mentioned) or in_fight,
+        uid=uid, uname=display, images=images, human_reply=replies_to_human(message),
+    ))
 
 
 def guard_store_text(author: discord.abc.User, text: str) -> str:
@@ -312,7 +411,10 @@ def mark_human_activity(channel_id: int) -> None:
     st.next_at = now + rand_minutes(icfg["first_after_min"])
 
 
-async def handle_dm(message: discord.Message, text: str) -> None:
+dm_images: dict[int, list[bytes]] = {}
+
+
+async def handle_dm(message: discord.Message, text: str, n_img: int = 0) -> None:
     """DM: 연달아 온 메시지를 잠깐 기다렸다가 한 번에 묶어서 처리한다."""
     uid = message.author.id
     await memory.set_dm_channel(uid, message.channel.id)
@@ -320,6 +422,8 @@ async def handle_dm(message: discord.Message, text: str) -> None:
     await memory.add_message(message.channel.id, uid, message.author.display_name, "user", stored)
     engine.mood.observe(stored, directed=True, uid=uid, who=engine.label(uid, message.author.display_name))
     bot.dm_buffer.setdefault(uid, []).append(text)
+    if n_img:
+        dm_images.setdefault(uid, []).extend(await vision.collect_images(message, vcfg))
     t = bot.dm_tasks.get(uid)
     if t and not t.done() and uid not in bot.dm_generating:
         t.cancel()                    # 아직 기다리는 중이면 새 메시지까지 포함해서 다시 기다린다
@@ -341,12 +445,14 @@ async def dm_worker(channel: discord.DMChannel, author: discord.abc.User) -> Non
             texts = bot.dm_buffer.pop(uid, [])
             if not texts:
                 return
+            images = dm_images.pop(uid, [])[: vcfg.get("max_images", 2)]
             bot.dm_generating.add(uid)
             try:
                 async with bot.gpu_lock:
                     async with channel.typing():
                         bubbles = await engine.reply(
-                            channel.id, uid, author.display_name, "\n".join(texts), dm=True)
+                            channel.id, uid, author.display_name, "\n".join(texts), dm=True,
+                            images=images or None)
                 if bubbles:
                     await send_bubbles(channel, bubbles)
             finally:
@@ -360,36 +466,61 @@ async def dm_worker(channel: discord.DMChannel, author: discord.abc.User) -> Non
 async def respond_group(channel_id: int, target: Pending) -> None:
     msg = target.message
     channel = msg.channel
+    uid = target.uid or msg.author.id
+    uname = target.uname or msg.author.display_name
     bot.busy.add(channel_id)
     try:
+        fight = engine.fights.get(channel_id, uid)
         async with bot.gpu_lock:
             async with channel.typing():
                 note = bot.return_note.get(channel_id)
+                extra = note
+                if target.kind == "reaction":
+                    extra = ((note + " ") if note else "") + (
+                        "상대가 네 메시지에 이모지 리액션을 달았다. 그 리액션에 대한 짧은 반응 한마디만 해라. "
+                        "(고마움, 장난, 놀림 등. 길게 말하지 마라)")
                 bubbles = await engine.reply(
-                    channel_id, msg.author.id, msg.author.display_name, target.text or clean_text(msg),
-                    # 멘션/답장이 아니고, 돌아온 상황 메모도 없을 때만 SKIP 가능
-                    can_skip=not target.priority and not note,
-                    priority=target.priority,
-                    extra_note=note,
+                    channel_id, uid, uname, target.text or clean_text(msg),
+                    # 멘션/답장/싸움이 아니고, 돌아온 상황 메모도 없을 때만 SKIP 가능
+                    can_skip=not target.priority and not note and fight is None and target.kind == "msg",
+                    priority=target.priority, extra_note=extra,
+                    images=target.images or None, fight=fight,
                 )
                 if bubbles and note:
                     bot.return_note.pop(channel_id, None)
         if bubbles:
+            bot.last_replied[uid] = time.time()
+            bot.last_target[channel_id] = uid
             # 그 사이에 다른 메시지가 올라왔으면 '답장'으로 누구에게 하는 말인지 표시
             latest = getattr(channel, "last_message_id", None)
-            reply_to = msg if latest and latest != msg.id else None
+            reply_to = msg if (latest and latest != msg.id and target.kind == "msg") else None
             await send_bubbles(channel, bubbles, reply_to)
+        elif engine.last_skip and target.kind == "msg":
+            await maybe_react(msg, ecfg.get("react_on_skip", 0.5), target.text)   # 글로 안 답하면 이모지로라도 반응
     except Exception:  # noqa: BLE001
         log.exception("서버 응답 생성 실패 (channel=%s)", channel_id)
     finally:
-        # 대답이 완전히 끝난 시점부터 쿨다운 타이머 시작
-        bot.next_ok[channel_id] = time.monotonic() + next_cooldown()
+        # 대답이 완전히 끝난 시점부터 쿨다운 타이머 시작 (싸움 중에는 거의 바로, 인원이 많으면 짧게)
+        in_fight = engine.fights.get(channel_id, uid) is not None
+        bot.next_ok[channel_id] = time.monotonic() + (1.0 if in_fight else next_cooldown(channel_id))
         bot.busy.discard(channel_id)
 
 
-@tasks.loop(seconds=2)
+def to_candidate(p: Pending, now: float, channel_id: int) -> targeting.Candidate:
+    uid = p.uid or p.message.author.id
+    text = p.text or clean_text(p.message)
+    return targeting.Candidate(
+        uid=uid, text=text, age=now - p.ts, priority=p.priority,
+        in_fight=engine.fights.get(channel_id, uid) is not None, directed=is_directed(text),
+        human_reply=p.human_reply, has_image=bool(p.images), affinity=engine.mood.affinity(uid),
+        since_replied=time.time() - bot.last_replied.get(uid, 0),
+        is_last_target=bot.last_target.get(channel_id) == uid,
+    )
+
+
+@tasks.loop(seconds=1.5)
 async def group_loop() -> None:
-    """채널별로 쿨다운이 끝났으면, 그동안 올라온 메시지 중 하나를 골라 대답한다."""
+    """채널별로 쿨다운이 끝났으면, 그동안 올라온 메시지 중 점수가 높은 사람을 골라 대답한다."""
     if bot.paused:
         return
     now = time.monotonic()
@@ -401,42 +532,139 @@ async def group_loop() -> None:
         # 1) 같은 사람이 연달아 쓰는 중이면 끝날 때까지 기다린다 (마지막 메시지 후 settle_sec, 입력 중이면 더)
         latest: dict[int, float] = {}
         for p in items:
-            aid = p.message.author.id
-            latest[aid] = max(latest.get(aid, 0), p.ts)
+            u = p.uid or p.message.author.id
+            latest[u] = max(latest.get(u, 0), p.ts)
 
         def settled(p: Pending) -> bool:
-            aid = p.message.author.id
-            quiet = now - latest[aid]
+            if p.kind == "reaction":
+                return True
+            u = p.uid or p.message.author.id
+            quiet = now - latest[u]
             if quiet < gcfg["settle_sec"]:
                 return False
-            typing = bot.typing_until.get((channel_id, aid), 0) > now
+            typing = bot.typing_until.get((channel_id, u), 0) > now
             return not typing or quiet >= gcfg["max_settle_wait_sec"]
 
         ready = [p for p in items if settled(p)]
         if not ready:
             continue
 
+        # 2) ㅋㅋ 같은 사소한 말은 LLM 없이 이모지만 달고 넘어간다 (속도 + 자연스러움)
+        trivial = [p for p in ready if p.kind == "msg" and not p.priority and not p.images
+                   and emojis.is_trivial(p.text or clean_text(p.message))]
+        if trivial:
+            for p in trivial:
+                asyncio.create_task(maybe_react(p.message, ecfg.get("trivial_react_chance", 0.5)))
+            ready = [p for p in ready if p not in trivial]
+            items[:] = [p for p in items if p not in trivial]
+            if not ready:
+                continue
+
         prio = [p for p in ready if p.priority]
+        users, _ = crowd_now(channel_id)
         cooling = now < bot.next_ok.get(channel_id, 0)
         if cooling and not (prio and gcfg["mention_bypass_cooldown"]):
             continue
         if prio:
-            target = prio[-1]
+            pool = prio
         else:
-            if random.random() > min(1.0, gcfg["reply_chance"] * engine.mood.reply_mult):
-                items[:] = [p for p in items if p not in ready]   # 이번 메시지들은 그냥 넘어간다
+            chance = gcfg["reply_chance"] + targeting.chance_boost(users, gcfg["crowd_chance_per_user"])
+            if random.random() > min(1.0, chance * engine.mood.reply_mult):
+                # 글로는 대답하지 않지만 이모지 리액션은 달 수 있다
+                for p in ready:
+                    asyncio.create_task(maybe_react(p.message, ecfg.get("react_chance", 0.12)))
+                items[:] = [p for p in items if p not in ready]
                 continue
-            target = random.choice(ready)
+            pool = ready
 
-        # 2) 고른 사람이 연달아 보낸 메시지는 하나로 묶어서 대답한다
-        same = [p for p in ready if p.message.author.id == target.message.author.id]
+        # 3) 대상 점수(멘션, 싸움, 이름 부름, 질문, 호감도, 오래 대답 못 받음, 최신성...)로 가중 랜덤 선택
+        target = pool[targeting.pick([to_candidate(p, now, channel_id) for p in pool])]
+        tuid = target.uid or target.message.author.id
+
+        # 4) 고른 사람이 연달아 보낸 메시지는 하나로 묶어서 대답한다. 다른 사람 메시지는 남겨서 다음 순서에 대답
+        if target.kind == "reaction":
+            same = [target]
+            text = target.text
+            imgs: list = []
+        else:
+            same = [p for p in ready if (p.uid or p.message.author.id) == tuid and p.kind == "msg"] or [target]
+            text = "\n".join(t for t in (p.text or clean_text(p.message) for p in same) if t)
+            imgs = [im for p in same for im in p.images][: vcfg.get("max_images", 2)]
+            if imgs:
+                text = (text + "\n" if text else "") + f"(이미지 {len(imgs)}장 첨부)"
         merged = Pending(
             message=same[-1].message, ts=same[-1].ts,
-            priority=any(p.priority for p in same),
-            text="\n".join(clean_text(p.message) for p in same),
+            priority=any(p.priority for p in same), text=text,
+            uid=tuid, uname=target.uname or target.message.author.display_name,
+            images=imgs, kind=target.kind,
         )
-        items[:] = [p for p in items if p not in ready]   # 나머지는 대화 기록으로 맥락에만 반영
+        items[:] = [p for p in items if p not in same]
         asyncio.create_task(respond_group(channel_id, merged))
+
+
+@tasks.loop(seconds=10)
+async def fight_loop() -> None:
+    """상대가 한동안 말이 없는 말싸움을 마무리한다. (이기고 있었으면 놀리고, 지고 있었으면 조용히 투덜)"""
+    if bot.paused:
+        return
+    for f in engine.fights.timed_out():
+        ch = bot.get_channel(f.channel_id)
+        if ch is None:
+            engine.fights.finish(f)
+            continue
+        if f.channel_id in bot.busy:
+            f.ending = ""                      # 바쁘면 다음 턴에 다시 시도
+            continue
+        bot.busy.add(f.channel_id)
+        try:
+            async with bot.gpu_lock:
+                async with ch.typing():
+                    bubbles = await engine.reply(
+                        f.channel_id, f.user_id, f.user_name, "(상대가 말없이 사라짐)", fight=f, priority=True)
+            if bubbles:
+                await send_bubbles(ch, bubbles)
+        except Exception:  # noqa: BLE001
+            log.exception("말싸움 마무리 실패")
+            engine.fights.finish(f)
+        finally:
+            bot.busy.discard(f.channel_id)
+            bot.next_ok[f.channel_id] = time.monotonic() + next_cooldown(f.channel_id)
+
+
+@fight_loop.before_loop
+async def _fight_ready() -> None:
+    await bot.wait_until_ready()
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    """봇 메시지에 누가 이모지 리액션을 달면 그에 대해 반응한다."""
+    if not ecfg.get("enabled", True) or bot.paused:
+        return
+    if (bot.user and payload.user_id == bot.user.id) or payload.channel_id not in bot.channels:
+        return
+    member = payload.member
+    if member is None or member.bot or not user_allowed(member.id):
+        return
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
+    if not bot.user or msg.author.id != bot.user.id:
+        return
+    emoji = str(payload.emoji)
+    who = engine.label(member.id, member.display_name)
+    snippet = (msg.clean_content or "").replace("\n", " ").strip()[:30]
+    note = f'(네 말 "{snippet}"에 {who}이(가) {emoji} 리액션을 남김)'
+    await memory.add_message(channel.id, member.id, member.display_name, "user", note)
+    engine.mood.on_reaction(member.id, Emojis.classify_reaction(emoji), who)
+    if random.random() < ecfg.get("respond_to_reaction", 0.6):
+        bot.pending.setdefault(channel.id, []).append(Pending(
+            msg, time.monotonic(), priority=False, text=note, uid=member.id,
+            uname=member.display_name, kind="reaction"))
 
 
 @group_loop.before_loop
@@ -675,6 +903,7 @@ async def swap_character(
         return
     persona.load(character)
     engine.mood.reset()                 # 새 캐릭터의 기준 기분으로 시작
+    engine.fights.stop_all()            # 진행 중인 말싸움은 종료
     await memory.kv_set("character", persona.char_id)
     if clear_history:
         await memory.clear_all_history()
@@ -700,8 +929,15 @@ async def status(interaction: discord.Interaction) -> None:
     total_msgs, n_ch = await memory.message_counts()
     ch = " ".join(f"<#{c}>" for c in sorted(bot.channels)) or "(없음 — 멘션/DM만 반응)"
     pend = sum(len(v) for v in bot.pending.values())
+    avg = llm.avg_stats()
+    speed = (f"평균 {avg[0]:.1f}초 (모델로드 {avg[1]:.1f} · 프롬프트 {avg[2]:.1f} · 생성 {avg[3]:.1f}) — 최근 {len(llm.stats)}회"
+             if avg else "아직 기록 없음")
+    nf = len(engine.fights.active)
     await interaction.followup.send(
         f"**봇 상태**\n"
+        f"- 응답 속도: {speed}\n"
+        f"- 말싸움: {'켜짐' if engine.fights.cfg['enabled'] else '꺼짐'} (수위 {engine.fights.cfg['level']}) · 진행 중 {nf}건\n"
+        f"- 이모지: 서버 커스텀 {len(emojis.custom)}개 | 이미지 인식: {'켜짐' if vcfg.get('enabled', True) else '꺼짐'}\n"
         f"- 캐릭터: **{persona.name}** (`{persona.char_id}`)\n"
         f"- 모델: `{llm.model}`\n"
         f"- 상태: {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
@@ -902,6 +1138,60 @@ async def mood_cmd(
         f"-# 타이핑 속도 x{e.speed:g} · 끼어들기 x{e.reply:g} · 쿨다운 x{e.cooldown:g}",
     ]
     await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
+
+
+# ---- 싸움 ----
+@bot.tree.command(name="싸움", description="말싸움 기능을 관리해요 (켜기/끄기/수위/상태/시작/중단)")
+@app_commands.describe(action="동작", user="'시작'할 때 상대 유저", level="'수위' 설정: 1=순화된 말싸움, 2=가벼운 욕까지")
+@app_commands.rename(action="동작", user="유저", level="수위")
+@app_commands.choices(action=[
+    app_commands.Choice(name="상태", value="status"),
+    app_commands.Choice(name="켜기", value="on"),
+    app_commands.Choice(name="끄기", value="off"),
+    app_commands.Choice(name="수위", value="level"),
+    app_commands.Choice(name="시작", value="start"),
+    app_commands.Choice(name="중단", value="stop"),
+])
+async def fight_cmd(
+    interaction: discord.Interaction, action: app_commands.Choice[str],
+    user: Optional[discord.User] = None, level: Optional[app_commands.Range[int, 1, 2]] = None,
+) -> None:
+    fm = engine.fights
+    if action.value in ("on", "off"):
+        fm.cfg["enabled"] = action.value == "on"
+        await memory.kv_set("fight_enabled", "1" if fm.cfg["enabled"] else "0")
+        if not fm.cfg["enabled"]:
+            fm.stop_all()
+        await interaction.response.send_message(
+            "말싸움 기능을 켰어요." if fm.cfg["enabled"] else "말싸움 기능을 껐어요.", ephemeral=True)
+        return
+    if action.value == "level":
+        if level is None:
+            await interaction.response.send_message(f"현재 수위: {fm.cfg['level']}", ephemeral=True)
+            return
+        fm.cfg["level"] = int(level)
+        await memory.kv_set("fight_level", str(level))
+        await interaction.response.send_message(
+            f"수위를 **{level}**로 바꿨어요. ({'가벼운 욕까지' if level == 2 else '순화된 말싸움만'})", ephemeral=True)
+        return
+    if action.value == "stop":
+        n = fm.stop_all(interaction.channel_id)
+        await interaction.response.send_message(f"이 채널의 말싸움 {n}건을 중단했어요.", ephemeral=True)
+        return
+    if action.value == "start":
+        if user is None or interaction.channel_id is None:
+            await interaction.response.send_message("싸움을 걸 유저를 지정해주세요.", ephemeral=True)
+            return
+        f = fm.start(interaction.channel_id, user.id, user.display_name)
+        engine.mood.on_fight_start(user.id, engine.label(user.id, user.display_name))
+        await interaction.response.send_message(
+            f"{user.display_name} 님과 말싸움 모드를 켰어요. 그 사람이 다음에 말하면 바로 받아쳐요.", ephemeral=True)
+        return
+    fights = list(fm.active.values())
+    body = "\n".join(
+        f"<#{f.channel_id}> {f.user_name}: 라운드 {f.rounds} · 흐름 {f.advantage}" for f in fights) or "(진행 중인 싸움 없음)"
+    await interaction.response.send_message(
+        f"**말싸움** {'켜짐' if fm.cfg['enabled'] else '꺼짐'} · 수위 {fm.cfg['level']}\n{body}", ephemeral=True)
 
 
 # ---- 11. 혼잣말 (조용할 때 먼저 말 걸기) ----

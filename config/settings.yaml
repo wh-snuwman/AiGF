@@ -9,7 +9,7 @@ character: "eunlang"          # eunlang / miku / teto
 ollama:
   host: "http://127.0.0.1:11434"
   model: "gemma3:12b"          # 메인 대화 모델
-  keep_alive: "30m"            # 모델을 VRAM에 유지하는 시간
+  keep_alive: "24h"            # 모델을 VRAM에 오래 상주시킴 (속도: 다시 로드할 필요 없음)
   options:
     temperature: 1.0           # 높을수록 창의적/다양, 낮을수록 안정적
     top_p: 0.95
@@ -17,7 +17,7 @@ ollama:
     repeat_penalty: 1.15       # 같은 말 반복 방지
     repeat_last_n: 256         # 반복을 감시할 최근 토큰 범위 (기본 64 → 넓혀서 말버릇 반복 억제)
     presence_penalty: 0.2      # 이미 쓴 단어를 다시 쓰는 것에 약한 페널티 (지원 안 하는 버전이면 무시됨)
-    num_ctx: 8192              # 컨텍스트 길이 (12GB VRAM이면 8192 권장)
+    num_ctx: 6144              # 컨텍스트 길이 (줄이면 빨라짐. 프롬프트가 잘리면 8192로)
     num_predict: 300           # 답변 최대 토큰 (짧게 유지)
 
 discord:
@@ -32,14 +32,19 @@ discord:
 
 # 서버 채널에서 '캐릭터가 같이 채팅하는' 방식
 group:
-  cooldown_sec: 25             # 대답을 '완전히 끝낸 뒤' 다음 대답까지 쉬는 시간(초) → /쿨다운 으로 변경 가능
+  cooldown_sec: 18             # 대답을 '완전히 끝낸 뒤' 다음 대답까지 쉬는 시간(초) → /쿨다운 으로 변경 가능
   cooldown_jitter: 0.6         # 쿨다운에 0~60% 랜덤 추가 (너무 기계적이지 않게)
   reply_chance: 0.9            # 쿨다운 후 올라온 메시지에 대답할 확률 (1.0이면 항상)
   mention_bypass_cooldown: true  # 멘션/답장은 쿨다운 무시하고 바로 대답 (끄면 멘션도 쿨다운 적용)
-  max_pending_age_sec: 300     # 이 시간보다 오래된 메시지는 대답 후보에서 제외
+  max_pending_age_sec: 90      # 이 시간보다 오래된 메시지는 대답 후보에서 제외
   # 한 사람이 말을 여러 줄로 끊어서 보낼 때 하나로 묶어서 이해하기 위한 설정
-  settle_sec: 4                # 그 사람의 마지막 메시지 후 이 시간(초) 동안 새 메시지가 없어야 대답 시작
-  max_settle_wait_sec: 20      # 입력 중 표시가 계속 떠 있어도 최대 이만큼만 기다림 (DM 포함)
+  settle_sec: 2.5              # 그 사람의 마지막 메시지 후 이 시간(초) 동안 새 메시지가 없어야 대답 시작
+  max_settle_wait_sec: 15      # 입력 중 표시가 계속 떠 있어도 최대 이만큼만 기다림 (DM 포함)
+  # 대화에 참여하는 사람이 많아지면 더 빨리, 더 많이 말한다
+  crowd_window_sec: 180        # 최근 이 시간 동안 말한 사람 수/메시지 수로 인원 규모를 계산
+  crowd_boost: 0.35            # 사람이 한 명 늘 때마다 쿨다운이 이만큼씩 짧아짐 (배율 = 1 / (1 + boost*(인원-1) + ...))
+  crowd_min_ratio: 0.25        # 쿨다운이 아무리 줄어도 기본값의 이 비율 밑으로는 안 내려감
+  crowd_chance_per_user: 0.05  # 사람이 늘 때마다 대답 확률이 이만큼 오름 (최대 +0.25)
 
 # 채널이 조용할 때 캐릭터가 먼저 말을 꺼내고, 답이 없으면 단계별로 반응하는 기능
 #  단계0: 먼저 말 걸기 → 단계1: 다시 불러보기 / 서운해하기 / 혼잣말 / (일부러 침묵)
@@ -56,18 +61,18 @@ idle:
 
 memory:
   db_path: "data/memory.db"
-  history_turns: 20            # 프롬프트에 넣을 최근 채널 대화 개수(메시지 단위)
+  history_turns: 16            # 프롬프트에 넣을 최근 채널 대화 개수(메시지 단위)
   extract_every: 10            # 유저에게 N번 대답할 때마다 장기 기억(사실) 추출
   max_facts_in_prompt: 25
   max_facts_per_user: 200
 
 typing:
   enabled: true
-  chars_per_second: 14         # 타이핑 속도 (글자/초)
-  min_delay: 0.8
-  max_delay: 5.0
+  chars_per_second: 20         # 타이핑 속도 (글자/초)
+  min_delay: 0.5
+  max_delay: 3.5
   max_bubbles: 3               # 한 번에 보낼 최대 말풍선 수
-  read_delay: [0.5, 2.0]       # DM에서 메시지를 읽는 척 하는 지연(초)
+  read_delay: [0.3, 1.0]       # DM에서 메시지를 읽는 척 하는 지연(초)
 
 proactive:                     # DM 에서 먼저 말 걸기 (서버 채팅 모드에서는 기본 꺼둠)
   enabled: false
@@ -93,3 +98,28 @@ guard:
   mute_after: 3                # mute_window_min 안에 차단 시도가 이만큼 쌓이면 잠시 무시
   mute_window_min: 10
   mute_minutes: 5
+
+# 말싸움 (bot/fight.py)  level: 1=순화(비꼼과 순한 표현), 2=가벼운 욕까지
+fight:
+  enabled: true
+  level: 2
+  max_rounds: 8                # 이 라운드가 지나면 기세로 승패 판정
+  timeout_sec: 120             # 상대가 이만큼 말이 없으면 종료
+  start_chance: 0.7            # 도발을 받고 기분이 상했을 때 싸움이 붙을 확률
+  cooldown_after_sec: 180      # 같은 사람과 싸움이 끝난 뒤 다시 붙기까지
+
+# 이모지 (bot/emoji.py)
+emoji:
+  enabled: true
+  custom: true                 # 서버 커스텀 이모지를 글에 섞어 씀
+  max_custom_in_prompt: 40
+  react_chance: 0.12           # 대답하지 않기로 한 메시지에 리액션만 달 확률
+  trivial_react_chance: 0.5    # ㅋㅋ 같은 짧은 말에는 LLM 없이 리액션만 달 확률
+  respond_to_reaction: 0.6     # 봇 메시지에 누가 리액션을 달면 한마디 할 확률
+
+# 이미지 인식 (bot/vision.py) — gemma3 는 이미지를 지원한다
+vision:
+  enabled: true
+  max_images: 2
+  max_bytes: 8000000
+  max_side: 1024

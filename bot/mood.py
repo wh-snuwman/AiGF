@@ -484,6 +484,52 @@ class Mood:
         self._set_override(random.choice(["dumbfounded", "dumbfounded", "annoyed", "smug"]), 5)
         self._save()
 
+    def on_reaction(self, uid: Optional[int], sign: int, who: str = "") -> None:
+        """누가 내 메시지에 이모지 리액션을 달았을 때 (sign: +1 호의적 / -1 부정적 / 0 중립)"""
+        self._tick()
+        if sign > 0:
+            self._apply({"mood": 3, "lonely": -3})
+            self._adj_aff(uid, 0.01)
+            self.add_thought("내 말에 호의적인 리액션이 달려서 기분이 좋다", who)
+        elif sign < 0:
+            self._apply({"mood": -3, "irritation": 4})
+            self._adj_aff(uid, -0.015)
+            self.add_thought("내 말에 비웃는 듯한 리액션이 달려서 기분이 상한다", who)
+        else:
+            return
+        self._save()
+
+    def on_fight_start(self, uid: Optional[int], who: str = "") -> None:
+        """말싸움이 시작될 때: 열이 오르고 기세가 오른다"""
+        self._tick()
+        self._apply({"irritation": 8, "energy": 6, "interest": 8})
+        self.add_thought("누가 시비를 걸어서 말싸움이 붙었다. 질 수 없다", who)
+        if not self.override or self.override[0] not in ("angry", "annoyed"):
+            self._set_override(random.choice(["annoyed", "angry", "playful"]), 6)
+        self._save()
+
+    def on_fight_result(self, result: str, uid: Optional[int], who: str = "") -> None:
+        """말싸움이 끝났을 때 결과를 기분/호감도/마음에 반영한다"""
+        self._tick()
+        if result in ("bot_win", "timeout_win", "retreat"):
+            self._apply({"mood": 8, "interest": 5, "irritation": -10})
+            self.add_thought("말싸움에서 이겨서 속이 시원하고 으쓱하다", who)
+            self._set_override(random.choice(["smug", "smug", "playful"]), 8)
+        elif result in ("bot_lose", "timeout_quiet"):
+            self._apply({"mood": -10, "irritation": 8, "lonely": 6, "energy": -6})
+            self.add_thought("말싸움에서 져서 억울하고 서럽다", who)
+            self._set_override(random.choice(["hurt", "sulky"]), 12)
+            self._adj_aff(uid, -0.03)
+        elif result == "calmed":
+            self._apply({"irritation": -25, "mood": -2})
+            self.add_thought("상대가 진심으로 속상해 보여서 미안하다", who)
+            self._set_override("caring", 8)
+            self._adj_aff(uid, 0.05)
+        else:                                  # draw
+            self._apply({"energy": -8, "irritation": -12})
+            self._set_override("tired", 6)
+        self._save()
+
     def on_atmosphere(self, name: str) -> None:
         """채널 분위기가 기분에 아주 조금 스며든다 (60초에 한 번)"""
         now = time.time()
