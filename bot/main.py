@@ -50,6 +50,7 @@ class Pending:
     message: discord.Message
     ts: float          # time.monotonic()
     priority: bool     # 멘션 또는 봇 메시지에 대한 답장
+    text: str | None = None   # 같은 사람이 연달아 보낸 메시지를 묶은 텍스트
 
 
 @dataclass
@@ -109,6 +110,10 @@ class GirlBot(discord.Client):
         self.pending: dict[int, list[Pending]] = {}
         self.next_ok: dict[int, float] = {}      # 채널별 다음 발언 가능 시각 (monotonic)
         self.busy: set[int] = set()
+        self.typing_until: dict[tuple[int, int], float] = {}   # (채널, 유저) -> 입력 중 표시가 끝나는 시각
+        self.dm_buffer: dict[int, list[str]] = {}
+        self.dm_tasks: dict[int, asyncio.Task] = {}
+        self.dm_generating: set[int] = set()
         self.idle: dict[int, IdleState] = {}
         self.return_note: dict[int, str] = {}    # 사람들이 돌아왔을 때 다음 대답에 넣을 상황 메모
         # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
@@ -221,6 +226,14 @@ async def on_ready() -> None:
 
 
 @bot.event
+async def on_typing(channel: discord.abc.Messageable, user: discord.abc.User, when: datetime) -> None:
+    """누가 입력 중인지 기록해서, 말을 끝낼 때까지 기다리는 데 쓴다. (디스코드 입력 중 표시는 약 10초 지속)"""
+    if not user.bot:
+        cid = getattr(channel, "id", 0)
+        bot.typing_until[(cid, user.id)] = time.monotonic() + 8
+
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot or not user_allowed(message.author.id):
         return
@@ -270,23 +283,46 @@ def mark_human_activity(channel_id: int) -> None:
 
 
 async def handle_dm(message: discord.Message, text: str) -> None:
+    """DM: 연달아 온 메시지를 잠깐 기다렸다가 한 번에 묶어서 처리한다."""
     uid = message.author.id
-    lock = bot.dm_locks.setdefault(uid, asyncio.Lock())
-    async with lock:
-        await memory.set_dm_channel(uid, message.channel.id)
-        await memory.add_message(message.channel.id, uid, message.author.display_name, "user", text)
+    await memory.set_dm_channel(uid, message.channel.id)
+    await memory.add_message(message.channel.id, uid, message.author.display_name, "user", text)
+    bot.dm_buffer.setdefault(uid, []).append(text)
+    t = bot.dm_tasks.get(uid)
+    if t and not t.done() and uid not in bot.dm_generating:
+        t.cancel()                    # 아직 기다리는 중이면 새 메시지까지 포함해서 다시 기다린다
+    bot.dm_tasks[uid] = asyncio.create_task(dm_worker(message.channel, message.author))
+
+
+async def dm_worker(channel: discord.DMChannel, author: discord.abc.User) -> None:
+    uid = author.id
+    try:
+        start = time.monotonic()
+        await asyncio.sleep(gcfg["settle_sec"])
+        # 아직 입력 중이면 조금 더 기다린다 (최대 max_settle_wait_sec)
+        while (bot.typing_until.get((channel.id, uid), 0) > time.monotonic()
+               and time.monotonic() - start < gcfg["max_settle_wait_sec"]):
+            await asyncio.sleep(1)
         lo, hi = settings["typing"]["read_delay"]
         await asyncio.sleep(random.uniform(lo, hi))
-        try:
-            async with bot.gpu_lock:
-                async with message.channel.typing():
-                    bubbles = await engine.reply(
-                        message.channel.id, uid, message.author.display_name, text, dm=True)
-        except Exception:  # noqa: BLE001
-            log.exception("DM 응답 생성 실패")
-            return
-        if bubbles:
-            await send_bubbles(message.channel, bubbles)
+        async with bot.dm_locks.setdefault(uid, asyncio.Lock()):
+            texts = bot.dm_buffer.pop(uid, [])
+            if not texts:
+                return
+            bot.dm_generating.add(uid)
+            try:
+                async with bot.gpu_lock:
+                    async with channel.typing():
+                        bubbles = await engine.reply(
+                            channel.id, uid, author.display_name, "\n".join(texts), dm=True)
+                if bubbles:
+                    await send_bubbles(channel, bubbles)
+            finally:
+                bot.dm_generating.discard(uid)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("DM 응답 실패 (uid=%s)", uid)
 
 
 async def respond_group(channel_id: int, target: Pending) -> None:
@@ -298,7 +334,7 @@ async def respond_group(channel_id: int, target: Pending) -> None:
             async with channel.typing():
                 note = bot.return_note.get(channel_id)
                 bubbles = await engine.reply(
-                    channel_id, msg.author.id, msg.author.display_name, clean_text(msg),
+                    channel_id, msg.author.id, msg.author.display_name, target.text or clean_text(msg),
                     # 멘션/답장이 아니고, 돌아온 상황 메모도 없을 때만 SKIP 가능
                     can_skip=not target.priority and not note,
                     priority=target.priority,
@@ -329,7 +365,26 @@ async def group_loop() -> None:
         items[:] = [p for p in items if now - p.ts <= gcfg["max_pending_age_sec"]]
         if not items or channel_id in bot.busy:
             continue
-        prio = [p for p in items if p.priority]
+
+        # 1) 같은 사람이 연달아 쓰는 중이면 끝날 때까지 기다린다 (마지막 메시지 후 settle_sec, 입력 중이면 더)
+        latest: dict[int, float] = {}
+        for p in items:
+            aid = p.message.author.id
+            latest[aid] = max(latest.get(aid, 0), p.ts)
+
+        def settled(p: Pending) -> bool:
+            aid = p.message.author.id
+            quiet = now - latest[aid]
+            if quiet < gcfg["settle_sec"]:
+                return False
+            typing = bot.typing_until.get((channel_id, aid), 0) > now
+            return not typing or quiet >= gcfg["max_settle_wait_sec"]
+
+        ready = [p for p in items if settled(p)]
+        if not ready:
+            continue
+
+        prio = [p for p in ready if p.priority]
         cooling = now < bot.next_ok.get(channel_id, 0)
         if cooling and not (prio and gcfg["mention_bypass_cooldown"]):
             continue
@@ -337,11 +392,19 @@ async def group_loop() -> None:
             target = prio[-1]
         else:
             if random.random() > gcfg["reply_chance"]:
-                items.clear()          # 이번 메시지들은 그냥 넘어간다
+                items[:] = [p for p in items if p not in ready]   # 이번 메시지들은 그냥 넘어간다
                 continue
-            target = random.choice(items)
-        items.clear()                  # 나머지 메시지는 대화 기록으로 맥락에만 반영
-        asyncio.create_task(respond_group(channel_id, target))
+            target = random.choice(ready)
+
+        # 2) 고른 사람이 연달아 보낸 메시지는 하나로 묶어서 대답한다
+        same = [p for p in ready if p.message.author.id == target.message.author.id]
+        merged = Pending(
+            message=same[-1].message, ts=same[-1].ts,
+            priority=any(p.priority for p in same),
+            text="\n".join(clean_text(p.message) for p in same),
+        )
+        items[:] = [p for p in items if p not in ready]   # 나머지는 대화 기록으로 맥락에만 반영
+        asyncio.create_task(respond_group(channel_id, merged))
 
 
 @group_loop.before_loop
