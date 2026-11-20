@@ -82,6 +82,12 @@ class Persona:
     def reload(self) -> None:
         self.load(self.char_id)
 
+    def example_names(self) -> set[str]:
+        """예시(examples)에 쓰인 사람 이름들. 출력에 나오면 '대화에 없는 사람을 지어낸 것'이라 걷어낸다."""
+        names = {str(self.data.get("example_user", ""))}
+        names |= {str(ex.get("who", "")) for ex in (self.data.get("examples") or [])}
+        return {n for n in names if n and n != "유저"}
+
     # ---------- 속성 ----------
     @property
     def name(self) -> str:
@@ -169,11 +175,16 @@ class Persona:
         default_who = self.data.get("example_user", "유저")
         msgs: list[dict[str, str]] = []
         exs = list(self.data.get("examples", []) or [])
+        # 예시 속 사람 이름(철수/영희...)을 그대로 보여 주면 모델이 대화에 없는 그 이름을 지어내 언급한다 → 중립 라벨(유저1, 유저2...)로 바꿔 보여 준다
+        labels: dict[str, str] = {}
+
+        def neutral(who: str) -> str:
+            return labels.setdefault(who, f"유저{len(labels) + 1}")
         if limit and rotate_min and len(exs) > limit:
             slot = int(time.time() // (float(rotate_min) * 60))
             exs = random.Random(f"{self.char_id}:{slot}").sample(exs, limit)
         for ex in (exs[:limit] if limit else exs):
-            who = ex.get("who", default_who)
+            who = neutral(ex.get("who", default_who))
             msgs.append({"role": "user", "content": f"{who}: {str(ex['user']).strip()}"})
             msgs.append({"role": "assistant", "content": str(ex["assistant"]).strip()})
         return msgs

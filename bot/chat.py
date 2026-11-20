@@ -64,6 +64,12 @@ def strip_symbols(t: str, lively: bool = False) -> str:
     return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], t)
 
 
+# 대화에 없는데 모델이 지어내서 자꾸 언급하는 흔한 가짜 이름 (예시 속 이름은 persona.example_names() 로 따로 더함)
+GHOST_NAMES = {"철수", "영희", "민수", "순이", "길동", "영수", "수진", "지훈", "민지", "유진", "도윤", "서연"}
+GHOST_AMBIGUOUS = {"하나", "지우", "나래", "하늘", "보람"}        # 일반 낱말이기도 해서 '이름처럼 부를 때(~야/~아)'만 걷어낸다
+_PART = r"(?:이랑|한테|에게|이가|야|아|이|가|는|은|를|을|의|도|랑|와|과|님|씨)?"
+
+
 def humanize(text: str, lively: bool = False) -> str:
     """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)
     lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다."""
@@ -836,6 +842,34 @@ class ChatEngine:
     def _short(self) -> float:
         return float(self.s.get("style", {}).get("short_bias", 1.6))
 
+    def _scrub_ghosts(self, text: str, allowed: set[str]) -> str:
+        """대화 참여자도 등록된 사람도 아닌 이름(예시 속 철수/영희 등)이 나오면 그 이름만 걷어낸다."""
+        allow = set(allowed) | {self.persona.name, self.persona.nickname}
+        for real, call in self.names.values():
+            allow |= {real, call or ""}
+        allow = {a for a in allow if a}
+        ghosts = {g for g in (GHOST_NAMES | self.persona.example_names()) if g not in allow and g not in GHOST_AMBIGUOUS}
+        amb = {g for g in GHOST_AMBIGUOUS | self.persona.example_names() if g in GHOST_AMBIGUOUS and g not in allow}
+        found: list[str] = []
+        out = text
+        if ghosts:
+            pat = re.compile(r"(?<![가-힣A-Za-z])(" + "|".join(map(re.escape, sorted(ghosts, key=len, reverse=True)))
+                             + r")" + _PART + r"(?![가-힣])")
+            found += [m.group(1) for m in pat.finditer(out)]
+            out = pat.sub("", out)
+        if amb:
+            pat2 = re.compile(r"(?<![가-힣A-Za-z])(" + "|".join(map(re.escape, amb)) + r")(?:야|아)(?![가-힣])")
+            found += [m.group(1) for m in pat2.finditer(out)]
+            out = pat2.sub("", out)
+        pat3 = re.compile(r"(?<![가-힣A-Za-z])유저\s?[0-9A-Da-d](?:" + _PART[3:-2] + r")?(?![가-힣0-9])")   # 예시 라벨(유저1 ...)
+        found += [m.group(0) for m in pat3.finditer(out)]
+        out = pat3.sub("", out)
+        if found:
+            trace.cur().event("scrub_ghost_names", names=found, before=text, after=out)
+            out = re.sub(r"[ \t]{2,}", " ", out)
+            out = re.sub(r"^[ ,]+|(?<=\n)[ ,]+", "", out)
+        return out
+
     @staticmethod
     def _trim(p: str, maxc: int) -> str:
         """말풍선이 상한보다 길면 문장 단위로 잘라낸다 (첫 문장은 항상 남김). 한 문장이 너무 길면 쉼표/띄어쓰기에서 자른다."""
@@ -860,6 +894,7 @@ class ChatEngine:
         name = re.escape(self.persona.name)
         nick = re.escape(self.persona.nickname)
         text = sanitize_output(raw.strip())                     # @everyone/역할 멘션/링크/토큰 제거
+        text = self._scrub_ghosts(text, set(other_names or ()))   # 대화에 없는 이름(예시 속 철수/영희) 걷어내기
         text = re.sub(rf"^\s*(?:{name}|{nick})\s*[:：]\s*", "", text)
         if other_names:
             pat = "|".join(re.escape(n) for n in sorted(other_names, key=len, reverse=True) if n)
