@@ -10,16 +10,16 @@ ollama:
   host: "http://127.0.0.1:11434"
   model: "gemma3:12b"          # 메인 대화 모델
   keep_alive: "24h"            # 모델을 VRAM에 오래 상주시킴 (속도: 다시 로드할 필요 없음)
-  temp_jitter: 0.1             # 호출마다 temperature 를 ±이만큼 랜덤으로 흔든다 (같은 말투 고착 방지)
+  temp_jitter: 0.05            # 호출마다 temperature 를 ±이만큼 랜덤으로 흔든다 (같은 말투 고착 방지)
   options:
-    temperature: 1.0           # 높을수록 창의적/다양, 낮을수록 안정적
-    top_p: 0.95
-    top_k: 64
-    repeat_penalty: 1.05       # Gemma 권장 1.0. 크게 올리면 어색한 대체어로 쏠려서 약하게만 (문구 반복은 bot/diversity.py 가 담당)
-    repeat_last_n: 96          # 반복을 감시할 최근 토큰 범위
-    frequency_penalty: 0.25    # 자주 쓴 단어일수록 페널티 (0~0.5 권장, 지원 안 하는 버전이면 무시됨)
-    presence_penalty: 0.15
-    min_p: 0.02                # 확률이 너무 낮은 이상한 단어를 걸러서 온도를 높여도 안정적
+    temperature: 0.85          # 높을수록 창의적/다양, 낮을수록 안정적
+    top_p: 0.9
+    top_k: 40
+    repeat_penalty: 1.0        # 한국어는 조사/어미가 자주 반복돼서 페널티를 주면 문장이 꼬인다 → 끔 (문구 반복은 bot/diversity.py 가 담당)
+    repeat_last_n: 64
+    frequency_penalty: 0.0     # 끔 (켜면 조사/어미까지 피해서 말이 어색해짐)
+    presence_penalty: 0.0
+    min_p: 0.05                # 확률이 너무 낮은 이상한 단어를 걸러서 문장이 안정적
     num_ctx: 6144              # 컨텍스트 길이 (줄이면 빨라짐. 프롬프트가 잘리면 8192로)
     num_predict: 300           # 답변 최대 토큰 (짧게 유지)
 
@@ -131,7 +131,7 @@ fight:
 emoji:
   enabled: true
   custom: true                 # 서버 커스텀 이모지를 글에 섞어 씀
-  max_custom_in_prompt: 40
+  max_custom_in_prompt: 6
   react_chance: 0.12           # 대답하지 않기로 한 메시지에 리액션만 달 확률
   trivial_react_chance: 0.5    # ㅋㅋ 같은 짧은 말에는 LLM 없이 리액션만 달 확률
   respond_to_reaction: 0.6     # 봇 메시지에 누가 리액션을 달면 한마디 할 확률

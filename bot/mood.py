@@ -533,16 +533,12 @@ class Mood:
         e = self.current()
         it = self.intensity()
         level = "약" if it < 0.35 else "중" if it < 0.65 else "강" if it < 0.85 else "극"
-        sc = self.scores_100()
-        lines = [f"기분:{e.label}({level}) 기분{sc['mood']:+d}/에너지{sc['energy']}/짜증{sc['irritation']}/"
-                 f"외로움{sc['lonely']}/흥미{sc['interest']}"]
-        th = self._recent_thoughts()
-        if th:
-            lines.append("심정(말로 안 하고 말투에 묻어남):" + " / ".join(th))
+        lines = [f"기분:{e.label}({level})"]
         if uid is not None:
             label, guide = self.aff_label(self.affinity(uid))
-            lines.append(f"{who or '상대'} 호감도:{label}→{guide}")
-        lines.append(f"말투:{self.tone_of(e.id)} [{' '.join(self.knobs(uid))}]")
+            if label != "보통":                                   # 평범한 사이는 굳이 적지 않는다
+                lines.append(f"{who or '상대'} 호감도:{label}→{guide}")
+        lines.append(f"말투:{self.tone_of(e.id)}")
         return "\n".join(lines)
 
     def decorate(self, text: str, is_last: bool = True) -> str:
