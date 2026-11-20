@@ -69,9 +69,11 @@ def decide(snap: Snapshot, cfg: dict, engage: float = 1.0, init_mult: float = 1.
     p *= max(0.0, init_mult)
     if snap.silence < min_sil and s4 == 0:
         p *= 0.3                                    # 대화가 한창일 땐 끼어들기를 드물게
+    if snap.msgs_3m >= 4 and s4 == 0:
+        p *= 0.2                                    # 사람들끼리 활발히 얘기 중이면 더 드물게
     if snap.silence < min_sil and s3 > 0 and s4 == 0:
         p *= 0.5
-    p_tick = min(0.5, p * 0.15 * max(0.5, engage) ** 0.5)
+    p_tick = min(0.5, p * 0.08 * max(0.5, engage) ** 0.5)
     parts = f"침묵{s1:.2f} 식어감{s2:.2f} 비율{s3:.2f} 미응답{s4:.0f}"
     if rng.random() >= p_tick:
         return Decision(p=p_tick, reason=parts)
@@ -94,11 +96,23 @@ INSTRUCTIONS = {
 }
 
 
-def instruction(d: Decision) -> str:
+# 먼저 말할 때마다 같은 얘기만 하지 않도록 던져주는 화제 힌트 (참고만 하게 한다)
+TOPIC_SEEDS = [
+    "최근에 본 영상/영화/드라마", "지금 먹고 싶은 음식", "요즘 듣는 노래", "다음 주말 계획", "요즘 빠진 취미",
+    "날씨나 계절 느낌", "어릴 때 추억", "엉뚱한 만약에 질문", "오늘 컨디션", "서버 사람들 근황",
+    "최근에 산 물건", "잠, 커피, 아침 같은 일상", "가고 싶은 여행지", "웃겼던 일", "요즘 고민",
+]
+AVOID = "시계/시각은 언급하지 말고, '뭐 하고 있었어', '뭐 할 건데', '어디 갔었어' 같은 상투적인 질문으로 시작하지 마라. "
+
+
+def instruction(d: Decision, rng: random.Random | None = None) -> str:
+    rng = rng or random
     base = INSTRUCTIONS.get(d.kind, INSTRUCTIONS["chime"])
     if d.target:
-        return base.format(name=d.target[1], text=str(d.target[2])[:40])
-    return base
+        base = base.format(name=d.target[1], text=str(d.target[2])[:40])
+    if d.kind in ("new_topic", "chime", "follow_topic"):
+        base += f" 화제 힌트(참고만, 억지로 쓰지 마): {rng.choice(TOPIC_SEEDS)}."
+    return AVOID + base
 
 
 def analysis_text(s: Snapshot) -> str:

@@ -31,6 +31,9 @@ def clean_name(name: str) -> str:
     return s or name.strip()
 
 
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u231A\u231B\uFE0F\u200D]+")
+
+
 def humanize(text: str, lively: bool = False) -> str:
     """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)
     lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다."""
@@ -41,6 +44,7 @@ def humanize(text: str, lively: bool = False) -> str:
         t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)       # ?! → ?
         t = re.sub(r"([?!？！])\1+", r"\1", t)                  # ??? → ?
     t = re.sub(r"~{2,}", "~", t)
+    t = re.sub(r"([ㅠㅜㅋㅎㅡ]) (?=[ㅠㅜㅋㅎㅡ]\b)", r"\1", t)           # 'ㅠ ㅠ' 처럼 띄어 쓴 이모티콘을 붙인다
     t = re.sub(r"[ \t]+", " ", t).strip(" -—–·")
     t = re.sub(r"\s+([,?!])", r"\1", t)
     t = re.sub(r"[.。]+$", "", t)                               # 문장 끝 마침표 제거
@@ -162,6 +166,7 @@ class ChatEngine:
         self.busy_check = lambda: False                            # 대화가 바쁜지 (기억 추출 보류용, main 이 설정)
         self.last_skip = False
         self._recent_guard: list[str] = []
+        self._init_recent: dict[int, list[str]] = {}      # 채널별 최근에 먼저 건 말 (중복 방지)
         self._bg: set[asyncio.Task] = set()
 
     @property
@@ -486,11 +491,40 @@ class ChatEngine:
         else:
             msgs = self._assemble("", [], scene, merged, "\n".join(parts))
         res, bubbles = await self._generate(msgs, mode, banned, known, temperature=1.05)
+        # 최근에 한 말과 비슷하면 한 번 다시 만들고, 그래도 비슷하면 말하지 않는다 (같은 말 반복 방지)
+        if bubbles and self._too_similar(channel_id, bubbles, own):
+            retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
+                                + "\n방금 만든 말이 최근에 한 말과 비슷하다. 화제도 표현도 완전히 다르게 다시 말해라."}]
+            res2 = await self.llm.chat(retry, num_predict=mode.num_predict, temperature=1.15)
+            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles)
+            res2.prompt_tokens += res.prompt_tokens
+            res2.completion_tokens += res.completion_tokens
+            res = res2
+            bubbles = b2 if (b2 and not self._too_similar(channel_id, b2, own)) else []
         if bubbles:
+            rec = self._init_recent.setdefault(channel_id, [])
+            rec.append(" ".join(bubbles))
+            del rec[:-6]
             await self.mem.add_message(channel_id, 0, self.persona.name, "assistant", "\n".join(bubbles))
             await self._record("idle", res, target[0] if target else 0, "(먼저 말걸기)", channel_id,
                                f"[{mode.label}] " + " / ".join(bubbles))
         return bubbles
+
+    @staticmethod
+    def _stems(text: str) -> set[str]:
+        toks = [re.sub(r"[^\w]", "", w) for w in text.split()]
+        return {_stem(t) for t in toks if len(t) >= 2 and t not in _STOP and not re.fullmatch(r"[ㄱ-ㅎㅏ-ㅣ]+", t)}
+
+    def _too_similar(self, channel_id: int, bubbles: list[str], own: list[str], thresh: float = 0.34) -> bool:
+        """새로 만든 말이 최근 먼저 건 말/자기 발언과 어간 기준으로 많이 겹치는가 (자카드 유사도)"""
+        cur = self._stems(" ".join(bubbles))
+        if len(cur) < 3:
+            return False
+        for prev in self._init_recent.get(channel_id, []) + [" ".join(own[-3:])]:
+            ps = self._stems(prev)
+            if ps and len(cur & ps) / len(cur | ps) >= thresh:
+                return True
+        return False
 
     def warm_messages(self) -> list[dict[str, str]]:
         """KV 캐시 선적재용 메시지 (고정 system + few-shot). 시작할 때 한 번 계산해 두면 첫 응답도 캐시에 적중한다."""
@@ -545,6 +579,8 @@ class ChatEngine:
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
         text = re.sub(r"^#+\s*", "", text, flags=re.M)
         text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
+        if not self.s.get("expression", {}).get("unicode_in_text", False):
+            text = EMOJI_RE.sub("", text)                       # 글에는 유니코드 이모지를 쓰지 않는다 (리액션에만)
         parts = [self.mood.filter_text(humanize(p, lively)) for p in re.split(r"\n+", text)]
         parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])

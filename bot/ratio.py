@@ -38,6 +38,7 @@ class RatioControl:
         self.window = float(cfg.get("window_min", 20)) * 60
         self.reroll = float(cfg.get("reroll_min", 8)) * 60
         self.min_human = int(cfg.get("min_human", 3))
+        self.allow = float(cfg.get("allow", 2))      # 사람이 말하지 않아도 봇이 먼저 말할 수 있는 여유분(메시지 수)
         self._ev: dict[int, deque[tuple[float, str, int]]] = {}
         self._t: dict[int, tuple[float, float]] = {}
 
@@ -86,16 +87,25 @@ class RatioControl:
         tgt = self.target(channel_id)
         return _clamp((tgt - b / h) / max(tgt, 0.2), -0.6, 0.6)
 
+    def over_cap(self, channel_id: int) -> bool:
+        """봇 메시지가 (목표 비율 x 사람 메시지 + 여유분) 이상이면 먼저 말하기를 막는다.
+        사람이 거의 말하지 않는 구간에서도 봇이 혼자 떠드는 일을 막는 절대 상한이다."""
+        if not self.enabled:
+            return False
+        h, b = self.counts(channel_id)
+        return b >= self.target(channel_id) * h + self.allow
+
     def adjust(self, channel_id: int) -> Adjust:
         h, b = self.counts(channel_id)
         tgt = self.target(channel_id)
         ratio = b / h if h else 0.0
+        capped = self.over_cap(channel_id)
         if not self.enabled or h < self.min_human:
-            return Adjust(ratio=ratio, target=tgt, human=h, bot=b)
+            return Adjust(initiate=0.0 if capped else 1.0, ratio=ratio, target=tgt, human=h, bot=b)
         d = self.deficit(channel_id)
         if d >= 0:      # 봇이 조용함 → 더 말한다
-            return Adjust(reply=1 + 0.8 * d, cooldown=1 - 0.8 * d, bubbles=1 + 1.2 * d, initiate=1 + 1.5 * d,
-                          ratio=ratio, target=tgt, human=h, bot=b)
+            return Adjust(reply=1 + 0.8 * d, cooldown=1 - 0.8 * d, bubbles=1 + 1.2 * d,
+                          initiate=0.0 if capped else 1 + 1.5 * d, ratio=ratio, target=tgt, human=h, bot=b)
         # 봇이 너무 많이 말함 → 줄인다
         return Adjust(reply=max(0.4, 1 + 1.0 * d), cooldown=1 - 1.2 * d, bubbles=max(0.3, 1 + 1.5 * d),
-                      initiate=max(0.1, 1 + 2.0 * d), ratio=ratio, target=tgt, human=h, bot=b)
+                      initiate=0.0 if capped else max(0.1, 1 + 2.0 * d), ratio=ratio, target=tgt, human=h, bot=b)

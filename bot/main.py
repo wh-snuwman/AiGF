@@ -149,6 +149,7 @@ class GirlBot(discord.Client):
         self.init_times: dict[int, deque] = {}           # 채널별 먼저 말한 시각들 (시간당 한도용)
         self.init_unanswered: dict[int, int] = {}        # 먼저 말했는데 아직 사람이 답하지 않은 횟수
         self.init_gap: dict[int, float] = {}             # 채널별 이번 능동 대화 쿨타임(랜덤)
+        self.init_target: dict[int, tuple] = {}          # 채널별 마지막으로 먼저 말 건 대상 (uid, 시각)
         self.unaddressed: dict[int, list] = {}           # 대답 후보에서 탈락해 답을 못 받은 메시지 (uid, 이름, 글, 시각)
         self.init_enabled = bool(inicfg.get("enabled", True))
         # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
@@ -464,7 +465,11 @@ async def on_message(message: discord.Message) -> None:
     engine.mood.observe(stored, directed=directed, uid=uid, who=who)
     bot.chan_events.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
     ratio.record(ch, "h")
-    bot.init_unanswered[ch] = 0                      # 사람이 말했으니 먼저 한 말에 답이 온 셈
+    # 먼저 한 말에 '답이 왔다'고 보는 경우: 봇을 부르거나(멘션/이름/답장) 먼저 말 건 상대가 3분 안에 말했을 때만.
+    # 사람들끼리만 떠드는 건 답이 아니다. (그래서 혼자 계속 말 거는 일을 막는다)
+    it = bot.init_target.get(ch)
+    if directed or (it and it[0] == uid and time.time() - it[1] < 180):
+        bot.init_unanswered[ch] = 0
     bot.last_speaker[ch] = who
 
     # ---- 말싸움: 도발/모욕을 받았고 기분이 상했으면 붙는다 ----
@@ -768,6 +773,7 @@ def roll_gap(channel_id: int) -> float:
     """다음 능동 대화까지의 랜덤 쿨타임 (적극성이 높으면 짧게)"""
     lo, hi = inicfg.get("min_gap_sec", [45, 180])
     g = random.uniform(float(lo), float(hi)) / max(1.0, engine.mood.engage) ** 0.5
+    g *= 1 + 0.8 * bot.init_unanswered.get(channel_id, 0)        # 답이 없을수록 더 오래 기다린다
     bot.init_gap[channel_id] = g
     return g
 
@@ -812,6 +818,7 @@ async def run_initiative(channel_id: int, dec: initiative.Decision, snap: initia
             if dec.kind == "ask_user" and target:
                 bubbles[0] = f"<@{target[0]}> {bubbles[0]}"      # 답을 못 받은 사람을 호출하며 먼저 말을 건다
                 unpark(channel_id, target[0])
+                bot.init_target[channel_id] = (target[0], time.time())
             await send_bubbles(channel, bubbles)
             bot.init_times.setdefault(channel_id, deque(maxlen=60)).append(time.time())
             bot.init_unanswered[channel_id] = bot.init_unanswered.get(channel_id, 0) + 1

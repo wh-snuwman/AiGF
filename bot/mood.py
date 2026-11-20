@@ -250,7 +250,7 @@ RULES: list[Rule] = [
 INSULT_RE = re.compile(r"죽을래|꺼져|닥쳐|바보|멍청|병신|시발|씨발|ㅅㅂ|ㅂㅅ|한심|쓰레기")
 SERIOUS_RE = re.compile(r"진짜\s*심각|문제|고민|걱정|힘들|어떡|도와|부탁|사실은")
 ATMOSPHERES = {
-    "썰렁한 정적": ("말이 없다. 화제를 던지거나 조용히 있어도 자연스럽다", {"lonely": 3, "interest": -1}),
+    "썰렁한 정적": ("말이 없다. 화제를 던지거나 조용히 있어도 자연스럽다", {"interest": -1}),
     "과열된 말싸움": ("서로 날이 서 있다. 편들기보다 한 발 물러서서 한마디 하거나 말리는 쪽이 자연스럽다", {"irritation": 3, "energy": 1}),
     "정신없이 빠른 수다판": ("말이 빠르게 오간다. 아주 짧게 끼어든다", {"energy": 1, "irritation": 1.5}),
     "다 같이 웃고 떠드는 분위기": ("가볍고 신난다. 드립을 받아주고 같이 웃는다", {"mood": 2, "energy": 1}),
@@ -309,6 +309,7 @@ class Mood:
         self.energy_floor = 0.45          # 적극성이 높을 때 에너지가 이 밑으로 떨어지지 않게 하는 바닥값
         self.expr_scale = 1.0             # 이모티콘/표현 강도 배수 (settings.yaml expression.scale)
         self.emoji_picker = None          # callable(카테고리)->':이름:' (서버 커스텀 이모지 선택, main 이 설정)
+        self._deco_ts = 0.0               # 마지막으로 이모티콘을 붙인 시각 (연속 남발 억제)
         self.s: dict[str, float] = self.baseline()
 
     # ---------- 기준값 / 저장 ----------
@@ -507,6 +508,8 @@ class Mood:
             return text
         inten = 0.55 + 0.9 * self.intensity()                   # 0.55 ~ 1.45
         rate = x.rate * self.expr_scale * inten * (1.0 if is_last else 0.3)
+        if time.time() - self._deco_ts < 150:
+            rate *= 0.25                                         # 방금도 붙였으면 연달아 붙이지 않는다
         out = text
         if x.stretch:                                           # ㅋㅋ → ㅋㅋㅋㅋ, ㅠㅠ → ㅠㅠㅠ 처럼 감정이 길게 늘어난다
             out = re.sub(r"ㅋ{2,3}(?!ㅋ)", lambda m: "ㅋ" * random.randint(3, 5) if random.random() < 0.6 else m.group(0), out)
@@ -522,6 +525,7 @@ class Mood:
                 tok = random.choice(x.marks)                    # 텍스트 이모티콘
             if tok:
                 out = f"{out} {tok}"
+                self._deco_ts = time.time()
         return out
 
     # ---------- 행동에 미치는 영향 ----------
@@ -669,7 +673,7 @@ class Mood:
         eff = ATMOSPHERES.get(name, ("", {}))[1]
         if eff:
             self._tick()
-            self._apply(eff)
+            self._apply(eff, 0.4)                  # 분위기는 기분에 아주 약하게만 스며든다
             self._save()
 
     def on_reply(self) -> None:
