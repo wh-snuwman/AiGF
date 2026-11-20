@@ -237,7 +237,7 @@ def summarize(r: dict, width: int = 70) -> str:
         out = " / ".join(r.get("bubbles") or []) or f"({r.get('outcome', '무응답')})"
         who = cut(r.get("target_label") or r.get("target_name") or "먼저말걸기", 10)
         return (f"`{t}` 💬 [{r.get('id')}] {who}: {cut(r.get('input'), 30)} → {cut(out, width)} "
-                f"({r.get('emotion', '')}, {r.get('total_sec', 0):.1f}s)")
+                f"({(r.get('mood') or {}).get('emotion', '')}, {r.get('total_sec', 0):.1f}s)")
     if k == "decision":
         return f"`{t}` ⏭ {r.get('action')}: {cut(r.get('detail'), width)}"
     if k == "send":

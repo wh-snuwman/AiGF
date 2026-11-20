@@ -39,6 +39,31 @@ def clean_name(name: str) -> str:
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u231A\u231B\uFE0F\u200D]+")
 
 
+# 보호할 토큰: 멘션, 서버 이모지(:이름:), 숫자 속 . , :, 텍스트 이모티콘
+_PROTECT = re.compile(r"<[@#!&]\w+>|:[\w가-힣]{2,32}:|///|\^\^|;;|ㅡㅡ|\d[.,:]\d")
+
+
+def strip_symbols(t: str, lively: bool = False) -> str:
+    """디코 채팅처럼 보이도록 특수문자를 걷어낸다: 쉼표/마침표/따옴표/괄호/물결/대시/느낌표 제거(물음표와 ㅋㅋ ㅠㅠ 같은 자모 표현은 유지).
+    lively(싸움)에서는 느낌표를 살린다. 멘션과 서버 이모지, 숫자 속 점/쉼표, ^^ ;; /// ㅡㅡ 는 보호한다."""
+    keep: list[str] = []
+
+    def hold(m: re.Match) -> str:
+        keep.append(m.group(0))
+        return f"\x00{len(keep) - 1}\x00"
+
+    t = _PROTECT.sub(hold, t)
+    t = re.sub(r"[\"“”‘’'`「」『』()（）\[\]{}*_|\\—–·•→<>#]", "", t)
+    t = re.sub(r"(?:^|\s)-+(?=\s|$)|^-+|-+$", " ", t)
+    t = re.sub(r"[,，、]+", " ", t)
+    t = re.sub(r"[.。]+", " ", t)
+    t = re.sub(r"~+", "", t)
+    t = re.sub(r"[:：;]+(?=\s|$)|^[:：;]+", " ", t)
+    if not lively:
+        t = re.sub(r"[!！]+", "", t)
+    return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], t)
+
+
 def humanize(text: str, lively: bool = False) -> str:
     """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)
     lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다."""
@@ -48,7 +73,7 @@ def humanize(text: str, lively: bool = False) -> str:
     else:
         t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)       # ?! → ?
         t = re.sub(r"([?!？！])\1+", r"\1", t)                  # ??? → ?
-    t = re.sub(r"~{2,}", "~", t)
+    t = strip_symbols(t, lively)
     t = re.sub(r"([ㅠㅜㅋㅎㅡ]) (?=[ㅠㅜㅋㅎㅡ]\b)", r"\1", t)           # 'ㅠ ㅠ' 처럼 띄어 쓴 이모티콘을 붙인다
     t = re.sub(r"[ \t]+", " ", t).strip(" -—–·")
     t = re.sub(r"\s+([,?!])", r"\1", t)
@@ -106,13 +131,14 @@ class LengthMode:
     desc: str
     num_predict: int
     max_bubbles: int
+    max_chars: int = 40          # 말풍선 하나의 글자 수 상한 (넘으면 문장 단위로 잘라냄)
 
 
 MODES = [
-    LengthMode("초단문", "한두 단어 리액션", 45, 1),
-    LengthMode("한 줄", "한 문장", 85, 1),
-    LengthMode("보통", "1~2문장", 140, 2),
-    LengthMode("길게", "2~4문장(말풍선 2~3개)", 230, 3),
+    LengthMode("초단문", "한두 단어 리액션(10자 안팎)", 30, 1, 12),
+    LengthMode("한 줄", "한 문장(20자 안팎)", 60, 1, 30),
+    LengthMode("보통", "1~2문장(35자 안팎)", 100, 2, 45),
+    LengthMode("길게", "2~3문장(말풍선마다 30자 안팎)", 170, 3, 60),
 ]
 
 
@@ -129,7 +155,8 @@ MOVES = [
 
 
 def pick_length(text: str, activity: int, priority: bool, free: bool = False,
-                bias: tuple = (1.0, 1.0, 1.0, 1.0), engage: float = 1.0, bubbles: float = 1.0) -> LengthMode:
+                bias: tuple = (1.0, 1.0, 1.0, 1.0), engage: float = 1.0, bubbles: float = 1.0,
+                short: float = 1.0) -> LengthMode:
     """대상 말의 길이/질문 여부, 채팅방 활발함, 멘션 여부, 현재 기분으로 가중치를 바꿔 랜덤 선택."""
     body = re.sub(r"^\(.*?에 답장\)\s*", "", text)
     n = len(body.strip())
@@ -160,6 +187,8 @@ def pick_length(text: str, activity: int, priority: bool, free: bool = False,
     elif bubbles < 1.0:                                 # 비율이 높으면 한 개로 짧게
         inv = 1.0 / max(bubbles, 0.2)
         w = [w[0] * inv ** 0.4, w[1] * inv ** 0.6, w[2] * bubbles, w[3] * bubbles ** 1.3]
+    if short != 1.0:                                    # 디코 채팅은 대부분 짧다: 짧은 쪽으로 쏠리게 (settings style.short_bias)
+        w = [w[0] * short, w[1] * short ** 0.5, w[2] / short ** 0.5, w[3] / short]
     return random.choices(MODES, weights=w, k=1)[0]
 
 
@@ -357,7 +386,7 @@ class ChatEngine:
         if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
             trace.cur().set(outcome="skip")
             return res, None
-        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles, lively)
+        bubbles = self.to_bubbles(res.text, known, mode.max_bubbles, lively, maxc=mode.max_chars)
         # 코드 차원의 말버릇 차단: 프롬프트에 '쓰지 마라'고 해도 모델이 어기면(예: 화났을 때 '됐어.' 반복) 출력에서 직접 걷어낸다.
         if bubbles and banned:
             stripped = self._strip_overused(bubbles, set(banned))
@@ -367,7 +396,7 @@ class ChatEngine:
                 retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
                                     + "\n방금 답이 최근에 계속 쓴 말뿐이었다. 그 말은 빼고 전혀 다른 표현으로 다시 대답해라."}]
                 res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict, temperature=1.15)
-                b2 = self._strip_overused(self.to_bubbles(res2.text, known, mode.max_bubbles, lively), set(banned))
+                b2 = self._strip_overused(self.to_bubbles(res2.text, known, mode.max_bubbles, lively, maxc=mode.max_chars), set(banned))
                 res2.prompt_tokens += res.prompt_tokens
                 res2.completion_tokens += res.completion_tokens
                 res, stripped = res2, b2
@@ -385,7 +414,7 @@ class ChatEngine:
             base_t = self.llm.options.get("temperature", 1.0)
             res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict,
                                        temperature=min(1.2, base_t + 0.15))
-            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles)
+            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, maxc=mode.max_chars)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens
             if b2:
@@ -412,7 +441,7 @@ class ChatEngine:
         base_t = self.llm.options.get("temperature", 1.0)
         res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict,
                                    temperature=min(1.25, base_t + 0.2))
-        b2 = self.div.drop_duplicates(self.to_bubbles(res2.text, known, mode.max_bubbles, lively), lines)
+        b2 = self.div.drop_duplicates(self.to_bubbles(res2.text, known, mode.max_bubbles, lively, maxc=mode.max_chars), lines)
         res2.prompt_tokens += res.prompt_tokens
         res2.completion_tokens += res.completion_tokens
         return res2, b2
@@ -523,7 +552,7 @@ class ChatEngine:
         if fight is not None:                  # 싸움은 짧고 빠르게 주고받는다
             bias = tuple(b * m for b, m in zip(bias, (0.5, 1.6, 1.1, 0.2)))
         mode = pick_length(safe_text, activity, priority or dm or fight is not None, bias=bias,
-                           engage=self.mood.engage, bubbles=bubble_bias)
+                           engage=self.mood.engage, bubbles=bubble_bias, short=self._short())
         own_text, banned = self._own_block(own, channel_id)
         move = None
         if fight is None and verdict.level == "ok" and not extra_note:
@@ -603,7 +632,7 @@ class ChatEngine:
                   "또는 현재 수위에서 허용되지 않는 욕설)이 있었다. 그런 표현 없이 다시 대답해라.",
             }]
             res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict)
-            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, fight is not None)
+            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, fight is not None, maxc=mode.max_chars)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens
             res = res2
@@ -712,7 +741,7 @@ class ChatEngine:
         tid = target[0] if target else None
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, tid)
         mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias,
-                           engage=self.mood.engage, bubbles=bubble_bias)
+                           engage=self.mood.engage, bubbles=bubble_bias, short=self._short())
         own_text, banned = self._own_block(own, channel_id)
         parts = [f"[메모-언급금지] 네가 먼저 말을 꺼낸다. 할 일:{instruction}"]
         if analysis:
@@ -738,7 +767,7 @@ class ChatEngine:
             retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
                                 + "\n방금 만든 말이 최근에 한 말과 비슷하다. 화제도 표현도 완전히 다르게 다시 말해라."}]
             res2 = await self.llm.chat(retry, num_predict=mode.num_predict, temperature=1.15)
-            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles)
+            b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, maxc=mode.max_chars)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens
             res = res2
@@ -779,7 +808,7 @@ class ChatEngine:
     async def _proactive_impl(self, channel_id: int, user_id: int, user_name: str, idle_hours: float) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, user_id)
         who = self.label(user_id, user_name)
-        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias, engage=self.mood.engage)
+        mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias, engage=self.mood.engage, short=self._short())
         own_text, banned = self._own_block(own, channel_id)
         hint = "\n".join([
             "[상황 메모 — 언급 금지]",
@@ -804,8 +833,30 @@ class ChatEngine:
         return self.evader.reply(name, pool)
 
     # ---------- 후처리 ----------
+    def _short(self) -> float:
+        return float(self.s.get("style", {}).get("short_bias", 1.6))
+
+    @staticmethod
+    def _trim(p: str, maxc: int) -> str:
+        """말풍선이 상한보다 길면 문장 단위로 잘라낸다 (첫 문장은 항상 남김). 한 문장이 너무 길면 쉼표/띄어쓰기에서 자른다."""
+        sents = re.split(r"(?<=[.!?。])\s+", p.strip())
+        out = ""
+        for s_ in sents:
+            if not out:
+                out = s_
+            elif len(out) + 1 + len(s_) <= maxc:
+                out += " " + s_
+            else:
+                break
+        hard = int(maxc * 1.4)
+        if len(out) > hard:
+            cut = out[:hard]
+            m = max(cut.rfind(","), cut.rfind(" "))
+            out = cut[:m] if m > maxc * 0.5 else cut
+        return out.strip(" ,")
+
     def to_bubbles(self, raw: str, other_names: set[str] | None = None, limit: int | None = None,
-                   lively: bool = False) -> list[str]:
+                   lively: bool = False, maxc: int | None = None) -> list[str]:
         name = re.escape(self.persona.name)
         nick = re.escape(self.persona.nickname)
         text = sanitize_output(raw.strip())                     # @everyone/역할 멘션/링크/토큰 제거
@@ -822,6 +873,9 @@ class ChatEngine:
         text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
         if not self.s.get("expression", {}).get("unicode_in_text", False):
             text = EMOJI_RE.sub("", text)                       # 글에는 유니코드 이모지를 쓰지 않는다 (리액션에만)
+        if maxc and self.s.get("style", {}).get("trim", True):
+            cap = int(maxc * (1.4 if lively else 1.0))
+            text = "\n".join(self._trim(p, cap) for p in re.split(r"\n+", text) if p.strip())
         parts = [self.mood.filter_text(humanize(p, lively)) for p in re.split(r"\n+", text)]
         parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])
