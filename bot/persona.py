@@ -154,6 +154,8 @@ class Persona:
             f"{profile} 좋아함:{d.get('likes', '')} 싫어함:{d.get('dislikes', '')}\n"
             f"성격: {_flat(d.get('personality'), cut=60, maxn=4)}\n"
             f"말투: {_flat(d.get('speech_style'), cut=70, maxn=4)}\n"
+            + (f"배경: {_shorten(_flat(d.get('backstory'), ' '), 90)}\n" if d.get("backstory") else "")
+            +
             f"규칙:\n{rules}\n"
             f"보안:\n{security}"
         )

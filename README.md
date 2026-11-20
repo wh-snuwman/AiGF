@@ -140,6 +140,11 @@ config/people/<서버id>.txt       그 서버의 사람 이름/인식 (처음엔
 - 설정 `multi:` — `webhook`, `webhook_name`, `chain_chance`(0이면 캐릭터끼리 대화 끔), `chain_decay`, `max_chain`, `chain_delay_sec`, `human_window_sec`.
 - 한계: 웹훅 메시지에는 봇의 이모지 리액션을 달 수 없고(리액션은 봇 계정으로 달립니다), 답장 표시(↪) 없이 보냅니다. 사용자가 캐릭터 메시지에 답장하면 그 캐릭터가 우선 대답합니다.
 
+### 캐릭터 만들기 / 다른 모델에게 맡기기
+- 작성 요령(필드 설명, 예시 작성법, 체크리스트, **모델에게 줄 지시문**): [`docs/캐릭터_작성_가이드.md`](docs/캐릭터_작성_가이드.md), 폴더 안내: [`config/characters/README.md`](config/characters/README.md)
+- 템플릿 `python scripts/new_character.py <id> "<이름>" [프리셋]` → 작성 → 검사 `python scripts/check_character.py <id>` → 디스코드 `/캐릭터 동작:부르기` 또는 `/상태 동작:리로드`
+- Claude Code 스킬: `character-writer` (`.claude/skills/character-writer`) — 생성·검사·적용 안내까지 자동으로 진행
+
 ### 상세 기록 (디버깅/수정용 데이터, `bot/trace.py`)
 받은 메시지, 대답 대상을 고른 과정, 프롬프트, LLM 원문, 후처리, 최종 답변, 전송 결과를 **JSONL(한 줄에 사건 하나)** 로 전부 저장합니다. 위치 `data/guilds/<서버id>/logs/trace-날짜.jsonl` (서버별) (git 에 올라가지 않음, 사용자 메시지가 들어 있으니 공유 주의).
 
