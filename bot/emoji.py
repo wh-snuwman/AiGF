@@ -55,7 +55,7 @@ class Emojis:
         if not self.custom:
             return ""
         names = " ".join(f":{n}:" for n in list(self.custom)[:limit])
-        return f"- 쓸 수 있는 서버 이모지(`:이름:` 형식 그대로 써라): {names}"
+        return f"서버이모지(:이름: 형식 그대로, 가끔만): {names}"
 
     # ---------- 출력 변환 ----------
     def render(self, text: str) -> str:
@@ -72,6 +72,12 @@ class Emojis:
 
         out = TOKEN.sub(sub, text)
         return re.sub(r"[ \t]{2,}", " ", out).strip() or text
+
+    def text_token(self, cat: str) -> Optional[str]:
+        """글에 섞을 서버 커스텀 이모지 `:이름:` (감정 카테고리에 맞는 이름 키워드로 고른다). 없으면 None."""
+        keys = EMOTION_KEYWORDS.get(cat, [])
+        hits = [n for n in self.custom if any(k in n.lower() for k in keys)]
+        return f":{random.choice(hits)}:" if hits else None
 
     # ---------- 리액션 선택 ----------
     def is_trivial(self, text: str) -> bool:

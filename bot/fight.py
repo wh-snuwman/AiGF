@@ -47,6 +47,9 @@ class Fight:
     user_spirit: float = 100.0
     ending: str = ""            # "", bot_win, bot_lose, draw, retreat, calmed, timeout_win, timeout_quiet
     last_power: float = 0.0     # 방금 받은 타격력 (프롬프트 힌트용)
+    last_bot: float = 0.0       # 봇이 마지막으로 말한 시각 (재촉 간격 계산용)
+    nudges: int = 0             # 상대가 대꾸하지 않아 봇이 먼저 도발한 횟수
+    level_text: str = ""        # 이 싸움에만 적용하는 자유 수위 설명 (비우면 기본 수위)
 
     @property
     def advantage(self) -> str:
@@ -81,6 +84,8 @@ class FightManager:
         self.cfg = {
             "enabled": True, "level": 3, "max_rounds": 8, "timeout_sec": 120,
             "start_chance": 0.7, "cooldown_after_sec": 180,
+            "level_text": "",         # 자유 텍스트 수위 (비우면 level 프리셋 사용)
+            "nudge_after_sec": 25, "max_nudges": 2,
             "filter": False,          # 출력 금지어 필터 (앞단에 별도 검열이 있으면 이중 검열이라 기본 꺼둠)
             **(cfg or {}),
         }
@@ -165,7 +170,12 @@ class FightManager:
     # ---------- 프롬프트 ----------
     def prompt(self, f: Fight, fight_style: str = "") -> str:
         lvl = int(self.cfg["level"])
-        if lvl >= 3:
+        custom = (f.level_text or self.cfg.get("level_text", "") or "").strip()
+        if custom in ("1", "2", "3"):                  # 숫자는 프리셋 단축키
+            lvl, custom = int(custom), ""
+        if custom:
+            allow = f"관리자가 정한 수위를 그대로 따른다 → {custom}"
+        elif lvl >= 3:
             allow = ("욕설을 거침없이 써도 된다. 화나면 화난 대로 그대로 터뜨려라. "
                      "(예: 씨발, 시발, 개새끼, 존나, 지랄, 염병, 미친, 닥쳐, 꺼져, 한심하네, 아 진짜). "
                      "욕은 상대의 '말과 행동'을 향해 쓴다.")
@@ -175,7 +185,7 @@ class FightManager:
             allow = "욕설은 쓰지 않고 비꼼과 빈정거림, 순화된 표현(바보, 멍청이, 뭐래, 꺼져)으로만 싸운다."
         # 속성 비하/혐오/실제 위협은 코드 필터가 아니라 프롬프트 지침으로만 안내한다 (필터는 fight.filter 로 선택)
         banned_line = ("인종·성별·장애·지역·종교 같은 속성 비하와 혐오 표현, 가족 욕(패드립), 실제 위협, 자해 권유, 개인정보"
-                       + ("" if lvl >= 3 else ", 씨발·개새끼 같은 센 욕설"))
+                       + ("" if (lvl >= 3 or custom) else ", 씨발·개새끼 같은 센 욕설"))
         tone = {
             "우세": ("짜증과 경멸이 치민다. 어이없고 얄밉다는 듯 깔보면서 짜증을 그대로 쏟아낸다. "
                     "'아 진짜', '어이가 없네', '지겹다' 같은 짜증이 말투에 배어 있다."),

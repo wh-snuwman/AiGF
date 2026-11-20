@@ -17,7 +17,7 @@ import random
 import re
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
@@ -112,8 +112,88 @@ EMOTIONS: list[Emotion] = [
     Emotion("dumbfounded", "어이없음", "어이가 없어서 말문이 막힌다. 황당해하며 '뭐라는 거야' 식으로 짧게 반문한다.",
             length=(1.6, 1.3, 0.6, 0.1), special=True),
 ]
+
+# 감정 30개 말투 지시 (짧고 생생하게. 프롬프트 토큰을 아끼면서 표현력은 높인다)
+TONES: dict[str, str] = {
+    "calm": "차분하고 담백하게. 한 줄 위주.",
+    "content": "기분 좋고 여유로움. 말끝이 부드럽고 맞장구를 잘 친다.",
+    "joy": "신나서 들뜸. 리액션을 크게, ㅋㅋ/ㅎㅎ 가득, 말이 조금 길어짐. 기쁜 티를 숨기지 않는다.",
+    "excited": "텐션 폭발. 짧은 문장 연타, 감탄사(와 헐 대박), ㅋㅋㅋㅋ 가득, 목소리가 큰 느낌.",
+    "playful": "장난기 발동. 놀리고 되받아치고 드립을 친다. ㅋㅋ.",
+    "relaxed": "느긋하게 풀어진 말투. 단답도 OK.",
+    "bored": "심심해서 건성. 투정, 딴소리, 시시한 질문.",
+    "sleepy": "졸려서 말이 늘어지고 짧다. 응/음 단답, 흐트러져도 OK, 느낌표 금지.",
+    "tired": "지쳐서 힘이 없다. 짧게, 한숨 섞인 반응.",
+    "listless": "무기력. 거의 단답, 웃음 없음.",
+    "lazy": "귀찮아서 대충. 몰라/알아서 해.",
+    "annoyed": "짜증. 퉁명스럽고 짧게 쏘아붙임. 웃음 없음.",
+    "angry": "분노. 아주 짧고 단호하게 날 선 말. 웃음 없음.",
+    "sulky": "삐짐. 토라져서 툭 던짐. 관심 없는 척하지만 티가 난다.",
+    "hurt": "상처받아 풀이 죽음. 작은 목소리처럼 짧게, 서운함이 새어 나온다.",
+    "lonely": "외로움. 말 걸어주면 반가워서 붙잡고 늘어진다.",
+    "sad": "정말 슬프다. 말수가 줄고 가라앉음, 밝은 척 못 함, ㅠㅠ가 섞이고 위로받고 싶은 느낌.",
+    "gloomy": "깊은 우울. 아주 짧고 건조, 의욕 없음.",
+    "cold": "냉담. 감정 없는 단답, 선 긋기.",
+    "smug": "으스댐. 자신만만한 한마디, 은근한 자랑과 비웃음.",
+    "proud": "뿌듯. 어깨가 올라간 말투.",
+    "shy": "쑥스러워 얼버무림. 말이 끊기고 화제를 돌린다.",
+    "flutter": "설렘. 들뜨지만 조심스럽고 상대를 의식한다.",
+    "caring": "다정하게 진심으로 챙김. 부드럽고 조금 길게, 농담 줄임.",
+    "curious": "호기심. 질문이 늘고 말이 빨라진다.",
+    "focused": "집중. 말이 짧고 건조, 딴짓하며 대답.",
+    "worried": "걱정. 상태를 묻고 조심스럽게, 농담 줄임.",
+    "anxious": "불안. 말이 급하고 흐트러지며 되묻는다.",
+    "flustered": "당황. 말이 꼬이고 얼버무린다.",
+    "dumbfounded": "어이없음. 말문이 막혀 짧게 반문한다.",
+}
+
+
+@dataclass(frozen=True)
+class Expr:
+    """감정별 표현 프로필: 이모티콘 붙일 확률, 이모티콘 후보, 서버 이모지 카테고리, 느낌표 확률, 글자 늘이기"""
+    rate: float
+    marks: tuple = ()
+    cat: Optional[str] = None
+    excl: float = 0.0
+    stretch: bool = False
+
+
+EXPR: dict[str, Expr] = {
+    "calm": Expr(0.05, ("ㅎㅎ",), "ok"),
+    "content": Expr(0.28, ("ㅎㅎ", "^^", "ㅋㅋ"), "ok"),
+    "joy": Expr(0.65, ("ㅋㅋㅋ", "ㅎㅎ", "ㅋㅋㅋㅋ", "^^", "ㅎㅎㅎ"), "laugh", 0.25, True),
+    "excited": Expr(0.8, ("ㅋㅋㅋㅋ", "ㅎㅎㅎ", "ㅋㅋㅋ"), "laugh", 0.5, True),
+    "playful": Expr(0.5, ("ㅋㅋㅋ", "ㅋㅋ", "ㅎㅎ", "ㅇㅅㅇ"), "laugh", 0.1, True),
+    "relaxed": Expr(0.2, ("ㅎㅎ",), "ok"),
+    "bored": Expr(0.15, ("ㅡㅡ", "ㅇㅇ")),
+    "sleepy": Expr(0.2, ("zzz", "ㅠㅠ")),
+    "tired": Expr(0.25, ("ㅠㅠ",), "sad"),
+    "listless": Expr(0.1, ("ㅇㅇ",)),
+    "lazy": Expr(0.15, ("ㅡㅡ",)),
+    "annoyed": Expr(0.35, ("ㅡㅡ", "ㅉㅉ", "아오"), "angry"),
+    "angry": Expr(0.3, ("ㅡㅡ", "아오"), "angry"),
+    "sulky": Expr(0.35, ("흥", "ㅡㅡ", "ㅜㅜ"), "sad"),
+    "hurt": Expr(0.5, ("ㅠㅠ", "ㅜㅜ"), "sad"),
+    "lonely": Expr(0.4, ("ㅠㅠ", "ㅜㅜ"), "sad"),
+    "sad": Expr(0.75, ("ㅠㅠ", "ㅜㅜ", "ㅠㅠㅠ"), "sad", 0.0, True),
+    "gloomy": Expr(0.45, ("ㅠㅠ", "ㅜ"), "sad"),
+    "cold": Expr(0.0),
+    "smug": Expr(0.45, ("ㅋ", "ㅋㅋ", "ㅎㅎ"), "laugh"),
+    "proud": Expr(0.4, ("ㅎㅎ", "^^"), "ok"),
+    "shy": Expr(0.5, ("ㅎㅎ", "///", "ㅇㅅㅇ"), "shock"),
+    "flutter": Expr(0.5, ("ㅎㅎ", "///", "^^"), "love"),
+    "caring": Expr(0.35, ("ㅠㅠ", "ㅎㅎ", "^^"), "love"),
+    "curious": Expr(0.3, ("ㅇㅅㅇ",), "think"),
+    "focused": Expr(0.05, (), "think"),
+    "worried": Expr(0.45, ("ㅠㅠ", "ㅜㅜ"), "shock"),
+    "anxious": Expr(0.5, ("ㅠㅠ", "ㅜㅜ", "ㅎㄷㄷ"), "shock"),
+    "flustered": Expr(0.55, ("ㅇㅅㅇ", "ㅎㄷㄷ", "///"), "shock"),
+    "dumbfounded": Expr(0.45, (";;", "ㅡㅡ", "ㅇㅅㅇ"), "shock"),
+}
+EMOTIONS = [replace(e, tone=TONES[e.id]) for e in EMOTIONS]
 EMO = {e.id: e for e in EMOTIONS}
 assert len(EMOTIONS) == 30
+assert set(TONES) == set(EMO) == set(EXPR)
 
 
 # ---------- 대화 사건 규칙 (앞에 있을수록 우선순위 높음) ----------
@@ -127,10 +207,11 @@ class Rule:
     only_directed: bool = False
     reason: str = ""        # 마음속 심정으로 남길 문장
     aff: float = 0.0        # 그 사람에 대한 호감도 변화
+    contagion: bool = False  # 봇에게 한 말이 아니어도 분위기에 전염되어 감정이 따라 움직임
 
 
-def _r(name, pat, effects, specials=(), minutes=6.0, only_directed=False, reason="", aff=0.0) -> Rule:
-    return Rule(name, re.compile(pat, re.I), effects, tuple(specials), minutes, only_directed, reason, aff)
+def _r(name, pat, effects, specials=(), minutes=6.0, only_directed=False, reason="", aff=0.0, contagion=False) -> Rule:
+    return Rule(name, re.compile(pat, re.I), effects, tuple(specials), minutes, only_directed, reason, aff, contagion)
 
 
 RULES: list[Rule] = [
@@ -143,6 +224,12 @@ RULES: list[Rule] = [
     _r("affection", r"사랑해|좋아해|보고\s*싶|결혼|내 거|내꺼",
        {"mood": 10, "lonely": -15}, (("flustered", 3), ("shy", 3), ("flutter", 2)), 8, True,
        "갑자기 좋아한다는 말을 들어서 당황스럽다", 0.05),
+    _r("sad_news", r"헤어졌|이별|차였|불합격|떨어졌|망했|사고\s*났|돌아가셨|세상을\s*떠|입원|수술|해고|잘렸|전학|눈물|너무\s*슬|슬퍼|우울해|죽고\s*싶|힘들어\s*죽",
+       {"mood": -22, "energy": -6}, (("sad", 3), ("worried", 2), ("caring", 2), ("gloomy", 1)), 12, False,
+       "누군가의 슬픈 소식에 같이 마음이 가라앉는다", 0.02, True),
+    _r("happy_news", r"합격|붙었|승진|우승|이겼|당첨|생일|결혼|성공|드디어|해냈|1등|축하|좋은\s*소식|취직|대박|레벨업|신난다|행복",
+       {"mood": 22, "energy": 10}, (("joy", 3), ("excited", 3), ("proud", 1)), 10, False,
+       "좋은 소식에 같이 신이 난다", 0.02, True),
     _r("sadness", r"우울|힘들|지쳤|죽고\s*싶|슬퍼|ㅠㅠ|ㅜㅜ|망했|아파|외로|울고",
        {"mood": -4, "energy": -3}, (("worried", 3), ("caring", 3), ("sad", 1)), 8, False,
        "누가 힘들어 보여서 신경 쓰인다", 0.02),
@@ -220,6 +307,8 @@ class Mood:
         self._tasks: set[asyncio.Task] = set()
         self.engage = 1.0                 # 적극성 (1.0=기본, 높을수록 대화에 적극적). settings.yaml engagement.level
         self.energy_floor = 0.45          # 적극성이 높을 때 에너지가 이 밑으로 떨어지지 않게 하는 바닥값
+        self.expr_scale = 1.0             # 이모티콘/표현 강도 배수 (settings.yaml expression.scale)
+        self.emoji_picker = None          # callable(카테고리)->':이름:' (서버 커스텀 이모지 선택, main 이 설정)
         self.s: dict[str, float] = self.baseline()
 
     # ---------- 기준값 / 저장 ----------
@@ -362,7 +451,7 @@ class Mood:
         for ts, t in reversed(self.thoughts):
             age = (now - ts) / 60
             if age <= THOUGHT_TTL_MIN:
-                out.append(f"{t} ({int(age)}분 전)" if age >= 1 else f"{t} (방금)")
+                out.append(t)
             if len(out) >= 3:
                 break
         return out
@@ -374,59 +463,66 @@ class Mood:
                 **{d: int(round(self.s[d] * 100)) for d in DIMS if d != "mood"}}
 
     def knobs(self, uid: Optional[int] = None) -> list[str]:
-        """점수와 호감도로 계산한 구체적 말투 조절 항목 (감정 라벨보다 세밀하게 실시간 반영)"""
+        """점수와 호감도로 계산한 말투 조절 태그 (압축형)"""
         e = self.current()
         s = self.s
         aff = self.affinity(uid)
         warmth = 0.5 * s["mood"] - 0.7 * s["irritation"] + 0.5 * aff
-        out = []
-        if warmth >= 0.45:
-            out.append("말투: 따뜻하고 다정하다")
-        elif warmth >= 0.1:
-            out.append("말투: 평범하게 친근하다")
-        elif warmth >= -0.2:
-            out.append("말투: 조금 무심하고 담백하다")
-        else:
-            out.append("말투: 차갑고 퉁명스럽다")
+        out = ["다정" if warmth >= 0.45 else "친근" if warmth >= 0.1 else "무심" if warmth >= -0.2 else "차가움"]
         if e.no_laugh:
-            out.append("웃음: ㅋㅋ/ㅎㅎ를 쓰지 않는다")
+            out.append("웃음없음")
         elif s["mood"] > 0.45 and s["energy"] > 0.45:
-            out.append("웃음: ㅋㅋ를 자주 쓴다")
+            out.append("ㅋㅋ자주")
         elif s["mood"] > 0.1:
-            out.append("웃음: ㅋㅋ를 가끔 쓴다")
-        else:
-            out.append("웃음: ㅋㅋ를 거의 쓰지 않는다")
+            out.append("ㅋㅋ가끔")
         tension = 0.6 * s["energy"] + 0.4 * s["interest"]
-        if tension > 0.75:
-            out.append("텐션: 높다 (반응이 빠르고 들떠 있다)")
-        elif tension > 0.45:
-            out.append("텐션: 보통")
-        else:
-            out.append("텐션: 낮다 (힘 뺀 느린 말투)")
-        out.append("격식: 가끔 존댓말이 섞여도 어색하지 않다" if (e.formal or aff < -0.4)
-                   else "격식: 편한 반말")
-        out.append("감탄사/느낌표: 한 번까지 허용" if (s["energy"] > 0.7 and s["mood"] > 0.3)
-                   else "감탄사/느낌표: 거의 쓰지 않는다")
+        out.append("텐션↑" if tension > 0.75 else "텐션↓" if tension <= 0.45 else "텐션보통")
+        out.append("존댓말섞임" if (e.formal or aff < -0.4) else "반말")
+        if s["energy"] > 0.7 and s["mood"] > 0.3:
+            out.append("!허용")
         return out
 
     def describe(self, uid: Optional[int] = None, who: str = "") -> str:
+        """프롬프트용 기분 블록 (압축). 이모티콘/늘임 표현은 코드가 decorate() 로 직접 붙이므로 지시하지 않는다."""
         e = self.current()
         it = self.intensity()
-        level = "아주 약하게" if it < 0.25 else "약하게" if it < 0.5 else "뚜렷하게" if it < 0.75 else "매우 강하게"
+        level = "약" if it < 0.35 else "중" if it < 0.65 else "강" if it < 0.85 else "극"
         sc = self.scores_100()
-        lines = [
-            f"- 기분: {e.label}({level}) · 점수 기분{sc['mood']:+d} 에너지{sc['energy']} 짜증{sc['irritation']} "
-            f"외로움{sc['lonely']} 흥미{sc['interest']}",
-        ]
+        lines = [f"기분:{e.label}({level}) 기분{sc['mood']:+d}/에너지{sc['energy']}/짜증{sc['irritation']}/"
+                 f"외로움{sc['lonely']}/흥미{sc['interest']}"]
         th = self._recent_thoughts()
         if th:
-            lines.append("- 마음속(겉으로 말하진 않고 말투에 묻어남): " + " / ".join(th))
+            lines.append("심정(말로 안 하고 말투에 묻어남):" + " / ".join(th))
         if uid is not None:
             label, guide = self.aff_label(self.affinity(uid))
-            lines.append(f"- {who or '이 사람'}에 대한 호감도: {label} → {guide}")
-        lines.append("- 말투: " + e.tone + " [" + "; ".join(self.knobs(uid)) + "]")
-        lines.append("- 기분/점수를 직접 말로 설명하지 말고 말투와 길이로만 드러낸다.")
+            lines.append(f"{who or '상대'} 호감도:{label}→{guide}")
+        lines.append(f"말투:{e.tone} [{' '.join(self.knobs(uid))}]")
         return "\n".join(lines)
+
+    def decorate(self, text: str, is_last: bool = True) -> str:
+        """감정에 맞는 텍스트 이모티콘/서버 이모지/글자 늘이기/느낌표를 코드로 붙인다.
+        기쁠 땐 ㅋㅋㅋㅋ·ㅎㅎ·! 를 적극적으로, 슬플 땐 ㅠㅠ 를 섞고, 짜증/냉담은 거의 붙이지 않는다. 감정 강도가 높을수록 자주 붙는다."""
+        x = EXPR.get(self.current().id)
+        if not x or not text:
+            return text
+        inten = 0.55 + 0.9 * self.intensity()                   # 0.55 ~ 1.45
+        rate = x.rate * self.expr_scale * inten * (1.0 if is_last else 0.3)
+        out = text
+        if x.stretch:                                           # ㅋㅋ → ㅋㅋㅋㅋ, ㅠㅠ → ㅠㅠㅠ 처럼 감정이 길게 늘어난다
+            out = re.sub(r"ㅋ{2,3}(?!ㅋ)", lambda m: "ㅋ" * random.randint(3, 5) if random.random() < 0.6 else m.group(0), out)
+            out = re.sub(r"ㅠ{2}(?!ㅠ)", lambda m: "ㅠ" * random.randint(2, 4) if random.random() < 0.4 else m.group(0), out)
+        already = re.search(r"([ㅠㅜㅋㅎㅡㅇ]{2,}|[;^]{2,}|/{3}|:[\w가-힣]+:|zzz)\s*$", out)
+        if is_last and not already and x.excl and random.random() < x.excl * self.expr_scale and not out.endswith(("?", "!")):
+            out += "!"
+        if not already and random.random() < rate:
+            tok = None
+            if x.cat and self.emoji_picker and random.random() < 0.4:
+                tok = self.emoji_picker(x.cat)                  # 서버 커스텀 이모지
+            if not tok and x.marks:
+                tok = random.choice(x.marks)                    # 텍스트 이모티콘
+            if tok:
+                out = f"{out} {tok}"
+        return out
 
     # ---------- 행동에 미치는 영향 ----------
     @property
@@ -471,20 +567,23 @@ class Mood:
         text = re.sub(r"^\(.*?에 답장\)\s*", "", text)
         scale = 1.0 if directed else 0.25
         changed = False
+        contagious = False
         first_special: Optional[Rule] = None       # RULES 순서가 우선순위 (모욕 > 칭찬 > ...)
         for rule in RULES:
             if rule.only_directed and not directed:
                 continue
             if not rule.pattern.search(text):
                 continue
-            self._apply(rule.effects, scale)
-            self._adj_aff(uid, rule.aff * scale)
-            if directed and rule.reason:
+            sc = 1.0 if directed else (0.6 if rule.contagion else 0.25)
+            self._apply(rule.effects, sc)
+            self._adj_aff(uid, rule.aff * sc)
+            if (directed or rule.contagion) and rule.reason:
                 self.add_thought(rule.reason, who)
             changed = True
-            if rule.specials and first_special is None:
+            if rule.specials and first_special is None and (directed or rule.contagion):
                 first_special = rule
-        if directed and first_special and random.random() < 0.85:
+                contagious = rule.contagion and not directed
+        if (directed or contagious) and first_special and random.random() < (0.85 if directed else 0.6):
             ids, ws = zip(*first_special.specials)
             self._set_override(random.choices(ids, weights=ws, k=1)[0], first_special.minutes)
         if directed:

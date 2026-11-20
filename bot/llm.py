@@ -70,11 +70,12 @@ class LLM:
                  total, load, pt, pe, ct, ev, " [이미지]" if images else "")
         return LLMResult((resp["message"]["content"] or "").strip(), pt, ct, total)
 
-    async def warmup(self) -> None:
-        """봇 시작 시 모델을 미리 VRAM 에 올려서 첫 응답이 느리지 않게 한다."""
+    async def warmup(self, messages: Optional[list[dict[str, Any]]] = None) -> None:
+        """봇 시작 시 모델을 미리 VRAM 에 올리고, 고정 프롬프트(system+예시)를 한 번 계산해 KV 캐시에 올려둔다.
+        그러면 첫 실제 응답도 캐시가 적중해서 프롬프트 처리 시간이 줄어든다."""
         try:
             await self.client.chat(
-                model=self.model, messages=[{"role": "user", "content": "안녕"}],
+                model=self.model, messages=messages or [{"role": "user", "content": "안녕"}],
                 options={"num_predict": 1, "num_ctx": self.options.get("num_ctx", 6144)},
                 keep_alive=self.keep_alive)
             log.info("모델 웜업 완료: %s", self.model)

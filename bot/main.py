@@ -16,7 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from . import targeting, vision
+from . import initiative, targeting, vision
 from .chat import ChatEngine
 from .config import discord_token, load_settings
 from .emoji import Emojis
@@ -25,6 +25,7 @@ from .llm import LLM
 from .memory import Memory
 from .mood import EMO, EMOTIONS
 from .persona import Persona
+from .ratio import RatioControl
 
 settings = load_settings()
 logging.basicConfig(
@@ -45,6 +46,8 @@ engine = ChatEngine(settings, persona, llm, memory)
 emojis = Emojis()
 ecfg = settings.get("emoji", {})
 vcfg = settings.get("vision", {})
+ratio = RatioControl(settings.get("ratio", {}))
+inicfg = settings.get("initiative", {})
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -65,6 +68,7 @@ class Pending:
     images: list = field(default_factory=list)    # 첨부 이미지(바이트)
     human_reply: bool = False                     # 다른 사람 메시지에 대한 답장인가
     kind: str = "msg"                             # msg / reaction
+    bubbles: float = 1.0                          # 채팅 비율 제어가 정한 말풍선 가중치
 
 
 @dataclass
@@ -140,6 +144,13 @@ class GirlBot(discord.Client):
         self.chan_events: dict[int, deque] = {}     # 채널별 (시각, 유저) — 인원 규모 계산용
         self.last_replied: dict[int, float] = {} # 유저별로 마지막 대답한 시각
         self.last_target: dict[int, int] = {}    # 채널별 직전에 대답한 상대
+        self.last_bot_msg: dict[int, float] = {}         # 채널별 봇이 마지막으로 말한 시각
+        self.last_speaker: dict[int, str] = {}           # 채널별 마지막 발언자 이름
+        self.init_times: dict[int, deque] = {}           # 채널별 먼저 말한 시각들 (시간당 한도용)
+        self.init_unanswered: dict[int, int] = {}        # 먼저 말했는데 아직 사람이 답하지 않은 횟수
+        self.init_gap: dict[int, float] = {}             # 채널별 이번 능동 대화 쿨타임(랜덤)
+        self.unaddressed: dict[int, list] = {}           # 대답 후보에서 탈락해 답을 못 받은 메시지 (uid, 이름, 글, 시각)
+        self.init_enabled = bool(inicfg.get("enabled", True))
         # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
         self.paused = False
         self.idle_enabled = bool(icfg["enabled"])
@@ -156,6 +167,7 @@ class GirlBot(discord.Client):
         group_loop.start()
         idle_loop.start()
         fight_loop.start()
+        initiative_loop.start()
         if pcfg["enabled"]:
             proactive_loop.change_interval(minutes=pcfg["check_interval_min"])
             proactive_loop.start()
@@ -177,6 +189,15 @@ class GirlBot(discord.Client):
         eg = await memory.kv_get("engagement")
         if eg:
             engine.mood.engage = max(0.5, min(4.0, float(eg)))
+        flt = await memory.kv_get("fight_level_text")
+        if flt is not None:
+            engine.fights.cfg["level_text"] = flt
+        rt = await memory.kv_get("ratio")
+        if rt:
+            ratio.set_center(float(rt))
+        ie2 = await memory.kv_get("init_enabled")
+        if ie2 is not None:
+            self.init_enabled = ie2 == "1"
         ff = await memory.kv_get("fight_filter")
         if ff is not None:
             engine.fights.cfg["filter"] = ff == "1"
@@ -264,6 +285,10 @@ async def send_bubbles(
             except discord.HTTPException:
                 pass
         await channel.send(text)
+    cid = getattr(channel, "id", None)
+    if cid is not None and not isinstance(channel, discord.DMChannel):
+        ratio.record(cid, "b", len(bubbles))              # 채팅 비율 통계에 봇 메시지 수 기록
+        bot.last_bot_msg[cid] = time.time()
 
 
 def crowd_now(channel_id: int) -> tuple[int, int]:
@@ -278,6 +303,7 @@ def next_cooldown(channel_id: int | None = None) -> float:
     if channel_id is not None:
         users, msgs = crowd_now(channel_id)
         base *= targeting.crowd_factor(users, msgs, gcfg["crowd_boost"], gcfg["crowd_min_ratio"])
+        base *= ratio.adjust(channel_id).cooldown          # 봇이 너무 조용하면 짧게, 너무 말이 많으면 길게
     return max(1.0, base)
 
 
@@ -299,7 +325,7 @@ async def gpu_lines() -> list[tuple[str, float, float, float]]:
 
 
 async def warmup_and_report() -> None:
-    await llm.warmup()
+    await llm.warmup(engine.warm_messages())      # 고정 프롬프트를 미리 계산해 KV 캐시에 올린다
     try:
         for name, size, vram, pct in await gpu_lines():
             if pct < 99:
@@ -317,6 +343,7 @@ def refresh_emojis() -> None:
     if ecfg.get("enabled", True) and ecfg.get("custom", True):
         emojis.refresh(bot.guilds)
         engine.emoji_hint = emojis.prompt_block(ecfg.get("max_custom_in_prompt", 40))
+        engine.mood.emoji_picker = emojis.text_token              # 감정 표현에 서버 이모지를 섞는다
         log.info("서버 커스텀 이모지 %d개 인식", len(emojis.custom))
     else:
         engine.emoji_hint = ""
@@ -436,6 +463,9 @@ async def on_message(message: discord.Message) -> None:
     directed = bool(mentioned) or is_directed(text)
     engine.mood.observe(stored, directed=directed, uid=uid, who=who)
     bot.chan_events.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
+    ratio.record(ch, "h")
+    bot.init_unanswered[ch] = 0                      # 사람이 말했으니 먼저 한 말에 답이 온 셈
+    bot.last_speaker[ch] = who
 
     # ---- 말싸움: 도발/모욕을 받았고 기분이 상했으면 붙는다 ----
     in_fight = engine.fights.get(ch, uid) is not None
@@ -565,7 +595,7 @@ async def respond_group(channel_id: int, target: Pending) -> None:
                     # 멘션/답장/싸움이 아니고, 돌아온 상황 메모도 없을 때만 SKIP 가능
                     can_skip=not target.priority and not note and fight is None and target.kind == "msg",
                     priority=target.priority, extra_note=extra,
-                    images=target.images or None, fight=fight,
+                    images=target.images or None, fight=fight, bubble_bias=target.bubbles,
                 )
                 if bubbles and note:
                     bot.return_note.pop(channel_id, None)
@@ -573,6 +603,7 @@ async def respond_group(channel_id: int, target: Pending) -> None:
         if bubbles:
             bot.last_replied[uid] = time.time()
             bot.last_target[channel_id] = uid
+            unpark(channel_id, uid)
             # 그 사이에 다른 메시지가 올라왔으면 '답장'으로 누구에게 하는 말인지 표시
             latest = getattr(channel, "last_message_id", None)
             reply_to = msg if (latest and latest != msg.id and target.kind == "msg") else None
@@ -611,6 +642,8 @@ async def group_loop() -> None:
         return
     now = time.monotonic()
     for channel_id, items in list(bot.pending.items()):
+        for p in [p for p in items if now - p.ts > gcfg["max_pending_age_sec"]]:
+            park_unaddressed(channel_id, p)             # 오래 기다려도 대답 못 한 메시지는 능동 대화가 챙긴다
         items[:] = [p for p in items if now - p.ts <= gcfg["max_pending_age_sec"]]
         if not items or channel_id in bot.busy:
             continue
@@ -648,6 +681,7 @@ async def group_loop() -> None:
 
         prio = [p for p in ready if p.priority]
         users, _ = crowd_now(channel_id)
+        adj = ratio.adjust(channel_id)                  # 채팅 비율 보정 (대답 확률, 말풍선 수)
         cooling = now < bot.next_ok.get(channel_id, 0)
         if cooling and not (prio and gcfg["mention_bypass_cooldown"]):
             continue
@@ -656,10 +690,11 @@ async def group_loop() -> None:
         else:
             chance = (gcfg["reply_chance"] + targeting.chance_boost(users, gcfg["crowd_chance_per_user"])
                       + 0.2 * (engine.mood.engage - 1.0))      # 적극성이 높을수록 더 많은 말에 대답한다
-            if random.random() > min(1.0, chance * engine.mood.reply_mult):
-                # 글로는 대답하지 않지만 이모지 리액션은 달 수 있다
+            if random.random() > min(1.0, chance * engine.mood.reply_mult * adj.reply):
+                # 글로는 대답하지 않지만 이모지 리액션은 달 수 있다. 답을 못 받은 메시지는 보관해 둔다
                 for p in ready:
                     asyncio.create_task(maybe_react(p.message, ecfg.get("react_chance", 0.12)))
+                    park_unaddressed(channel_id, p)
                 items[:] = [p for p in items if p not in ready]
                 continue
             pool = ready
@@ -683,17 +718,159 @@ async def group_loop() -> None:
             message=same[-1].message, ts=same[-1].ts,
             priority=any(p.priority for p in same), text=text,
             uid=tuid, uname=target.uname or target.message.author.display_name,
-            images=imgs, kind=target.kind,
+            images=imgs, kind=target.kind, bubbles=adj.bubbles,
         )
         items[:] = [p for p in items if p not in same]
         asyncio.create_task(respond_group(channel_id, merged))
 
 
-@tasks.loop(seconds=10)
+async def run_fight_open(channel, f: Fight) -> None:
+    """/싸움 명령으로 시작한 싸움: 이미 기분이 나쁜 봇이 상대를 멘션하며 먼저 욕하고 시비를 건다."""
+    bot.busy.add(channel.id)
+    try:
+        async with bot.gpu_lock:
+            async with channel.typing():
+                bubbles = await engine.reply(
+                    channel.id, f.user_id, f.user_name, "(네가 먼저 시비를 걸어 싸움을 시작한다)",
+                    fight=f, priority=True, phase="open")
+        if bubbles:
+            bubbles[0] = f"<@{f.user_id}> {bubbles[0]}"          # 상대를 호출(멘션)하며 시작
+            await send_bubbles(channel, bubbles)
+    except Exception:  # noqa: BLE001
+        log.exception("싸움 선공 실패")
+    finally:
+        bot.busy.discard(channel.id)
+        bot.next_ok[channel.id] = time.monotonic() + 1.0
+
+
+# ------------------ 능동 대화: 스스로 상황을 분석해서 먼저 말하기 ------------------
+def park_unaddressed(channel_id: int, p: Pending) -> None:
+    """대답 후보에서 탈락한(답을 못 받은) 메시지를 보관한다. 나중에 능동 대화가 그 사람에게 먼저 말을 건다."""
+    if p.kind != "msg" or p.priority:
+        return
+    text = (p.text or clean_text(p.message)).strip()
+    if len(text) < 4 or emojis.is_trivial(text):
+        return
+    uid = p.uid or p.message.author.id
+    lst = bot.unaddressed.setdefault(channel_id, [])
+    lst[:] = [x for x in lst if x[0] != uid]                        # 사람당 최신 1개만
+    lst.append((uid, p.uname or p.message.author.display_name, text, time.time()))
+    del lst[:-8]
+
+
+def unpark(channel_id: int, uid: int) -> None:
+    lst = bot.unaddressed.get(channel_id)
+    if lst:
+        lst[:] = [x for x in lst if x[0] != uid]
+
+
+def roll_gap(channel_id: int) -> float:
+    """다음 능동 대화까지의 랜덤 쿨타임 (적극성이 높으면 짧게)"""
+    lo, hi = inicfg.get("min_gap_sec", [45, 180])
+    g = random.uniform(float(lo), float(hi)) / max(1.0, engine.mood.engage) ** 0.5
+    bot.init_gap[channel_id] = g
+    return g
+
+
+def build_snapshot(channel_id: int) -> initiative.Snapshot:
+    now = time.time()
+    ev = list(bot.chan_events.get(channel_id, ()))
+    last_h = max((t for t, _ in ev), default=0.0)
+    m3 = [(t, u) for t, u in ev if now - t <= 180]
+    prev = [(t, u) for t, u in ev if 180 < now - t <= 780]
+    adj = ratio.adjust(channel_id)
+    inits = [t for t in bot.init_times.get(channel_id, ()) if now - t <= 3600]
+    lb = bot.last_bot_msg.get(channel_id)
+    un = [(u, n, tx, now - t) for u, n, tx, t in bot.unaddressed.get(channel_id, []) if now - t <= 300]
+    return initiative.Snapshot(
+        silence=(now - last_h) if last_h else 9999.0,
+        msgs_3m=len(m3), msgs_prev=len(prev), users_3m=len({u for _, u in m3}),
+        since_bot=(now - lb) if lb else 9999.0,
+        last_init_age=(now - inits[-1]) if inits else 9999.0,
+        unanswered_inits=bot.init_unanswered.get(channel_id, 0), inits_hour=len(inits),
+        deficit=ratio.deficit(channel_id), hour=engine.now().hour,
+        gap_needed=bot.init_gap.get(channel_id) or roll_gap(channel_id),
+        unaddressed=un, last_speaker=bot.last_speaker.get(channel_id, ""),
+        ratio=adj.ratio, target=adj.target,
+    )
+
+
+async def run_initiative(channel_id: int, dec: initiative.Decision, snap: initiative.Snapshot,
+                         adj) -> None:
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    bot.busy.add(channel_id)
+    try:
+        target = (dec.target[0], dec.target[1]) if dec.target else None
+        async with bot.gpu_lock:
+            async with channel.typing():
+                bubbles = await engine.initiate(
+                    channel_id, initiative.instruction(dec), int(snap.silence // 60), 0,
+                    analysis=initiative.analysis_text(snap), target=target, bubble_bias=adj.bubbles)
+        if bubbles:
+            if dec.kind == "ask_user" and target:
+                bubbles[0] = f"<@{target[0]}> {bubbles[0]}"      # 답을 못 받은 사람을 호출하며 먼저 말을 건다
+                unpark(channel_id, target[0])
+            await send_bubbles(channel, bubbles)
+            bot.init_times.setdefault(channel_id, deque(maxlen=60)).append(time.time())
+            bot.init_unanswered[channel_id] = bot.init_unanswered.get(channel_id, 0) + 1
+            log.info("먼저 말걸기(%s): channel=%s p=%.3f [%s]", dec.kind, channel_id, dec.p, dec.reason)
+    except Exception:  # noqa: BLE001
+        log.exception("능동 대화 실패 (channel=%s)", channel_id)
+    finally:
+        roll_gap(channel_id)
+        bot.busy.discard(channel_id)
+
+
+@tasks.loop(seconds=3)
+async def initiative_loop() -> None:
+    """채널별로 침묵, 대화 속도 감소, 채팅 비율 부족, 답 못 받은 사람, 랜덤 쿨타임을 종합해 먼저 말할지 정한다."""
+    if bot.paused or not bot.init_enabled or not inicfg.get("enabled", True):
+        return
+    for ch_id in list(bot.channels):
+        if bot.gpu_lock.locked():
+            return                                   # GPU 가 바쁘면 이번 턴은 건너뛴다 (대답 우선)
+        if ch_id in bot.busy or bot.pending.get(ch_id) or engine.fights.in_channel(ch_id):
+            continue
+        snap = build_snapshot(ch_id)
+        adj = ratio.adjust(ch_id)
+        dec = initiative.decide(snap, inicfg, engine.mood.engage, adj.initiate)
+        if dec.fire:
+            await run_initiative(ch_id, dec, snap, adj)
+
+
+@initiative_loop.before_loop
+async def _init_ready() -> None:
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=5)
 async def fight_loop() -> None:
-    """상대가 한동안 말이 없는 말싸움을 마무리한다. (이기고 있었으면 놀리고, 지고 있었으면 조용히 투덜)"""
+    """상대가 대꾸하지 않으면 봇이 먼저 다시 도발하고(재촉), 한동안 말이 없는 싸움은 마무리한다."""
     if bot.paused:
         return
+    now_t = time.time()
+    fcfg = engine.fights.cfg
+    for f in list(engine.fights.active.values()):
+        if f.ending or f.channel_id in bot.busy or not f.last_bot:
+            continue
+        if f.nudges < fcfg.get("max_nudges", 2) and f.last_bot >= f.last_user and now_t - f.last_bot >= fcfg.get("nudge_after_sec", 25):
+            ch = bot.get_channel(f.channel_id)
+            if ch is None:
+                continue
+            bot.busy.add(f.channel_id)
+            try:
+                async with bot.gpu_lock:
+                    async with ch.typing():
+                        bubbles = await engine.reply(f.channel_id, f.user_id, f.user_name, "(상대가 대꾸하지 않음)",
+                                                     fight=f, priority=True, phase="nudge")
+                if bubbles:
+                    await send_bubbles(ch, bubbles)
+            except Exception:  # noqa: BLE001
+                log.exception("싸움 재촉 실패")
+            finally:
+                bot.busy.discard(f.channel_id)
     for f in engine.fights.timed_out():
         ch = bot.get_channel(f.channel_id)
         if ch is None:
@@ -904,64 +1081,50 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-# ---- 1. 사용량-총 ----
-@bot.tree.command(name="사용량-총", description="지금까지 사용한 전체 토큰 사용량을 보여줘요")
-async def usage_total(interaction: discord.Interaction) -> None:
+# ---- 1. 사용량 (전체 + 유저별 통합) ----
+@bot.tree.command(name="사용량", description="토큰 사용량을 보여줘요. 유저를 고르면 그 유저에게 한 답변 내역까지, 생략하면 전체 + 유저 순위")
+@app_commands.describe(user="특정 유저를 고르면 그 유저에게 한 답변 내역을 보여줘요 (생략하면 전체 요약 + 순위)")
+@app_commands.rename(user="유저")
+async def usage_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None) -> None:
+    if user is not None:
+        d = await memory.usage_user_detail(user.id, 10)
+        name, n, p, c, first, last = d["summary"]
+        if not n:
+            await interaction.response.send_message(f"{user.display_name} 님에게 한 답변 기록이 없어요.", ephemeral=True)
+            return
+        lines = [
+            f"**{user.display_name}** 님에게 쓴 토큰",
+            f"```총 {fmt(p + c)} 토큰 (입력 {fmt(p)} / 출력 {fmt(c)})",
+            f"답변 {fmt(n)}회 | {kst(first)} ~ {kst(last)}```",
+            "**최근 답변 내역**",
+        ]
+        for ts, kind, char, ch, pt, ct, snip in d["recent"]:
+            where = f"<#{ch}>" if ch else "-"
+            lines.append(f"`{kst(ts)}` {where} [{char}/{kind}] {fmt(pt + ct)}토큰\n> {trunc(snip or '', 90)}")
+        await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
+        return
+
     u = await memory.usage_total()
     n, p, c = u["all"]
+    names = {"reply": "답변", "memory": "기억", "proactive": "DM먼저", "idle": "먼저말걸기", "guard": "차단"}
     lines = [
-        f"**전체 토큰 사용량**" + (f" (기록 시작 {kst(u['since'])})" if u["since"] else ""),
-        f"```총 {fmt(p + c)} 토큰 | 호출 {fmt(n)}회",
-        f"입력(프롬프트) {fmt(p)} / 출력(생성) {fmt(c)}",
-        f"최근 24시간 {fmt(u['day'][1] + u['day'][2])} ({fmt(u['day'][0])}회)",
-        f"최근 7일   {fmt(u['week'][1] + u['week'][2])} ({fmt(u['week'][0])}회)```",
+        "**전체 토큰 사용량**" + (f" (기록 시작 {kst(u['since'])})" if u["since"] else ""),
+        f"```총 {fmt(p + c)} 토큰 | 호출 {fmt(n)}회 (입력 {fmt(p)} / 출력 {fmt(c)})",
+        f"24시간 {fmt(u['day'][1] + u['day'][2])} ({fmt(u['day'][0])}회) · 7일 {fmt(u['week'][1] + u['week'][2])} ({fmt(u['week'][0])}회)```",
     ]
     if u["by_kind"]:
-        names = {"reply": "일반 답변", "memory": "기억 추출", "proactive": "DM 먼저", "idle": "혼잣말", "guard": "인젝션 차단"}
-        lines.append("**용도별**\n```" + "\n".join(
-            f"{names.get(k, k):<8} {fmt((pp or 0) + (cc or 0)):>12} 토큰 ({fmt(nn)}회)" for k, nn, pp, cc in u["by_kind"]
-        ) + "```")
+        lines.append("**용도별** " + " · ".join(
+            f"{names.get(k, k)} {fmt((pp or 0) + (cc or 0))}" for k, nn, pp, cc in u["by_kind"]))
     if u["by_character"]:
-        lines.append("**캐릭터별**\n```" + "\n".join(
-            f"{(k or '-'):<10} {fmt((pp or 0) + (cc or 0)):>12} 토큰 ({fmt(nn)}회)" for k, nn, pp, cc in u["by_character"]
-        ) + "```")
-    lines.append("-# 입력 토큰은 Ollama가 캐시를 쓰면 실제보다 적게 잡힐 수 있어요.")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-
-# ---- 2. 사용량-유저 ----
-@bot.tree.command(name="사용량-유저", description="유저별 토큰 사용량, 그리고 그 유저에게 한 답변 내역을 확인해요")
-@app_commands.describe(user="특정 유저를 고르면 그 유저에게 한 답변 내역까지 보여줘요 (생략하면 전체 순위)")
-@app_commands.rename(user="유저")
-async def usage_user(interaction: discord.Interaction, user: Optional[discord.User] = None) -> None:
-    if user is None:
-        rows = await memory.usage_by_user(15)
-        if not rows:
-            await interaction.response.send_message("아직 기록이 없어요.", ephemeral=True)
-            return
+        lines.append("**캐릭터별** " + " · ".join(
+            f"{k or '-'} {fmt((pp or 0) + (cc or 0))}" for k, nn, pp, cc in u["by_character"]))
+    rows = await memory.usage_by_user(8)
+    if rows:
         body = "\n".join(
-            f"{i:>2}. {trunc(name or str(uid), 14):<14} {fmt((p or 0) + (c or 0)):>10} 토큰  답변 {fmt(n)}회"
-            for i, (uid, name, n, p, c) in enumerate(rows, 1)
-        )
-        await interaction.response.send_message(
-            f"**유저별 토큰 사용량 (상위 {len(rows)}명)**\n```{body}```\n"
-            "-# 개인 내역은 `/사용량-유저 유저:@이름` 으로 확인", ephemeral=True)
-        return
-
-    d = await memory.usage_user_detail(user.id, 10)
-    name, n, p, c, first, last = d["summary"]
-    if not n:
-        await interaction.response.send_message(f"{user.display_name} 님에게 한 답변 기록이 없어요.", ephemeral=True)
-        return
-    lines = [
-        f"**{user.display_name}** 님에게 쓴 토큰",
-        f"```총 {fmt(p + c)} 토큰 (입력 {fmt(p)} / 출력 {fmt(c)})",
-        f"답변 {fmt(n)}회 | {kst(first)} ~ {kst(last)}```",
-        "**최근 답변 내역**",
-    ]
-    for ts, kind, char, ch, pt, ct, snip in d["recent"]:
-        where = f"<#{ch}>" if ch else "-"
-        lines.append(f"`{kst(ts)}` {where} [{char}/{kind}] {fmt(pt + ct)}토큰\n> {trunc(snip or '', 90)}")
+            f"{i:>2}. {trunc(name or str(uid), 14):<14} {fmt((pp or 0) + (cc or 0)):>10} 토큰  답변 {fmt(nn)}회"
+            for i, (uid, name, nn, pp, cc) in enumerate(rows, 1))
+        lines.append(f"**유저 순위**\n```{body}```")
+    lines.append("-# 개인 내역: `/사용량 유저:@이름` · 입력 토큰은 캐시 사용 시 실제보다 적게 잡힐 수 있어요.")
     await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
 
 
@@ -1002,9 +1165,33 @@ async def swap_character(
         await interaction.channel.send(persona.greeting)
 
 
-# ---- 4. 상태 ----
-@bot.tree.command(name="상태", description="봇 현재 상태를 확인해요")
-async def status(interaction: discord.Interaction) -> None:
+# ---- 4. 상태 (보기 + 일시정지 + 리로드 통합) ----
+@bot.tree.command(name="상태", description="봇 상태를 보거나, 일시정지/재개, 설정 파일 리로드를 해요")
+@app_commands.describe(action="보기(기본) / 일시정지·재개(전환) / 리로드(캐릭터·사람 파일 다시 읽기)")
+@app_commands.rename(action="동작")
+@app_commands.choices(action=[
+    app_commands.Choice(name="보기", value="show"),
+    app_commands.Choice(name="일시정지", value="pause"),
+    app_commands.Choice(name="리로드", value="reload"),
+])
+async def status(interaction: discord.Interaction, action: Optional[app_commands.Choice[str]] = None) -> None:
+    act = action.value if action else "show"
+    if act == "pause":
+        bot.paused = not bot.paused
+        await memory.kv_set("paused", "1" if bot.paused else "0")
+        if bot.paused:
+            bot.pending.clear()
+        await interaction.response.send_message(
+            "⏸ 일시정지했어요. 이제 대답하지 않아요." if bot.paused else "▶ 다시 대화에 참여해요.", ephemeral=True)
+        return
+    if act == "reload":
+        persona.reload()
+        n = engine.people.reload()
+        err = ("\n형식 오류: " + "; ".join(engine.people.errors[:4])) if engine.people.errors else ""
+        await interaction.response.send_message(
+            f"다시 불러왔어요. 캐릭터 **{persona.name}** (`{persona.char_id}`), people.txt {n}명.{err}", ephemeral=True)
+        return
+
     await interaction.response.defer(ephemeral=True)
     try:
         rows = await gpu_lines()
@@ -1016,51 +1203,28 @@ async def status(interaction: discord.Interaction) -> None:
     except Exception as e:  # noqa: BLE001
         gpu = f"  Ollama 연결 실패: {e}"
     total_msgs, n_ch = await memory.message_counts()
-    ch = " ".join(f"<#{c}>" for c in sorted(bot.channels)) or "(없음 — 멘션/DM만 반응)"
+    chs = sorted(bot.channels)
+    ch = " ".join(f"<#{c}>" for c in chs) or "(없음 — 멘션/DM만 반응)"
+    ratios = " · ".join(
+        f"<#{c}> {a.ratio:.2f}/{a.target:.2f}(사람{a.human}·봇{a.bot})" for c in chs for a in [ratio.adjust(c)]) or "-"
     pend = sum(len(v) for v in bot.pending.values())
     avg = llm.avg_stats()
     speed = (f"평균 {avg[0]:.1f}초 (모델로드 {avg[1]:.1f} · 프롬프트 {avg[2]:.1f} · 생성 {avg[3]:.1f}) — 최근 {len(llm.stats)}회"
              if avg else "아직 기록 없음")
     nf = len(engine.fights.active)
+    lvl = engine.fights.cfg.get("level_text") or engine.fights.cfg["level"]
     await interaction.followup.send(
-        f"**봇 상태**\n"
+        f"**봇 상태** {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
+        f"- 캐릭터 **{persona.name}** (`{persona.char_id}`) · 모델 `{llm.model}` · 기분 {engine.mood.current().label}\n"
         f"- 응답 속도: {speed}\n"
-        f"- 말싸움: {'켜짐' if engine.fights.cfg['enabled'] else '꺼짐'} (수위 {engine.fights.cfg['level']}) · 진행 중 {nf}건\n"
-        f"- 이모지: 서버 커스텀 {len(emojis.custom)}개 | 이미지 인식: {'켜짐' if vcfg.get('enabled', True) else '꺼짐'}\n"
-        f"- 캐릭터: **{persona.name}** (`{persona.char_id}`)\n"
-        f"- 모델: `{llm.model}`\n"
-        f"- 상태: {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
-        f"- 기분: {engine.mood.current().label} · 적극성 {engine.mood.engage:g}\n"
-        f"- 쿨다운: {bot.cooldown:g}초 (+최대 {int(gcfg['cooldown_jitter'] * 100)}% 랜덤)\n"
+        f"- 적극성 {engine.mood.engage:g} · 쿨다운 {bot.cooldown:g}초 · 채팅 비율(현재/목표): {ratios}\n"
+        f"- 먼저 말걸기: {'켜짐' if bot.init_enabled else '꺼짐'} (10~24시) · 혼잣말 이벤트 {'켜짐' if bot.idle_enabled else '꺼짐'}\n"
+        f"- 말싸움: {'켜짐' if engine.fights.cfg['enabled'] else '꺼짐'} (수위 {trunc(str(lvl), 30)}) · 진행 중 {nf}건\n"
+        f"- 서버 이모지 {len(emojis.custom)}개 · 이미지 인식 {'켜짐' if vcfg.get('enabled', True) else '꺼짐'}\n"
         f"- 대화 채널: {ch}\n"
-        f"- 대기 중 메시지: {pend}개 | 저장된 기록 {fmt(total_msgs)}개 ({n_ch}개 채널)\n"
-        f"- 가동 시간: {fmt_uptime(time.time() - bot.started_at)} | 디스코드 지연 {bot.latency * 1000:.0f}ms\n"
-        f"- Ollama 로드된 모델:\n{gpu}",
+        f"- 대기 메시지 {pend}개 · 저장 기록 {fmt(total_msgs)}개({n_ch}개 채널) · 가동 {fmt_uptime(time.time() - bot.started_at)} · 지연 {bot.latency * 1000:.0f}ms\n"
+        f"- Ollama:\n{gpu}",
         ephemeral=True)
-
-
-# ---- 5. 일시정지 ----
-@bot.tree.command(name="일시정지", description="봇의 대답을 일시정지/재개해요 (실행할 때마다 전환)")
-async def pause(interaction: discord.Interaction) -> None:
-    bot.paused = not bot.paused
-    await memory.kv_set("paused", "1" if bot.paused else "0")
-    if bot.paused:
-        bot.pending.clear()
-    await interaction.response.send_message(
-        "⏸ 일시정지했어요. 이제 대답하지 않아요." if bot.paused else "▶ 다시 대화에 참여해요.", ephemeral=True)
-
-
-# ---- 6. 쿨다운 ----
-@bot.tree.command(name="쿨다운", description="대답 후 다음 대답까지 기다리는 시간(초)을 설정해요")
-@app_commands.describe(seconds="0~600초 (생략하면 현재 값 확인)")
-@app_commands.rename(seconds="초")
-async def set_cooldown(interaction: discord.Interaction, seconds: Optional[app_commands.Range[int, 0, 600]] = None) -> None:
-    if seconds is None:
-        await interaction.response.send_message(f"현재 쿨다운: {bot.cooldown:g}초", ephemeral=True)
-        return
-    bot.cooldown = float(seconds)
-    await memory.kv_set("cooldown", str(seconds))
-    await interaction.response.send_message(f"쿨다운을 **{seconds}초**로 바꿨어요.", ephemeral=True)
 
 
 # ---- 7. 채널 ----
@@ -1094,59 +1258,51 @@ async def manage_channel(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-# ---- 8. 기억 ----
-@bot.tree.command(name="기억", description="특정 유저에 대한 기억을 보거나 초기화해요")
-@app_commands.describe(action="보기/초기화", user="대상 유저")
-@app_commands.rename(action="동작", user="유저")
-@app_commands.choices(action=[
-    app_commands.Choice(name="보기", value="show"),
-    app_commands.Choice(name="초기화", value="reset"),
-])
-async def manage_memory(
-    interaction: discord.Interaction, action: app_commands.Choice[str], user: discord.User
-) -> None:
-    if action.value == "reset":
-        await memory.reset_user(user.id)
-        await interaction.response.send_message(
-            f"{user.display_name} 님의 기억과 대화 기록을 지웠어요.", ephemeral=True)
-        return
-    facts = await memory.get_facts(user.id, 40)
-    body = "\n".join(f"• {f}" for f in facts) if facts else "아직 기억하는 게 없어요."
-    await interaction.response.send_message(
-        f"**{persona.name}이(가) 기억하는 {user.display_name}**\n{body}"[:1990], ephemeral=True)
-
-
-# ---- 9. 사람 (호칭/이미지는 서버의 config/people.txt 파일에서 직접 수정) ----
-@bot.tree.command(name="사람", description="config/people.txt 에 설정된 호칭/이미지를 확인하거나 다시 불러와요")
-@app_commands.describe(action="목록/보기/리로드", user="보기 대상 유저")
+# ---- 사람 (호칭/이미지 목록·보기·리로드 + 기억 보기/초기화 통합. 호칭/이미지 수정은 config/people.txt 파일에서) ----
+@bot.tree.command(name="사람", description="사람 설정(people.txt)과 캐릭터가 기억하는 내용을 보거나 초기화해요")
+@app_commands.describe(action="목록/보기/리로드/기억보기/기억초기화", user="대상 유저 (보기·기억 동작)")
 @app_commands.rename(action="동작", user="유저")
 @app_commands.choices(action=[
     app_commands.Choice(name="목록", value="list"),
     app_commands.Choice(name="보기", value="show"),
     app_commands.Choice(name="리로드", value="reload"),
+    app_commands.Choice(name="기억보기", value="mem"),
+    app_commands.Choice(name="기억초기화", value="memreset"),
 ])
 async def people_cmd(
     interaction: discord.Interaction, action: app_commands.Choice[str], user: Optional[discord.User] = None
 ) -> None:
     ppl = engine.people
-    if action.value == "reload":
+    act = action.value
+    if act == "reload":
         n = ppl.reload()
         msg = f"people.txt 를 다시 불러왔어요. ({n}명)"
         if ppl.errors:
             msg += "\n형식 오류:\n" + "\n".join(f"- {e}" for e in ppl.errors[:8])
         await interaction.response.send_message(msg[:1990], ephemeral=True)
         return
-    if action.value == "show":
+    if act in ("show", "mem", "memreset"):
         if user is None:
             await interaction.response.send_message("유저를 지정해주세요.", ephemeral=True)
+            return
+        if act == "memreset":
+            await memory.reset_user(user.id)
+            await interaction.response.send_message(f"{user.display_name} 님의 기억과 대화 기록을 지웠어요.", ephemeral=True)
+            return
+        if act == "mem":
+            facts = await memory.get_facts(user.id, 40)
+            body = "\n".join(f"• {f}" for f in facts) if facts else "아직 기억하는 게 없어요."
+            await interaction.response.send_message(
+                f"**{persona.name}이(가) 기억하는 {user.display_name}**\n{body}"[:1990], ephemeral=True)
             return
         name = ppl.names.get(user.id)
         view = ppl.views.get(user.id)
         aff = engine.mood.affinity(user.id)
         label, _ = engine.mood.aff_label(aff)
+        nfacts = len(await memory.get_facts(user.id, 200))
         await interaction.response.send_message(
             f"**{user.display_name}** (`{user.id}`)\n- 부르는 이름: {name[0] if name else '(없음, 닉네임 사용)'}\n"
-            f"- 이미지: {view or '(없음)'}\n- 호감도: {label} ({aff:+.2f})", ephemeral=True)
+            f"- 이미지: {view or '(없음)'}\n- 호감도: {label} ({aff:+.2f}) · 기억 {nfacts}개", ephemeral=True)
         return
     ids = sorted(set(ppl.names) | set(ppl.views))
     if not ids:
@@ -1232,91 +1388,126 @@ async def mood_cmd(
 LEVEL_DESC = {1: "순화된 말싸움만", 2: "가벼운 욕까지", 3: "센 욕설까지 (가족·외모·성적·장애·지역·혐오 비하와 위협은 계속 금지)"}
 
 
-# ---- 적극성 ----
-@bot.tree.command(name="적극성", description="대화에 얼마나 적극적으로 참여할지 조절해요 (1.0=기본, 높을수록 적극적)")
-@app_commands.describe(level="0.5(느긋)~1.0(기본)~4.0(폭주). 생략하면 현재 값 확인")
-@app_commands.rename(level="단계")
+# ---- 적극성 (적극성 + 쿨다운 + 채팅 비율 통합) ----
+@bot.tree.command(name="적극성", description="대화 적극성, 쿨다운, 채팅 비율을 한 번에 조절해요. 값을 생략하면 현재 설정을 보여줘요")
+@app_commands.describe(level="적극성 0.5(느긋)~1.0(기본)~4.0(폭주)", cooldown="대답 후 다음 대답까지 기본 쿨다운(초, 0~600)",
+                       chat_ratio="채팅 비율 중심값: 사람 메시지 1개당 봇 메시지 수 (0.3~4.0, 기본 1.25 → 1.0~1.5 랜덤)")
+@app_commands.rename(level="단계", cooldown="쿨다운", chat_ratio="비율")
 async def engagement_cmd(
-    interaction: discord.Interaction, level: Optional[app_commands.Range[float, 0.5, 4.0]] = None
+    interaction: discord.Interaction,
+    level: Optional[app_commands.Range[float, 0.5, 4.0]] = None,
+    cooldown: Optional[app_commands.Range[int, 0, 600]] = None,
+    chat_ratio: Optional[app_commands.Range[float, 0.3, 4.0]] = None,
 ) -> None:
     m = engine.mood
-    if level is None:
-        await interaction.response.send_message(
-            f"현재 적극성: **{m.engage:g}** (1.0=기본). 에너지 바닥 {m.energy_floor * m.engage_amount():.2f}, "
-            f"대답 확률 보너스 +{max(0.0, 0.2 * (m.engage - 1.0)):.2f}, 쿨다운 x{1 / max(0.5, m.engage):.2f}", ephemeral=True)
+    msgs = []
+    if level is not None:
+        m.engage = float(level)
+        await memory.kv_set("engagement", f"{m.engage:g}")
+        m.boost_to_baseline()
+        msgs.append(f"적극성 **{m.engage:g}**" + (" 🔥폭주 구간(GPU 사용 증가, 밀리면 낮추세요)" if m.engage > 2.0 else ""))
+    if cooldown is not None:
+        bot.cooldown = float(cooldown)
+        await memory.kv_set("cooldown", str(cooldown))
+        msgs.append(f"쿨다운 **{cooldown}초**")
+    if chat_ratio is not None:
+        ratio.set_center(float(chat_ratio))
+        await memory.kv_set("ratio", f"{ratio.center:g}")
+        msgs.append(f"채팅 비율 중심 **{ratio.center:g}** (목표는 {max(0.2, ratio.center - ratio.spread):.2f}~{ratio.center + ratio.spread:.2f} 사이 랜덤)")
+    if msgs:
+        await interaction.response.send_message("바꿨어요: " + " · ".join(msgs), ephemeral=True)
         return
-    m.engage = float(level)
-    await memory.kv_set("engagement", f"{m.engage:g}")
-    m.boost_to_baseline()
     await interaction.response.send_message(
-        f"적극성을 **{m.engage:g}**로 바꿨어요. "
-        + ("🔥 폭주 구간이에요. 거의 모든 말에 바로바로 끼어들고, 길게 떠들고, 먼저 말도 자주 걸어요. "
-           "(GPU 사용이 늘어서 응답이 밀리면 값을 낮추세요)" if m.engage > 2.0
-           else "더 자주, 더 길게, 덜 귀찮아하며 대화에 참여해요." if m.engage > 1.0
-           else "기본 또는 느긋한 모드예요."), ephemeral=True)
+        f"**현재 설정**\n- 적극성 **{m.engage:g}** (에너지 바닥 {m.energy_floor * m.engage_amount():.2f}, "
+        f"대답 확률 +{max(0.0, 0.2 * (m.engage - 1.0)):.2f}, 쿨다운 x{1 / max(0.5, m.engage):.2f})\n"
+        f"- 기본 쿨다운 **{bot.cooldown:g}초** (+랜덤 최대 {int(gcfg['cooldown_jitter'] * 100)}%)\n"
+        f"- 채팅 비율 중심 **{ratio.center:g}** (±{ratio.spread:g}), 최근 {int(ratio.window // 60)}분 기준으로 자동 보정", ephemeral=True)
 
 
-# ---- 싸움 ----
-@bot.tree.command(name="싸움", description="말싸움 기능을 관리해요 (켜기/끄기/수위/상태/시작/중단)")
-@app_commands.describe(action="동작", user="'시작'할 때 상대 유저", level="'수위' 설정: 1=순화된 말싸움, 2=가벼운 욕까지, 3=센 욕설까지")
-@app_commands.rename(action="동작", user="유저", level="수위")
+LEVEL_DESC = {1: "순화된 말싸움만", 2: "가벼운 욕까지", 3: "욕설을 거침없이"}
+
+
+# ---- 싸움 (유저를 주면 즉시 싸움 시작) ----
+@bot.tree.command(name="싸움", description="유저를 고르면 즉시 싸움을 겁니다. 수위는 자유롭게 써요. 동작으로 켜기/끄기/중단/필터/상태")
+@app_commands.describe(user="싸울 상대 (고르면 봇이 바로 먼저 시비를 걸어요)",
+                       level_text="수위를 자유롭게 (예: 거칠게 욕하고 서럽게 따져). 1/2/3 은 프리셋. 유저 없이 쓰면 기본 수위로 저장",
+                       action="상태(기본) / 켜기 / 끄기 / 중단(이 채널 싸움 종료) / 필터(출력 필터 전환)")
+@app_commands.rename(user="유저", level_text="수위", action="동작")
 @app_commands.choices(action=[
     app_commands.Choice(name="상태", value="status"),
     app_commands.Choice(name="켜기", value="on"),
     app_commands.Choice(name="끄기", value="off"),
-    app_commands.Choice(name="수위", value="level"),
-    app_commands.Choice(name="시작", value="start"),
     app_commands.Choice(name="중단", value="stop"),
     app_commands.Choice(name="필터", value="filter"),
 ])
 async def fight_cmd(
-    interaction: discord.Interaction, action: app_commands.Choice[str],
-    user: Optional[discord.User] = None, level: Optional[app_commands.Range[int, 1, 3]] = None,
+    interaction: discord.Interaction,
+    user: Optional[discord.User] = None,
+    level_text: Optional[app_commands.Range[str, 1, 300]] = None,
+    action: Optional[app_commands.Choice[str]] = None,
 ) -> None:
     fm = engine.fights
-    if action.value in ("on", "off"):
-        fm.cfg["enabled"] = action.value == "on"
+    act = action.value if action else ""
+    if act in ("on", "off"):
+        fm.cfg["enabled"] = act == "on"
         await memory.kv_set("fight_enabled", "1" if fm.cfg["enabled"] else "0")
         if not fm.cfg["enabled"]:
             fm.stop_all()
         await interaction.response.send_message(
             "말싸움 기능을 켰어요." if fm.cfg["enabled"] else "말싸움 기능을 껐어요.", ephemeral=True)
         return
-    if action.value == "level":
-        if level is None:
-            await interaction.response.send_message(f"현재 수위: {fm.cfg['level']} ({LEVEL_DESC[int(fm.cfg['level'])]})", ephemeral=True)
-            return
-        fm.cfg["level"] = int(level)
-        await memory.kv_set("fight_level", str(level))
-        await interaction.response.send_message(
-            f"수위를 **{level}**로 바꿨어요. ({LEVEL_DESC[int(level)]})", ephemeral=True)
-        return
-    if action.value == "filter":        # 출력 금지어 필터 켜기/끄기 (전환). 앞단 검열이 있으면 꺼두는 게 효율적
+    if act == "filter":                 # 출력 금지어 필터 전환. 앞단 검열이 있으면 꺼두는 게 효율적
         fm.cfg["filter"] = not fm.cfg.get("filter", False)
         await memory.kv_set("fight_filter", "1" if fm.cfg["filter"] else "0")
         await interaction.response.send_message(
             "출력 필터를 **켰어요**. 금지 표현이 나오면 다시 생성해요." if fm.cfg["filter"]
             else "출력 필터를 **껐어요**. 검열 없이 감정 그대로 나가요.", ephemeral=True)
         return
-    if action.value == "stop":
+    if act == "stop":
         n = fm.stop_all(interaction.channel_id)
         await interaction.response.send_message(f"이 채널의 말싸움 {n}건을 중단했어요.", ephemeral=True)
         return
-    if action.value == "start":
-        if user is None or interaction.channel_id is None:
-            await interaction.response.send_message("싸움을 걸 유저를 지정해주세요.", ephemeral=True)
+
+    if user is not None:                # ---- 즉시 싸움: 기분이 나빠진 채로 봇이 먼저 욕하며 시비를 건다 ----
+        channel = interaction.channel
+        if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.response.send_message("텍스트 채널에서 실행해주세요.", ephemeral=True)
             return
-        f = fm.start(interaction.channel_id, user.id, user.display_name)
+        if not fm.cfg["enabled"]:
+            await interaction.response.send_message("말싸움 기능이 꺼져 있어요. `/싸움 동작:켜기`", ephemeral=True)
+            return
+        if channel.id in bot.busy:
+            await interaction.response.send_message("지금 이 채널에서 대답을 만드는 중이에요. 잠시 뒤에 다시 해주세요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        f = fm.start(channel.id, user.id, user.display_name)
+        if level_text:
+            f.level_text = level_text.strip()
         engine.mood.on_fight_start(user.id, engine.label(user.id, user.display_name))
-        await interaction.response.send_message(
-            f"{user.display_name} 님과 말싸움 모드를 켰어요. 그 사람이 다음에 말하면 바로 받아쳐요.", ephemeral=True)
+        engine.mood.set_emotion("angry", 8)        # 기분이 즉시 나빠진다
+        await run_fight_open(channel, f)
+        shown = f.level_text or f"기본 수위({fm.cfg.get('level_text') or fm.cfg['level']})"
+        await interaction.followup.send(f"{user.display_name} 님과 싸움을 시작했어요. 수위: {trunc(shown, 80)}", ephemeral=True)
         return
+
+    if level_text:                      # 유저 없이 수위만: 기본 수위로 저장
+        t = level_text.strip()
+        fm.cfg["level_text"] = "" if t in ("1", "2", "3") else t
+        if t in ("1", "2", "3"):
+            fm.cfg["level"] = int(t)
+        await memory.kv_set("fight_level_text", fm.cfg["level_text"])
+        await memory.kv_set("fight_level", str(fm.cfg["level"]))
+        await interaction.response.send_message(
+            f"기본 수위를 바꿨어요: **{LEVEL_DESC[int(t)] if t in ('1', '2', '3') else trunc(t, 120)}**", ephemeral=True)
+        return
+
     fights = list(fm.active.values())
     body = "\n".join(
         f"<#{f.channel_id}> {f.user_name}: 라운드 {f.rounds} · 흐름 {f.advantage}" for f in fights) or "(진행 중인 싸움 없음)"
+    cur = fm.cfg.get("level_text") or f"{fm.cfg['level']} ({LEVEL_DESC[int(fm.cfg['level'])]})"
     await interaction.response.send_message(
-        f"**말싸움** {'켜짐' if fm.cfg['enabled'] else '꺼짐'} · 수위 {fm.cfg['level']} · "
-        f"출력 필터 {'켜짐' if fm.cfg.get('filter') else '꺼짐'}\n{body}", ephemeral=True)
+        f"**말싸움** {'켜짐' if fm.cfg['enabled'] else '꺼짐'} · 기본 수위 {trunc(str(cur), 100)} · "
+        f"출력 필터 {'켜짐' if fm.cfg.get('filter') else '꺼짐'}\n{body}\n-# `/싸움 유저:@누구` 로 즉시 싸움을 걸 수 있어요.", ephemeral=True)
 
 
 # ---- 11. 혼잣말 (조용할 때 먼저 말 걸기) ----
@@ -1333,10 +1524,13 @@ async def idle_cmd(
     interaction: discord.Interaction, action: app_commands.Choice[str], channel: Optional[discord.TextChannel] = None
 ) -> None:
     if action.value in ("on", "off"):
-        bot.idle_enabled = action.value == "on"
+        # 장시간 침묵 혼잣말 이벤트와 능동 대화(먼저 말걸기)를 함께 켜고 끈다
+        bot.idle_enabled = bot.init_enabled = action.value == "on"
         await memory.kv_set("idle_enabled", "1" if bot.idle_enabled else "0")
+        await memory.kv_set("init_enabled", "1" if bot.init_enabled else "0")
         await interaction.response.send_message(
-            "혼잣말 기능을 켰어요." if bot.idle_enabled else "혼잣말 기능을 껐어요.", ephemeral=True)
+            "먼저 말걸기(능동 대화 + 혼잣말 이벤트)를 켰어요." if bot.idle_enabled
+            else "먼저 말걸기(능동 대화 + 혼잣말 이벤트)를 껐어요.", ephemeral=True)
         return
     if action.value == "status":
         now = time.time()
@@ -1369,14 +1563,6 @@ async def idle_cmd(
     finally:
         bot.busy.discard(target.id)
     await interaction.followup.send(f"실행 결과: {result}", ephemeral=True)
-
-
-# ---- 12. 리로드 ----
-@bot.tree.command(name="리로드", description="캐릭터/공통 규칙 yaml 파일을 다시 불러와요")
-async def reload_persona(interaction: discord.Interaction) -> None:
-    persona.reload()
-    await interaction.response.send_message(
-        f"다시 불러왔어요. 현재 캐릭터: **{persona.name}** (`{persona.char_id}`)", ephemeral=True)
 
 
 def run() -> None:
