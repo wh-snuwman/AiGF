@@ -66,7 +66,7 @@ def _stem(tok: str) -> str:
 
 def overused_phrases(lines: list[str], ignore: set[str] | None = None) -> list[tuple[str, str]]:
     """최근 자기 발언에서 반복되는 단어를 찾는다. [(보여줄 단어, 매칭용 어간)]
-    - 최근 14줄 중 3줄 이상, 또는 최근 8줄 중 2줄 이상에 나온 말을 대상으로 한다."""
+    - 최근 14줄 중 3줄 이상, 또는 최근 6줄 중 2줄 이상에 나온 말을 대상으로 한다."""
     def count(sub: list[str]) -> tuple[Counter[str], dict[str, str]]:
         c: Counter[str] = Counter()
         disp: dict[str, str] = {}
@@ -84,7 +84,7 @@ def overused_phrases(lines: list[str], ignore: set[str] | None = None) -> list[t
         return c, disp
 
     c14, d14 = count(lines[-14:])
-    c5, d5 = count(lines[-8:])
+    c5, d5 = count(lines[-6:])
     stems = {s: n for s, n in c14.items() if n >= 3}
     for s, n in c5.items():
         if n >= 2:
