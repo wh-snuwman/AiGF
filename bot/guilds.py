@@ -49,6 +49,7 @@ class GuildState:
     paused: bool = False
     idle_enabled: bool = True
     init_enabled: bool = True
+    chain_auto: bool = True            # 캐릭터끼리 자동으로 받아치기
     cooldown: float = 18.0
     channels: set[int] = field(default_factory=set)
 
@@ -358,6 +359,9 @@ class Hub:
         ie2 = await m.kv_get("init_enabled")
         if ie2 is not None:
             st.init_enabled = ie2 == "1"
+        ca = await m.kv_get("chain_auto")
+        if ca is not None:
+            st.chain_auto = ca == "1"
         te = await m.kv_get("trace_enabled")
         eg = await m.kv_get("engagement")
         flt = await m.kv_get("fight_level_text")

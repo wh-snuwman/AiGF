@@ -1027,7 +1027,7 @@ async def group_loop() -> None:
 def maybe_chain(channel, speaker_cid: str, bubbles: list[str], depth: int) -> None:
     """방금 한 캐릭터의 말에 같은 방의 다른 캐릭터가 가끔 받아친다. 사람이 한동안 없으면 안 하고, 횟수/확률을 줄여 가며 끝없이 이어지지 않게 한다."""
     ctx = hub.ctx()
-    if len(ctx.chars) < 2 or bot.paused or depth > int(mcfg["max_chain"]) or not bubbles:
+    if len(ctx.chars) < 2 or bot.paused or depth > int(mcfg["max_chain"]) or not bubbles or not ctx.state.chain_auto:
         return
     ch = channel.id
     if time.time() - bot.last_human_ts.get(ch, 0) > float(mcfg["human_window_sec"]):
@@ -1651,6 +1651,129 @@ async def swap_character(
     if greet and c.persona.greeting and channel is not None:
         hub.use_char(c.cid)
         await send_bubbles(channel, [c.persona.greeting])
+
+
+# ---- 3-2. 캐릭터 (부르기/내보내기/목록 + 캐릭터끼리 대화 제어) ----
+talking: set[int] = set()          # 지금 캐릭터끼리 대화 중인 채널
+
+
+async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid: int, uname: str) -> None:
+    """관리자가 시킨 캐릭터끼리 대화: starter 가 먼저 말을 꺼내고, 다른 캐릭터가 번갈아 rounds 번 이어 간다 (/캐릭터 동작:대화중지 로 멈춤)."""
+    ch = channel.id
+    talking.add(ch)
+    prev: str | None = None
+    last_text = ""
+    try:
+        for i in range(rounds):
+            hub.use(gid)
+            if ch not in talking or bot.paused:
+                break
+            ctx = hub.ctx()
+            if i == 0 or prev not in ctx.chars:
+                cid = starter if starter in ctx.chars else next(iter(ctx.chars))
+            else:
+                cid = random.choice([c for c in ctx.chars if c != prev] or [prev])
+            hub.use_char(cid)
+            for _ in range(90):                                   # 사람 대화가 진행 중이면 끝나길 기다린다
+                if ch not in bot.busy:
+                    break
+                await asyncio.sleep(1)
+            if ch in bot.busy or ch not in talking:
+                break
+            bot.busy.add(ch)
+            try:
+                names = ", ".join(c.persona.name for k, c in ctx.chars.items() if k != cid)
+                if i == 0 or prev is None:
+                    text = f"(관리자가 캐릭터끼리 대화를 시켰다) 주제: {topic}" if topic else "(심심해서 같은 방 친구 캐릭터에게 말을 건다)"
+                    note = (f"같은 방 친구 캐릭터({names})에게 먼저 말을 꺼내라. 사람에게 하는 말이 아니다."
+                            + (f" 주제: {topic}" if topic else ""))
+                    from_uid, from_name = uid, uname
+                else:
+                    pname = ctx.chars[prev].persona.name
+                    text = last_text
+                    note = (f"방금 같은 방 친구 캐릭터 {pname}이(가) 한 말에 대한 반응이다. 사람이 아니라 친구 캐릭터에게 하는 말이니 "
+                            "자기 말투 그대로 받아치고, 대화가 이어지게 한마디 덧붙이거나 되물어라."
+                            + (f" (주제: {topic})" if topic else ""))
+                    from_uid, from_name = char_uid(prev), pname
+                async with bot.gpu_lock:
+                    async with channel.typing():
+                        bubbles = await engine.reply(ch, from_uid, from_name, text, can_skip=False, priority=True, extra_note=note)
+                if bubbles:
+                    await send_bubbles(channel, bubbles)
+                    bot.last_char[ch] = cid
+                    prev, last_text = cid, " ".join(bubbles)
+            finally:
+                bot.busy.discard(ch)
+            await asyncio.sleep(random.uniform(*[float(x) for x in mcfg["chain_delay_sec"]]))
+    except Exception:  # noqa: BLE001
+        log.exception("캐릭터 대화 실패 (channel=%s)", ch)
+    finally:
+        talking.discard(ch)
+        bot.next_ok[ch] = max(bot.next_ok.get(ch, 0), time.monotonic() + 2.0)
+
+
+@bot.tree.command(name="캐릭터", description="캐릭터를 부르거나 내보내고, 캐릭터끼리 대화를 시작/중지해요")
+@app_commands.describe(mode="부르기/내보내기/목록 · 대화시작/대화중지 · 자동대화켜기/끄기(사람 말에 다른 캐릭터가 알아서 끼어드는 것)",
+                       character="부를/내보낼 캐릭터, 대화시작일 땐 먼저 말할 캐릭터 (생략하면 아무나)",
+                       topic="대화시작할 때 이야기 주제 (생략하면 자유)", rounds="대화시작: 말을 주고받을 횟수 (기본 6, 최대 20)")
+@app_commands.rename(mode="동작", character="캐릭터", topic="주제", rounds="횟수")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="부르기", value="add"),
+    app_commands.Choice(name="내보내기", value="remove"),
+    app_commands.Choice(name="목록", value="list"),
+    app_commands.Choice(name="대화시작", value="talk"),
+    app_commands.Choice(name="대화중지", value="stop"),
+    app_commands.Choice(name="자동대화켜기", value="auto_on"),
+    app_commands.Choice(name="자동대화끄기", value="auto_off"),
+])
+@app_commands.autocomplete(character=character_autocomplete)
+async def character_cmd(
+    interaction: discord.Interaction, mode: app_commands.Choice[str], character: Optional[str] = None,
+    topic: Optional[str] = None, rounds: app_commands.Range[int, 2, 20] = 6,
+) -> None:
+    act = mode.value
+    ctx = hub.ctx()
+    if act in ("add", "remove", "list"):
+        if act != "list" and not character:
+            await interaction.response.send_message("캐릭터를 골라 주세요. (`/캐릭터 동작:목록`으로 확인)", ephemeral=True)
+            return
+        await swap_character.callback(interaction, character, app_commands.Choice(name=act, value=act), None, True, True)
+        return
+    ch = interaction.channel
+    if act in ("auto_on", "auto_off"):
+        ctx.state.chain_auto = act == "auto_on"
+        await memory.kv_set("chain_auto", "1" if ctx.state.chain_auto else "0")
+        await interaction.response.send_message(
+            "자동 대화 **켜짐**: 한 캐릭터가 사람에게 대답하면 다른 캐릭터가 가끔 받아쳐요." if ctx.state.chain_auto
+            else "자동 대화 **꺼짐**: 캐릭터끼리 알아서 말을 주고받지 않아요. (`동작:대화시작`으로 직접 시킬 수는 있어요)", ephemeral=True)
+        return
+    if act == "stop":
+        was = ch is not None and ch.id in talking
+        if ch is not None:
+            talking.discard(ch.id)
+        await interaction.response.send_message("캐릭터 대화를 멈춰요." if was else "지금 진행 중인 캐릭터 대화가 없어요.", ephemeral=True)
+        return
+    # ---- 대화시작 ----
+    if len(ctx.chars) < 2:
+        await interaction.response.send_message("캐릭터가 한 명뿐이에요. 먼저 `/캐릭터 동작:부르기 캐릭터:…`로 불러 주세요.", ephemeral=True)
+        return
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("서버 채팅 채널에서만 쓸 수 있어요.", ephemeral=True)
+        return
+    if ch.id in talking:
+        await interaction.response.send_message("이미 캐릭터끼리 대화 중이에요. `동작:대화중지`로 멈출 수 있어요.", ephemeral=True)
+        return
+    if bot.paused:
+        await interaction.response.send_message("지금 일시정지 상태예요. `/상태 동작:일시정지`로 다시 켜 주세요.", ephemeral=True)
+        return
+    if character and character not in ctx.chars:
+        await interaction.response.send_message("그 캐릭터는 이 서버에 없어요. 먼저 부르기로 불러 주세요.", ephemeral=True)
+        return
+    starter = character or random.choice(list(ctx.chars))
+    topic = (topic or "").strip()[:80]
+    await interaction.response.send_message(
+        f"{ctx.chars[starter].persona.name} 부터 캐릭터끼리 {rounds}번 이야기해요." + (f" 주제: {topic}" if topic else ""), ephemeral=True)
+    asyncio.create_task(run_talk(ch, ctx.gid, starter, topic, int(rounds), interaction.user.id, interaction.user.display_name))
 
 
 # ---- 4. 상태 (보기 + 일시정지 + 리로드 통합) ----
