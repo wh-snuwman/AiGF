@@ -11,6 +11,8 @@ from typing import Any, Optional
 
 from ollama import AsyncClient
 
+from . import trace
+
 log = logging.getLogger("llm")
 
 
@@ -70,6 +72,10 @@ class LLM:
         total, load = _secs(resp, "total_duration"), _secs(resp, "load_duration")
         pe, ev = _secs(resp, "prompt_eval_duration"), _secs(resp, "eval_duration")
         self.stats.append((total, load, pe, ev))
+        trace.cur().event("llm", model=self.model, temperature=opts.get("temperature"),
+                          num_predict=opts.get("num_predict"), images=bool(images),
+                          prompt_tokens=pt, completion_tokens=ct, sec=round(total, 2), load_sec=round(load, 2),
+                          prompt_sec=round(pe, 2), gen_sec=round(ev, 2), raw=(resp["message"]["content"] or "").strip())
         log.info("LLM %.1fs (모델로드 %.1fs · 프롬프트 %d토큰 %.1fs · 생성 %d토큰 %.1fs)%s",
                  total, load, pt, pe, ct, ev, " [이미지]" if images else "")
         return LLMResult((resp["message"]["content"] or "").strip(), pt, ct, total)

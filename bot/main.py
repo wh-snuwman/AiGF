@@ -6,7 +6,7 @@ import json
 import logging
 import random
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -18,6 +18,7 @@ from discord.ext import tasks
 from . import initiative, targeting, vision
 from .chat import ChatEngine
 from .guard import redact
+from . import trace as tracelib
 from .config import discord_token, load_settings
 from .emoji import Emojis
 from .fight import Fight
@@ -87,6 +88,7 @@ class Pending:
     human_reply: bool = False                     # 다른 사람 메시지에 대한 답장인가
     kind: str = "msg"                             # msg / reaction
     bubbles: float = 1.0                          # 채팅 비율 제어가 정한 말풍선 가중치
+    meta: dict = field(default_factory=dict)      # 대상 선정 과정(후보/점수) — 디버깅 기록용
 
 
 @dataclass
@@ -208,6 +210,9 @@ class GirlBot(discord.Client):
         char = await memory.kv_get("character")
         if char:
             persona.load(char)
+        te = await memory.kv_get("trace_enabled")
+        if te is not None:
+            engine.tracer.cfg["enabled"] = te == "1"
         eg = await memory.kv_get("engagement")
         if eg:
             engine.mood.engage = max(0.5, min(4.0, float(eg)))
@@ -292,9 +297,14 @@ async def send_bubbles(
     channel: discord.abc.Messageable, bubbles: list[str], reply_to: discord.Message | None = None
 ) -> None:
     tcfg = settings["typing"]
+    trace_id = engine.last_trace_id          # 방금 끝난 응답의 기록과 연결
+    t_send = time.time()
+    sent_ids: list[int] = []
+    rendered: list[str] = []
     for i, raw in enumerate(bubbles):
         # 서버 커스텀 이모지 `:이름:` 을 실제 이모지로 바꿔서 보낸다
         text = emojis.render(raw) if ecfg.get("enabled", True) else raw
+        rendered.append(text)
         if tcfg["enabled"]:
             # 첫 말풍선은 답을 만드는 동안 이미 '입력 중'이었으니 거의 바로 보내고, 이어지는 말풍선만 짧게 타이핑 연출
             delay = min(engine.typing_delay(raw), 0.4) if i == 0 else min(engine.typing_delay(raw), 1.5)
@@ -302,12 +312,17 @@ async def send_bubbles(
                 await asyncio.sleep(delay)
         if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id):
             try:
-                await reply_to.reply(text, mention_author=False)
+                m_ = await reply_to.reply(text, mention_author=False)
+                sent_ids.append(m_.id)
                 continue
             except discord.HTTPException:
                 pass
-        await channel.send(text)
+        m_ = await channel.send(text)
+        sent_ids.append(m_.id)
     cid = getattr(channel, "id", None)
+    engine.tracer.log("send", trace_id=trace_id, channel_id=cid, bubbles=bubbles, rendered=rendered,
+                      message_ids=sent_ids, reply_to=reply_to.id if reply_to is not None else None,
+                      sec=round(time.time() - t_send, 2))
     if cid is not None and not isinstance(channel, discord.DMChannel):
         ratio.record(cid, "b", len(bubbles))              # 채팅 비율 통계에 봇 메시지 수 기록
         bot.last_bot_msg[cid] = time.time()
@@ -383,6 +398,9 @@ async def maybe_react(msg: discord.Message, chance: float, text: str | None = No
             await msg.add_reaction(discord.PartialEmoji(name=name, id=eid, animated=anim))
         else:
             await msg.add_reaction(pick)
+        engine.tracer.log("react", channel_id=msg.channel.id, message_id=msg.id, user_id=msg.author.id,
+                          user_name=msg.author.display_name, text=text if text is not None else msg_text_plain(msg),
+                          emoji=str(pick if not isinstance(pick, tuple) else f":{pick[0]}:"), emotion=engine.mood.current().label)
         return True
     except discord.HTTPException:
         return False
@@ -452,32 +470,58 @@ async def on_typing(channel: discord.abc.Messageable, user: discord.abc.User, wh
         bot.typing_until[(cid, user.id)] = time.monotonic() + 8
 
 
+def trace_recv(message: discord.Message, text: str, outcome: str, **kw) -> None:
+    """받은 메시지를 처리 결과와 함께 기록한다 (디버깅용)."""
+    if not engine.tracer.enabled:
+        return
+    ch = message.channel
+    ref = getattr(message.reference, "message_id", None) if message.reference else None
+    v = engine.guard.inspect(text) if text else None
+    engine.tracer.log(
+        "recv", channel_id=ch.id, channel=getattr(ch, "name", "DM"), guild=getattr(message.guild, "name", None),
+        message_id=message.id, user_id=message.author.id, user_name=message.author.display_name,
+        label=engine.label(message.author.id, message.author.display_name), text=text,
+        attachments=[(a.content_type or a.filename) for a in message.attachments], reply_to=ref,
+        guard={"level": v.level, "score": v.score, "kinds": v.kinds} if v else None,
+        emotion=engine.mood.current().label, outcome=outcome, **kw)
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not user_allowed(message.author.id):
+    if message.author.bot:
+        return
+    if not user_allowed(message.author.id):
+        trace_recv(message, message.content or "", "dropped:not_allowed")
         return
     text = clean_text(message)
     n_img = sum(1 for a in message.attachments if (a.content_type or "").lower().startswith("image/"))
     if not text and not n_img:
+        trace_recv(message, "", "dropped:empty")
         return
     if n_img:                                   # 대화 기록에는 이미지 자체 대신 표시만 남긴다
         text = (text + " " if text else "") + f"(이미지 {n_img}장 첨부)"
     # 명령/주입을 반복 시도한 사람은 잠시 무시한다 (관리자는 제외)
     if engine.guard.is_muted(message.author.id) and message.author.id not in ADMIN_IDS:
+        trace_recv(message, text, "dropped:muted")
         return
     if message.author.id not in ADMIN_IDS and not engine.guard.rate_ok(message.author.id):
+        trace_recv(message, text, "dropped:rate_limit")
         return                                  # 도배(1분에 너무 많은 메시지)는 무시해서 GPU 독점을 막는다
 
     # ----- DM: 1:1 이므로 바로 대답 -----
     if isinstance(message.channel, discord.DMChannel):
         if dcfg["respond_to_dm"] and not bot.paused:
+            trace_recv(message, text, "dm")
             await handle_dm(message, text, n_img)
+        else:
+            trace_recv(message, text, "dropped:dm_off_or_paused")
         return
 
     # ----- 서버 채널: 기록해 두고, 쿨다운 후 점수로 골라서 대답 -----
     in_channel = message.channel.id in bot.channels
     mentioned = dcfg["respond_to_mention"] and is_priority(message)
     if not (in_channel or mentioned):
+        trace_recv(message, text, "dropped:channel_not_monitored")
         return
     ch, uid, display = message.channel.id, message.author.id, message.author.display_name
     who = engine.label(uid, display)
@@ -504,14 +548,22 @@ async def on_message(message: discord.Message) -> None:
             engine.fights.start(ch, uid, display)
             m.on_fight_start(uid, who)
             in_fight = True
+            engine.tracer.log("event", what="fight_start", channel_id=ch, user_id=uid, user_name=display,
+                              detail=text, emotion=m.current().label, irritation=round(m.s["irritation"], 2))
             log.info("말싸움 시작: channel=%s user=%s(%s)", ch, uid, display)
     if bot.paused:
+        trace_recv(message, text, "recorded:paused", directed=directed, mentioned=bool(mentioned), in_fight=in_fight,
+                   stored=stored)
         return
     images = await vision.collect_images(message, vcfg) if n_img else []
+    hr = replies_to_human(message)
     bot.pending.setdefault(ch, []).append(Pending(
         message, time.monotonic(), priority=bool(mentioned) or in_fight,
-        uid=uid, uname=display, images=images, human_reply=replies_to_human(message),
+        uid=uid, uname=display, images=images, human_reply=hr,
     ))
+    trace_recv(message, text, "recorded", directed=directed, mentioned=bool(mentioned), in_fight=in_fight,
+               replies_to_human=hr, images=len(images), stored=stored if stored != text else None,
+               pending_in_channel=len(bot.pending.get(ch, [])))
 
 
 def guard_store_text(author: discord.abc.User, text: str) -> str:
@@ -611,6 +663,9 @@ async def respond_group(channel_id: int, target: Pending) -> None:
     try:
         fight = engine.fights.get(channel_id, uid)
         async with bot.gpu_lock:
+            tracelib.set_meta(selection=target.meta, kind_in=target.kind, wait_sec=round(time.monotonic() - target.ts, 1),
+                              message_id=msg.id, channel_name=getattr(channel, "name", None),
+                              fight_state=(fight.advantage if fight else None))
             async with channel.typing():
                 note = bot.return_note.get(channel_id)
                 extra = note
@@ -701,6 +756,8 @@ async def group_loop() -> None:
                    and emojis.is_trivial(p.text or clean_text(p.message))]
         if trivial:
             for p in trivial:
+                engine.tracer.log("decision", action="trivial_react_only", channel_id=channel_id, user_id=p.uid,
+                                  user_name=p.uname, detail=p.text or clean_text(p.message))
                 asyncio.create_task(maybe_react(p.message, ecfg.get("trivial_react_chance", 0.5)))
             ready = [p for p in ready if p not in trivial]
             items[:] = [p for p in items if p not in trivial]
@@ -718,7 +775,12 @@ async def group_loop() -> None:
         else:
             chance = (gcfg["reply_chance"] + targeting.chance_boost(users, gcfg["crowd_chance_per_user"])
                       + 0.2 * (engine.mood.engage - 1.0))      # 적극성이 높을수록 더 많은 말에 대답한다
-            if random.random() > min(1.0, chance * engine.mood.reply_mult * adj.reply):
+            p_reply = min(1.0, chance * engine.mood.reply_mult * adj.reply)
+            if random.random() > p_reply:
+                engine.tracer.log("decision", action="skip_chance", channel_id=channel_id,
+                                  detail=f"대답 확률 {p_reply:.2f} 탈락 (사람 {users}명, 비율보정 x{adj.reply:.2f})",
+                                  messages=[{"user_id": p.uid, "user_name": p.uname, "text": p.text or clean_text(p.message)}
+                                            for p in ready][:6])
                 # 글로는 대답하지 않지만 이모지 리액션은 달 수 있다. 답을 못 받은 메시지는 보관해 둔다
                 for p in ready:
                     asyncio.create_task(maybe_react(p.message, ecfg.get("react_chance", 0.12)))
@@ -728,8 +790,19 @@ async def group_loop() -> None:
             pool = ready
 
         # 3) 대상 점수(멘션, 싸움, 이름 부름, 질문, 호감도, 오래 대답 못 받음, 최신성...)로 가중 랜덤 선택
-        target = pool[targeting.pick([to_candidate(p, now, channel_id) for p in pool])]
+        cands = [to_candidate(p, now, channel_id) for p in pool]
+        target = pool[targeting.pick(cands)]
         tuid = target.uid or target.message.author.id
+        sel_meta = {
+            "pool": [{"user_id": c.uid, "name": p.uname, "text": c.text[:80], "score": round(targeting.score(c), 2),
+                      "priority": c.priority, "in_fight": c.in_fight, "directed": c.directed,
+                      "human_reply": c.human_reply, "affinity": round(c.affinity, 2),
+                      "since_replied": int(min(c.since_replied, 99999)), "age": round(c.age, 1)}
+                     for c, p in zip(cands, pool)],
+            "chosen_user": tuid, "chosen_name": target.uname, "priority_pool": bool(prio),
+            "crowd_users": users, "ratio_reply_x": round(adj.reply, 2), "ratio_bubbles_x": round(adj.bubbles, 2),
+            "pending_total": len(items), "cooldown_s": round(bot.cooldown, 1), "engage": engine.mood.engage,
+        }
 
         # 4) 고른 사람이 연달아 보낸 메시지는 하나로 묶어서 대답한다. 다른 사람 메시지는 남겨서 다음 순서에 대답
         if target.kind == "reaction":
@@ -747,6 +820,10 @@ async def group_loop() -> None:
             priority=any(p.priority for p in same), text=text,
             uid=tuid, uname=target.uname or target.message.author.display_name,
             images=imgs, kind=target.kind, bubbles=adj.bubbles,
+            meta={**sel_meta, "merged_count": len(same),
+                  "merged_texts": [(p.text or clean_text(p.message))[:100] for p in same],
+                  "left_pending": [{"user_id": p.uid, "text": (p.text or clean_text(p.message))[:60]}
+                                   for p in items if p not in same][:5]},
         )
         items[:] = [p for p in items if p not in same]
         asyncio.create_task(respond_group(channel_id, merged))
@@ -1649,6 +1726,86 @@ async def web_cmd(interaction: discord.Interaction, action: Optional[app_command
         f"**웹 정보** {'켜짐' if w.enabled else '꺼짐'} · 방식 {w.cfg['provider']} · 캐시: {w.summary()}\n"
         f"사용 확률 {int(w.cfg['chance'] * 100)}% · 실시간 조회 {'허용' if w.cfg.get('realtime') else '안 함'}"
         f" (제한 {w.cfg['timeout_sec']}초, 분당 {w.cfg['per_min']}회)" + (f"\n최근 오류: {w.last_error}" if w.last_error else ""), ephemeral=True)
+
+
+# ---- 13. 로그 (디버깅용 상세 기록) ----
+@bot.tree.command(name="로그", description="받은 메시지/대답 대상/프롬프트/답변 기록을 보거나 내보내요 (디버깅용)")
+@app_commands.describe(action="보기(기본, 최근 응답) / 받은메시지 / 상세(기록 id) / 내보내기(파일) / 켜기 / 끄기 / 통계",
+                       count="보기 개수 (기본 10, 최대 30)", user="이 유저와 관련된 기록만", trace_id="상세로 볼 기록 id (보기 목록의 [id])",
+                       hours="내보내기 범위(시간, 기본 24)")
+@app_commands.rename(action="동작", count="개수", user="유저", trace_id="기록id", hours="시간")
+@app_commands.choices(action=[
+    app_commands.Choice(name="보기", value="show"),
+    app_commands.Choice(name="받은메시지", value="recv"),
+    app_commands.Choice(name="상세", value="detail"),
+    app_commands.Choice(name="내보내기", value="export"),
+    app_commands.Choice(name="통계", value="stats"),
+    app_commands.Choice(name="켜기", value="on"),
+    app_commands.Choice(name="끄기", value="off"),
+])
+async def log_cmd(
+    interaction: discord.Interaction, action: Optional[app_commands.Choice[str]] = None, count: int = 10,
+    user: Optional[discord.User] = None, trace_id: Optional[str] = None, hours: int = 24,
+) -> None:
+    tr = engine.tracer
+    act = action.value if action else "show"
+    uid = user.id if user else None
+    if act in ("on", "off"):
+        tr.cfg["enabled"] = act == "on"
+        await memory.kv_set("trace_enabled", "1" if tr.enabled else "0")
+        await interaction.response.send_message(f"상세 기록을 {'켰' if tr.enabled else '껐'}어요. (저장 위치 `{tr.dir}`)", ephemeral=True)
+        return
+    if act == "export":
+        await interaction.response.defer(ephemeral=True)
+        data, n = tr.export(max(1, hours))
+        if not n:
+            await interaction.followup.send("내보낼 기록이 없어요.", ephemeral=True)
+            return
+        import io
+        fname = f"trace-{datetime.now().strftime('%Y%m%d-%H%M')}.jsonl"
+        await interaction.followup.send(f"최근 {hours}시간 기록 {n}줄 (JSONL, 한 줄에 사건 하나). 사용자 메시지가 들어 있으니 공유에 주의하세요.",
+                                        file=discord.File(io.BytesIO(data), filename=fname), ephemeral=True)
+        return
+    if act == "stats":
+        rows = tr.read(5000, since_ts=time.time() - 24 * 3600)
+        kinds = Counter(r.get("kind") for r in rows)
+        outcomes = Counter(r.get("outcome") for r in rows if r.get("kind") in ("reply", "initiate", "proactive"))
+        recv = Counter(r.get("outcome") for r in rows if r.get("kind") == "recv")
+        secs = [r["total_sec"] for r in rows if r.get("kind") == "reply" and r.get("outcome") == "replied" and "total_sec" in r]
+        users = Counter(r.get("user_name") for r in rows if r.get("kind") == "recv").most_common(5)
+        files = tr.files()
+        size = sum(p.stat().st_size for p in files) / 1e6
+        avg = f"{sum(secs) / len(secs):.1f}초 ({len(secs)}건)" if secs else "-"
+        await interaction.response.send_message(
+            f"**최근 24시간 기록** {'켜짐' if tr.enabled else '꺼짐'} · 파일 {len(files)}개 {size:.1f}MB (보관 {tr.cfg['retention_days']}일)\n"
+            f"- 종류: {dict(kinds)}\n- 받은 메시지 처리: {dict(recv)}\n- 응답 결과: {dict(outcomes)}\n"
+            f"- 평균 응답 생성 {avg}\n- 많이 말한 사람: {', '.join(f'{n}({c})' for n, c in users) or '-'}",
+            ephemeral=True)
+        return
+    if act == "detail":
+        if not trace_id:
+            await interaction.response.send_message("`기록id` 에 [대괄호] 안의 id 를 넣어 주세요.", ephemeral=True)
+            return
+        rows = tr.read(1, trace_id=trace_id.strip("[] "))
+        if not rows:
+            await interaction.response.send_message("그 id 의 기록을 못 찾았어요.", ephemeral=True)
+            return
+        import io
+        body = json.dumps(rows[0], ensure_ascii=False, indent=2)
+        await interaction.response.send_message(
+            f"기록 `{trace_id}` 상세 (프롬프트/후보 점수/LLM 원문/후처리 포함)",
+            file=discord.File(io.BytesIO(body.encode("utf-8")), filename=f"trace-{trace_id}.json"), ephemeral=True)
+        return
+    n = max(1, min(30, count))
+    kind = "recv" if act == "recv" else None
+    rows = tr.read(n * 3 if kind is None else n, kind=kind, user=uid)
+    if kind is None:
+        rows = [r for r in rows if r.get("kind") in ("reply", "initiate", "proactive", "decision")][:n]
+    if not rows:
+        await interaction.response.send_message("기록이 없어요. (`/로그 동작:켜기` 로 켰는지 확인하세요)", ephemeral=True)
+        return
+    text = "\n".join(tracelib.summarize(r) for r in reversed(rows))
+    await interaction.response.send_message(text[:1990] + "\n-# `/로그 동작:상세 기록id:...` 로 프롬프트와 후보 점수까지 볼 수 있어요.", ephemeral=True)
 
 
 def run() -> None:

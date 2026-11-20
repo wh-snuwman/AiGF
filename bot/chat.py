@@ -20,7 +20,9 @@ from .llm import LLM, LLMResult
 from .memory import Memory
 from .mood import Mood, atmosphere_of
 from .people import People
+from . import trace
 from .persona import Persona
+from .trace import Tracer
 from .web import WebInfo
 
 log = logging.getLogger("chat")
@@ -181,6 +183,8 @@ class ChatEngine:
         self.busy_check = lambda: False                            # 대화가 바쁜지 (기억 추출 보류용, main 이 설정)
         self.last_skip = False
         self.evader = Evader()                             # 거절/회피 표현 다양화
+        self.tracer = Tracer(settings.get("trace", {}))      # 디버깅용 상세 기록 (JSONL)
+        self.last_trace_id = ""                            # 방금 끝난 응답의 기록 id (전송 기록과 연결)
         self._init_recent: dict[int, list[str]] = {}      # 채널별 최근에 먼저 건 말 (중복 방지)
         self._last_move: dict[int, str] = {}              # 채널별 직전 대화 주도 방식 (연속 반복 방지)
         self.div = Diversity(settings.get("diversity", {}))   # 정형행동(같은 말/틀 반복) 추적기
@@ -314,7 +318,13 @@ class ChatEngine:
             merged.append({"role": "user", "content": tail})
         pc = self.s.get("prompt", {})
         examples = self.persona.example_messages(pc.get("max_examples", 4), pc.get("example_rotate_min", 25))
-        return [{"role": "system", "content": self.persona.static_prompt()}] + examples + merged
+        system = self.persona.static_prompt()
+        tr = trace.cur()
+        tr.set(system_chars=len(system), examples=len(examples) // 2,
+               example_firsts=[e["content"][:30] for e in examples if e["role"] == "user"])
+        if self.tracer.cfg.get("include_prompt", True):
+            tr.set(prompt=[{"role": m["role"], "content": m["content"]} for m in merged])   # 고정 system/예시는 제외 (매번 같음)
+        return [{"role": "system", "content": system}] + examples + merged
 
     def _own_block(self, own_recent: list[str], channel_id: int = 0) -> tuple[str, list[str]]:
         """프롬프트에 넣을 '최근 한 말/금지 목록' 한 덩어리와, 코드로 걷어낼 금지 어간 목록.
@@ -345,11 +355,14 @@ class ChatEngine:
         extra = {"temperature": temperature} if temperature else {}
         res = await self.llm.chat(msgs, images=images, num_predict=mode.num_predict, **extra)
         if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
+            trace.cur().set(outcome="skip")
             return res, None
         bubbles = self.to_bubbles(res.text, known, mode.max_bubbles, lively)
         # 코드 차원의 말버릇 차단: 프롬프트에 '쓰지 마라'고 해도 모델이 어기면(예: 화났을 때 '됐어.' 반복) 출력에서 직접 걷어낸다.
         if bubbles and banned:
             stripped = self._strip_overused(bubbles, set(banned))
+            if stripped != bubbles:
+                trace.cur().event("strip_overused", banned=banned, before=bubbles, after=stripped)
             if not stripped:                       # 반복어뿐이었다 → 그 말을 빼고 한 번만 다시 생성, 또 그러면 말하지 않는다
                 retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
                                     + "\n방금 답이 최근에 계속 쓴 말뿐이었다. 그 말은 빼고 전혀 다른 표현으로 다시 대답해라."}]
@@ -388,6 +401,7 @@ class ChatEngine:
             return res, bubbles
         lines = self.div.lines(chan, own)
         kept = self.div.drop_duplicates(bubbles, lines)
+        trace.cur().event("dedupe", before=bubbles, kept=kept)
         if kept:
             if len(kept) < len(bubbles):
                 log.info("중복 말풍선 제거: %r", [b for b in bubbles if b not in kept])
@@ -456,7 +470,7 @@ class ChatEngine:
         )
 
     # ---------- 응답 (대화 기록에 target 메시지가 이미 저장된 상태에서 호출) ----------
-    async def reply(
+    async def _reply_impl(
         self, channel_id: int, target_id: int, target_name: str, target_text: str,
         dm: bool = False, can_skip: bool = False, priority: bool = False, extra_note: str | None = None,
         images: list[bytes] | None = None, fight: Fight | None = None,
@@ -475,7 +489,9 @@ class ChatEngine:
 
         # ---- 프롬프트 인젝션 방어: 강한 시도는 LLM 에 아예 보내지 않고 캐릭터답게 넘긴다 ----
         verdict = self.guard.inspect(target_text)
+        trace.cur().set(guard={"level": verdict.level, "score": verdict.score, "kinds": verdict.kinds})
         if verdict.level == "block":
+            trace.cur().set(outcome="blocked")
             self.mood.on_injection(target_id, who)
             bubbles = self.guard_reply(self.call_name(target_id, target_name))
             self.div.record(channel_id, bubbles)
@@ -501,6 +517,8 @@ class ChatEngine:
 
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, target_id)
         call = self.call_name(target_id, target_name)
+        trace.cur().set(call_name=call, facts=facts, view=self.views.get(target_id, ""), scene=scene, activity=activity,
+                        history_len=len(hist), own_recent=own[-4:], notes=notes)
         bias = self.mood.length_bias
         if fight is not None:                  # 싸움은 짧고 빠르게 주고받는다
             bias = tuple(b * m for b, m in zip(bias, (0.5, 1.6, 1.1, 0.2)))
@@ -537,7 +555,10 @@ class ChatEngine:
             parts.append(f"대화주도:{move[1]} (억지로 하지 말고 자연스러울 때만)")
         if fight is None and verdict.level == "ok":
             q = self.web.wants_lookup(safe_text)
+            t_web = time.time()
             web_line = (await self.web.lookup(q) if q else "") or self.web.hint(self.web_key(), safe_text)
+            if q or web_line:
+                trace.cur().event("web", query=q, used=bool(web_line), sec=round(time.time() - t_web, 2), line=web_line)
             if web_line:
                 parts.append(web_line)
         if images:
@@ -556,6 +577,8 @@ class ChatEngine:
             can_skip = False
         if can_skip:
             parts.append("끼어들 이유가 없으면 SKIP 만 출력.")
+        trace.cur().set(length=mode.label, num_predict=mode.num_predict, max_bubbles=mode.max_bubbles,
+                        move=move[0] if move else None, banned=banned, hints=parts)
         msgs = self._assemble(who, facts, scene, merged, "\n".join(parts),
                               self.views.get(target_id, ""), target_id)
 
@@ -590,6 +613,8 @@ class ChatEngine:
         # (후처리로 합쳐지기 전의 원문도 같이 검사한다)
         if not (self.guard.check_output(bubbles) and self.guard.check_output([res.text])):
             log.warning("출력 검사 실패, 대체 문구 사용: %r", " / ".join(bubbles)[:80])
+            trace.cur().event("output_guard_fail", bubbles=bubbles)
+            trace.cur().set(outcome="guard_fallback")
             bubbles = self.guard_reply()
         self.div.record(channel_id, bubbles)
         await self.mem.add_message(
@@ -610,11 +635,78 @@ class ChatEngine:
         self._schedule_extract(channel_id, target_id, target_name)
         return bubbles
 
+    # ---------- 기록(trace) 래퍼: 응답 한 번을 한 줄(JSON)로 남긴다 ----------
+    def _mood_info(self, uid: int | None) -> dict:
+        m = self.mood
+        return {"emotion": m.current().label, "emotion_id": m.current().id, "scores": m.scores_100(),
+                "intensity": round(m.intensity(), 2), "engage": m.engage,
+                "affinity": round(m.affinity(uid), 3) if uid is not None else None,
+                "thoughts": m._recent_thoughts()}
+
+    def _begin(self, kind: str, **fields):
+        self.tracer.char_id = self.persona.char_id
+        tr = self.tracer.begin(kind, **fields)
+        tr.set(mood=self._mood_info(fields.get("target_id")), model=self.llm.model)
+        return tr
+
+    def _end(self, tr, bubbles: list[str] | None, default: str = "") -> list[str]:
+        outcome = tr.data.get("outcome") if hasattr(tr, "data") else None
+        if not outcome:
+            outcome = "skip" if self.last_skip else ("silent" if not bubbles else "replied")
+        tr.finish(outcome=outcome, bubbles=bubbles or [])
+        self.last_trace_id = getattr(tr, "id", "")
+        return bubbles or []
+
+    async def reply(
+        self, channel_id: int, target_id: int, target_name: str, target_text: str,
+        dm: bool = False, can_skip: bool = False, priority: bool = False, extra_note: str | None = None,
+        images: list[bytes] | None = None, fight: Fight | None = None,
+        bubble_bias: float = 1.0, phase: str = "",
+    ) -> list[str]:
+        tr = self._begin("reply", channel_id=channel_id, target_id=target_id, user_id=target_id,
+                         target_name=target_name, target_label=self.label(target_id, target_name),
+                         input=target_text, dm=dm, can_skip=can_skip, priority=priority, extra_note=extra_note,
+                         images=len(images or []), fight=bool(fight), phase=phase, bubble_bias=round(bubble_bias, 2))
+        try:
+            bubbles = await self._reply_impl(channel_id, target_id, target_name, target_text, dm, can_skip, priority,
+                                             extra_note, images, fight, bubble_bias, phase)
+        except Exception as e:  # noqa: BLE001
+            tr.finish(outcome="error", error=f"{type(e).__name__}: {e}")
+            raise
+        return self._end(tr, bubbles)
+
+    async def initiate(self, channel_id: int, instruction: str, idle_minutes: int, unanswered: int,
+                       analysis: str = "", target: tuple | None = None, bubble_bias: float = 1.0) -> list[str]:
+        tr = self._begin("initiate", channel_id=channel_id, instruction=instruction, analysis=analysis,
+                         idle_minutes=idle_minutes, unanswered=unanswered, bubble_bias=round(bubble_bias, 2),
+                         target_id=target[0] if target else None, user_id=target[0] if target else None,
+                         target_name=target[1] if target else None)
+        self.last_skip = False
+        try:
+            bubbles = await self._initiate_impl(channel_id, instruction, idle_minutes, unanswered, analysis, target, bubble_bias)
+        except Exception as e:  # noqa: BLE001
+            tr.finish(outcome="error", error=f"{type(e).__name__}: {e}")
+            raise
+        return self._end(tr, bubbles)
+
+    async def proactive(self, channel_id: int, user_id: int, user_name: str, idle_hours: float) -> list[str]:
+        tr = self._begin("proactive", channel_id=channel_id, target_id=user_id, user_id=user_id, target_name=user_name,
+                         target_label=self.label(user_id, user_name), idle_hours=round(idle_hours, 1))
+        self.last_skip = False
+        try:
+            bubbles = await self._proactive_impl(channel_id, user_id, user_name, idle_hours)
+        except Exception as e:  # noqa: BLE001
+            tr.finish(outcome="error", error=f"{type(e).__name__}: {e}")
+            raise
+        return self._end(tr, bubbles)
+
     def apply_fight_result(self, fight: Fight) -> None:
+        self.tracer.log("event", what="fight_end", detail=fight.ending, user_id=fight.user_id,
+                        user_name=fight.user_name, channel_id=fight.channel_id)
         self.mood.on_fight_result(fight.ending, fight.user_id, self.label(fight.user_id, fight.user_name))
 
     # ---------- 채널이 조용할 때 먼저 말 걸기 ----------
-    async def initiate(self, channel_id: int, instruction: str, idle_minutes: int, unanswered: int,
+    async def _initiate_impl(self, channel_id: int, instruction: str, idle_minutes: int, unanswered: int,
                        analysis: str = "", target: tuple | None = None, bubble_bias: float = 1.0) -> list[str]:
         """먼저 말 걸기. target=(uid, name) 이면 그 사람에게 건다. analysis 는 코드가 계산한 상황 분석 한 줄."""
         tid = target[0] if target else None
@@ -684,7 +776,7 @@ class ChatEngine:
         return [{"role": "system", "content": self.persona.static_prompt()}] + ex + [{"role": "user", "content": "안녕"}]
 
     # ---------- 먼저 말 걸기 (DM) ----------
-    async def proactive(self, channel_id: int, user_id: int, user_name: str, idle_hours: float) -> list[str]:
+    async def _proactive_impl(self, channel_id: int, user_id: int, user_name: str, idle_hours: float) -> list[str]:
         hist, merged, own, scene, activity, facts, known = await self._context(channel_id, user_id)
         who = self.label(user_id, user_name)
         mode = pick_length("", activity, False, free=True, bias=self.mood.length_bias, engage=self.mood.engage)
