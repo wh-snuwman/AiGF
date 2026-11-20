@@ -70,7 +70,8 @@ def decide(snap: Snapshot, cfg: dict, engage: float = 1.0, init_mult: float = 1.
     if snap.silence < min_sil and s4 == 0:
         p *= 0.3                                    # 대화가 한창일 땐 끼어들기를 드물게
     if snap.msgs_3m >= 4 and s4 == 0:
-        p *= 0.2                                    # 사람들끼리 활발히 얘기 중이면 더 드물게
+        # 사람들끼리 활발히 얘기 중이어도 적극적인 성격이면 끼어든다 (적극성 1.0→x0.2, 2.0→x0.4, 3.0 이상→x0.6)
+        p *= 0.2 + 0.2 * _clamp(engage - 1.0, 0.0, 2.0)
     if snap.silence < min_sil and s3 > 0 and s4 == 0:
         p *= 0.5
     p_tick = min(0.5, p * 0.08 * max(0.5, engage) ** 0.5)
@@ -92,7 +93,7 @@ INSTRUCTIONS = {
     "ask_user": '아까 {name}의 말 "{text}"에 아직 아무도 반응하지 않았다. 네가 그 사람에게 먼저 반응하거나 궁금한 걸 되물어라.',
     "follow_topic": "대화가 식어 간다. 직전 이야기의 맥락을 파악해서 거기서 이어지는 궁금한 점을 묻거나 네 의견·경험을 한마디 덧붙여 대화를 살려라.",
     "new_topic": "한동안 조용하다. 기억하는 사람 얘기나 지금 시각, 심심함에서 자연스러운 새 화제를 던져라.",
-    "chime": "대화에 자연스럽게 한마디 끼어들어라. 방금 얘기에 대한 의견, 농담, 리액션.",
+    "chime": "사람들이 나누는 얘기에 네가 먼저 끼어들어라. 방금 누가 한 말에 대한 의견, 농담, 되묻기, 네 경험 중 하나로. 인사말이나 근황 질문으로 시작하지 마라.",
 }
 
 
@@ -105,13 +106,35 @@ TOPIC_SEEDS = [
 AVOID = "시계/시각은 언급하지 말고, '뭐 하고 있었어', '뭐 할 건데', '어디 갔었어' 같은 상투적인 질문으로 시작하지 마라. "
 
 
-def instruction(d: Decision, rng: random.Random | None = None) -> str:
+def time_seeds(hour: int, weekday: int) -> list[str]:
+    """지금 시간대에 어울리는 화제 (점심/저녁/밤, 요일). 사람처럼 '지금' 얘기를 꺼내게 한다."""
+    out: list[str] = []
+    if 11 <= hour < 14:
+        out += ["점심 메뉴", "점심 먹고 나른한 느낌"]
+    elif 17 <= hour < 20:
+        out += ["저녁 메뉴", "퇴근/하교 후 뭐 할지"]
+    elif hour >= 22:
+        out += ["야식", "슬슬 잘 시간인데 안 자는 사람"]
+    elif 10 <= hour < 11:
+        out += ["오늘 하루 계획"]
+    if weekday == 0:
+        out += ["월요일의 괴로움"]
+    elif weekday == 4:
+        out += ["불금 계획"]
+    elif weekday >= 5:
+        out += ["주말에 뭐 할지"]
+    return out
+
+
+def instruction(d: Decision, rng: random.Random | None = None, hour: int | None = None,
+                weekday: int | None = None) -> str:
     rng = rng or random
     base = INSTRUCTIONS.get(d.kind, INSTRUCTIONS["chime"])
     if d.target:
         base = base.format(name=d.target[1], text=str(d.target[2])[:40])
     if d.kind in ("new_topic", "chime", "follow_topic"):
-        base += f" 화제 힌트(참고만, 억지로 쓰지 마): {rng.choice(TOPIC_SEEDS)}."
+        seeds = TOPIC_SEEDS + (time_seeds(hour, weekday) * 3 if hour is not None and weekday is not None else [])
+        base += f" 화제 힌트(참고만, 억지로 쓰지 마): {rng.choice(seeds)}."
     return AVOID + base
 
 

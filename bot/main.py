@@ -812,7 +812,8 @@ async def run_initiative(channel_id: int, dec: initiative.Decision, snap: initia
         async with bot.gpu_lock:
             async with channel.typing():
                 bubbles = await engine.initiate(
-                    channel_id, initiative.instruction(dec), int(snap.silence // 60), 0,
+                    channel_id, initiative.instruction(dec, hour=engine.now().hour, weekday=engine.now().weekday()),
+                    int(snap.silence // 60), 0,
                     analysis=initiative.analysis_text(snap), target=target, bubble_bias=adj.bubbles)
         if bubbles:
             if dec.kind == "ask_user" and target:
