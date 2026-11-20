@@ -9,6 +9,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -22,11 +23,10 @@ from . import trace as tracelib
 from .config import discord_token, load_settings
 from .emoji import Emojis
 from .fight import Fight
+from .guilds import DM, Hub, Proxy
 from .llm import LLM
-from .memory import Memory
 from .mood import EMO, EMOTIONS
 from .persona import Persona
-from .ratio import RatioControl
 
 settings = load_settings()
 logging.basicConfig(
@@ -58,15 +58,21 @@ gcfg = settings["group"]
 pcfg = settings["proactive"]
 ADMIN_IDS: set[int] = {int(x) for x in dcfg["admin_user_ids"]}
 
-persona = Persona(settings.get("character", ""))
 llm = LLM(settings["ollama"])
-memory = Memory(settings["memory"]["db_path"], settings["memory"]["max_facts_per_user"])
-engine = ChatEngine(settings, persona, llm, memory)
 emojis = Emojis()
 ecfg = settings.get("emoji", {})
 vcfg = settings.get("vision", {})
-ratio = RatioControl(settings.get("ratio", {}))
 inicfg = settings.get("initiative", {})
+
+# 서버(길드)마다 따로 저장/동작한다 (bot/guilds.py). engine/memory/persona/ratio 는 '지금 처리 중인 서버'의 객체로 연결되는 프록시.
+hub = Hub(settings, llm, defaults={
+    "idle": bool(settings["idle"]["enabled"]), "init": bool(inicfg.get("enabled", True)),
+    "cooldown": float(gcfg["cooldown_sec"]), "channel_ids": dcfg["channel_ids"]},
+    data_dir=Path(settings["memory"]["db_path"]).parent / "guilds")       # data/guilds/<서버id>/
+engine = Proxy(hub, "engine")
+memory = Proxy(hub, "memory")
+persona = Proxy(hub, "persona")
+ratio = Proxy(hub, "ratio")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -140,6 +146,9 @@ class AdminTree(app_commands.CommandTree):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id in ADMIN_IDS:
+            gid = interaction.guild_id or DM
+            await hub.ensure(gid, getattr(interaction.guild, "name", ""))
+            hub.use(gid)                       # 이 명령은 이 서버의 데이터/설정만 바꾼다
             return True
         await interaction.response.send_message("관리자만 사용할 수 있어요.", ephemeral=True)
         return False
@@ -152,7 +161,7 @@ class GirlBot(discord.Client):
             everyone=False, roles=False, users=True, replied_user=True))
         self.tree = AdminTree(self)
         self.started_at = time.time()
-        self.gpu_lock = engine.gpu_lock
+        self.gpu_lock = ChatEngine.gpu_lock
         self.dm_locks: dict[int, asyncio.Lock] = {}
         self.pending: dict[int, list[Pending]] = {}
         self.next_ok: dict[int, float] = {}      # 채널별 다음 발언 가능 시각 (monotonic)
@@ -173,20 +182,47 @@ class GirlBot(discord.Client):
         self.init_gap: dict[int, float] = {}             # 채널별 이번 능동 대화 쿨타임(랜덤)
         self.init_target: dict[int, tuple] = {}          # 채널별 마지막으로 먼저 말 건 대상 (uid, 시각)
         self.unaddressed: dict[int, list] = {}           # 대답 후보에서 탈락해 답을 못 받은 메시지 (uid, 이름, 글, 시각)
-        self.init_enabled = bool(inicfg.get("enabled", True))
-        # 런타임 상태 (DB kv 에 저장되어 재시작 후에도 유지)
-        self.paused = False
-        self.idle_enabled = bool(icfg["enabled"])
-        self.cooldown = float(gcfg["cooldown_sec"])
-        self.channels: set[int] = {int(c) for c in dcfg["channel_ids"]}
+
+    # 런타임 상태: 서버마다 따로 (서버별 DB 의 kv 에 저장되어 재시작 후에도 유지). 지금 처리 중인 서버의 값을 읽고 쓴다.
+    @property
+    def paused(self) -> bool:
+        return hub.ctx().state.paused
+
+    @paused.setter
+    def paused(self, v: bool) -> None:
+        hub.ctx().state.paused = v
+
+    @property
+    def idle_enabled(self) -> bool:
+        return hub.ctx().state.idle_enabled
+
+    @idle_enabled.setter
+    def idle_enabled(self, v: bool) -> None:
+        hub.ctx().state.idle_enabled = v
+
+    @property
+    def init_enabled(self) -> bool:
+        return hub.ctx().state.init_enabled
+
+    @init_enabled.setter
+    def init_enabled(self, v: bool) -> None:
+        hub.ctx().state.init_enabled = v
+
+    @property
+    def cooldown(self) -> float:
+        return hub.ctx().state.cooldown
+
+    @cooldown.setter
+    def cooldown(self, v: float) -> None:
+        hub.ctx().state.cooldown = v
+
+    @property
+    def channels(self) -> set[int]:
+        return hub.ctx().state.channels
 
     async def setup_hook(self) -> None:
-        await memory.init()
-        await self.load_state()
-        await engine.load_names()
-        # 슬래시 명령 동기화는 on_ready 에서 서버별로 한다 (바로 반영되고, 옛 전역 명령과 중복 표시되지 않음)
-        # 대화가 바쁠 때는 기억 추출을 미룬다 (GPU 양보)
-        engine.busy_check = lambda: bool(self.busy) or any(self.pending.values()) or self.gpu_lock.locked()
+        # 서버별 저장소(DB, 상태)는 로그인 후 on_ready 에서 서버마다 만든다 (채널이 어느 서버 소속인지 알아야 하므로)
+        # 슬래시 명령 동기화도 on_ready 에서 서버별로 한다 (바로 반영되고, 옛 전역 명령과 중복 표시되지 않음)
         group_loop.start()
         idle_loop.start()
         fight_loop.start()
@@ -196,50 +232,11 @@ class GirlBot(discord.Client):
             proactive_loop.change_interval(minutes=pcfg["check_interval_min"])
             proactive_loop.start()
 
-    async def load_state(self) -> None:
-        self.paused = (await memory.kv_get("paused", "0")) == "1"
-        ie = await memory.kv_get("idle_enabled")
-        if ie is not None:
-            self.idle_enabled = ie == "1"
-        cd = await memory.kv_get("cooldown")
-        if cd:
-            self.cooldown = float(cd)
-        ch = await memory.kv_get("channels")
-        if ch:
-            self.channels = {int(c) for c in json.loads(ch)}
-        char = await memory.kv_get("character")
-        if char:
-            persona.load(char)
-        te = await memory.kv_get("trace_enabled")
-        if te is not None:
-            engine.tracer.cfg["enabled"] = te == "1"
-        eg = await memory.kv_get("engagement")
-        if eg:
-            engine.mood.engage = max(0.5, min(4.0, float(eg)))
-        flt = await memory.kv_get("fight_level_text")
-        if flt is not None:
-            engine.fights.cfg["level_text"] = flt
-        rt = await memory.kv_get("ratio")
-        if rt:
-            ratio.set_center(float(rt))
-        ie2 = await memory.kv_get("init_enabled")
-        if ie2 is not None:
-            self.init_enabled = ie2 == "1"
-        ff = await memory.kv_get("fight_filter")
-        if ff is not None:
-            engine.fights.cfg["filter"] = ff == "1"
-        fl = await memory.kv_get("fight_level")
-        if fl in ("1", "2", "3"):
-            engine.fights.cfg["level"] = int(fl)
-        fe = await memory.kv_get("fight_enabled")
-        if fe is not None:
-            engine.fights.cfg["enabled"] = fe == "1"
-
     async def save_channels(self) -> None:
-        await memory.kv_set("channels", json.dumps(sorted(self.channels)))
+        await hub.save_channels()
 
     async def close(self) -> None:
-        await memory.close()
+        await hub.close()
         await super().close()
 
 
@@ -362,7 +359,11 @@ async def gpu_lines() -> list[tuple[str, float, float, float]]:
 
 
 async def warmup_and_report() -> None:
-    await llm.warmup(engine.warm_messages())      # 고정 프롬프트를 미리 계산해 KV 캐시에 올린다
+    seen: set[str] = set()
+    for c in list(hub.ctxs.values()):             # 고정 프롬프트를 미리 계산해 KV 캐시에 올린다 (캐릭터가 다른 서버는 각각)
+        if c.persona.char_id not in seen:
+            seen.add(c.persona.char_id)
+            await llm.warmup(c.engine.warm_messages())
     try:
         for name, size, vram, pct in await gpu_lines():
             if pct < 99:
@@ -376,14 +377,30 @@ async def warmup_and_report() -> None:
         log.warning("GPU 적재 상태 확인 실패: %s", e)
 
 
+def apply_emojis(ctx) -> None:
+    """서버별 엔진에 이모지 안내/선택기를 연결한다 (새 서버 저장소가 만들어질 때도 호출)."""
+    if ecfg.get("enabled", True) and ecfg.get("custom", True):
+        ctx.engine.emoji_hint = emojis.prompt_block(ecfg.get("max_custom_in_prompt", 40))
+        ctx.engine.mood.emoji_picker = emojis.text_token          # 감정 표현에 서버 이모지를 섞는다
+    else:
+        ctx.engine.emoji_hint = ""
+
+
+def setup_ctx(ctx) -> None:
+    apply_emojis(ctx)
+    # 대화가 바쁠 때는 기억 추출을 미룬다 (GPU 양보)
+    ctx.engine.busy_check = lambda: bool(bot.busy) or any(bot.pending.values()) or bot.gpu_lock.locked()
+
+
+hub.on_create = setup_ctx
+
+
 def refresh_emojis() -> None:
     if ecfg.get("enabled", True) and ecfg.get("custom", True):
         emojis.refresh(bot.guilds)
-        engine.emoji_hint = emojis.prompt_block(ecfg.get("max_custom_in_prompt", 40))
-        engine.mood.emoji_picker = emojis.text_token              # 감정 표현에 서버 이모지를 섞는다
         log.info("서버 커스텀 이모지 %d개 인식", len(emojis.custom))
-    else:
-        engine.emoji_hint = ""
+    for c in hub.ctxs.values():
+        apply_emojis(c)
 
 
 async def maybe_react(msg: discord.Message, chance: float, text: str | None = None) -> bool:
@@ -439,7 +456,8 @@ async def sync_commands() -> None:
 
 @bot.event
 async def on_guild_join(guild: discord.Guild) -> None:
-    """새 서버에 초대되면 그 서버에도 명령을 등록한다."""
+    """새 서버에 초대되면 그 서버의 저장소를 만들고 명령을 등록한다."""
+    await hub.ensure(guild.id, guild.name)
     for c in _ALL_COMMANDS:
         bot.tree.add_command(c, guild=guild, override=True)
     try:
@@ -449,9 +467,28 @@ async def on_guild_join(guild: discord.Guild) -> None:
         log.exception("새 서버 명령 동기화 실패")
 
 
+async def prepare_guilds() -> None:
+    """서버마다 독립된 저장소를 만든다. 서버별 분리 이전의 단일 DB 가 있으면 처음 한 번만 서버별로 나눠 가진다."""
+    def owner(cid: int):
+        ch = bot.get_channel(cid)
+        g = getattr(ch, "guild", None)
+        return g.id if g is not None else None
+    hub.owner_of = owner
+    hub.is_dm = lambda cid: isinstance(bot.get_channel(cid), discord.DMChannel)
+    legacy = Path(settings["memory"]["db_path"])
+    first_run = legacy.exists() and not (hub.root.exists() and any(hub.root.iterdir()))   # 서버별 저장소가 아직 하나도 없을 때만
+    hub.legacy_path, hub.legacy_open = legacy, bool(first_run)
+    await hub.ensure(DM, "DM")
+    for g in bot.guilds:
+        await hub.ensure(g.id, g.name)
+    await hub.finish_legacy()
+    log.info("서버별 저장소: %s", ", ".join(f"{c.name}({'dm' if c.gid == DM else c.gid})" for c in hub.ctxs.values()))
+
+
 @bot.event
 async def on_ready() -> None:
-    log.info("로그인: %s | 모델: %s | 캐릭터: %s", bot.user, llm.model, persona.name)
+    log.info("로그인: %s | 모델: %s", bot.user, llm.model)
+    await prepare_guilds()
     await sync_commands()
     refresh_emojis()
     asyncio.create_task(warmup_and_report())   # 첫 응답이 느리지 않도록 모델을 미리 올리고 GPU 적재 상태를 점검한다
@@ -490,6 +527,10 @@ def trace_recv(message: discord.Message, text: str, outcome: str, **kw) -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
+    gid = message.guild.id if message.guild else DM
+    await hub.ensure(gid, getattr(message.guild, "name", "DM"))
+    hub.use(gid)                                   # 이후 engine/memory/persona/ratio 는 이 서버의 것
+    hub.chan_guild[message.channel.id] = gid
     if not user_allowed(message.author.id):
         trace_recv(message, message.content or "", "dropped:not_allowed")
         return
@@ -721,10 +762,11 @@ def to_candidate(p: Pending, now: float, channel_id: int) -> targeting.Candidate
 @tasks.loop(seconds=0.5)
 async def group_loop() -> None:
     """채널별로 쿨다운이 끝났으면, 그동안 올라온 메시지 중 점수가 높은 사람을 골라 대답한다."""
-    if bot.paused:
-        return
     now = time.monotonic()
     for channel_id, items in list(bot.pending.items()):
+        hub.use(hub.guild_of(channel_id))          # 이 채널이 속한 서버의 설정/저장소로 처리
+        if bot.paused:
+            continue
         for p in [p for p in items if now - p.ts > gcfg["max_pending_age_sec"]]:
             park_unaddressed(channel_id, p)             # 오래 기다려도 대답 못 한 메시지는 능동 대화가 챙긴다
         items[:] = [p for p in items if now - p.ts <= gcfg["max_pending_age_sec"]]
@@ -933,6 +975,15 @@ async def run_initiative(channel_id: int, dec: initiative.Decision, snap: initia
 
 @tasks.loop(seconds=3)
 async def initiative_loop() -> None:
+    for gid in hub.gids():
+        hub.use(gid)
+        try:
+            await _initiative_tick()
+        except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
+            log.exception("initiative_loop 처리 실패 (서버 %s)", gid)
+
+
+async def _initiative_tick() -> None:
     """채널별로 침묵, 대화 속도 감소, 채팅 비율 부족, 답 못 받은 사람, 랜덤 쿨타임을 종합해 먼저 말할지 정한다."""
     if bot.paused or not bot.init_enabled or not inicfg.get("enabled", True):
         return
@@ -955,6 +1006,15 @@ async def _init_ready() -> None:
 
 @tasks.loop(minutes=15)
 async def web_loop() -> None:
+    for gid in hub.gids():
+        hub.use(gid)
+        try:
+            await _web_tick()
+        except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
+            log.exception("web_loop 처리 실패 (서버 %s)", gid)
+
+
+async def _web_tick() -> None:
     """유행어/캐릭터 소식을 백그라운드에서 미리 받아 캐시한다 (답변 속도에 영향 없음). 오래된 항목만 갱신."""
     w = engine.web
     if not w.enabled or not w.stale([engine.web_key(), "slang"]):
@@ -973,6 +1033,15 @@ async def _web_ready() -> None:
 
 @tasks.loop(seconds=5)
 async def fight_loop() -> None:
+    for gid in hub.gids():
+        hub.use(gid)
+        try:
+            await _fight_tick()
+        except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
+            log.exception("fight_loop 처리 실패 (서버 %s)", gid)
+
+
+async def _fight_tick() -> None:
     """상대가 대꾸하지 않으면 봇이 먼저 다시 도발하고(재촉), 한동안 말이 없는 싸움은 마무리한다."""
     if bot.paused:
         return
@@ -1029,6 +1098,10 @@ async def _fight_ready() -> None:
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     """봇 메시지에 누가 이모지 리액션을 달면 그에 대해 반응한다."""
+    gid = payload.guild_id or DM
+    if gid not in hub.ctxs:
+        return
+    hub.use(gid)
     if not ecfg.get("enabled", True) or bot.paused:
         return
     if (bot.user and payload.user_id == bot.user.id) or payload.channel_id not in bot.channels:
@@ -1104,6 +1177,15 @@ async def run_idle_event(channel_id: int, st: IdleState, force: bool = False) ->
 
 @tasks.loop(seconds=60)
 async def idle_loop() -> None:
+    for gid in hub.gids():
+        hub.use(gid)
+        try:
+            await _idle_tick()
+        except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
+            log.exception("idle_loop 처리 실패 (서버 %s)", gid)
+
+
+async def _idle_tick() -> None:
     """아무도 말하지 않으면 먼저 말을 꺼내고, 답이 없으면 서운해하거나 혼자 놀거나 입을 닫는 등 단계별로 반응한다."""
     if bot.paused or not bot.idle_enabled:
         return
@@ -1144,6 +1226,7 @@ async def _idle_ready() -> None:
 # ------------------ 먼저 말 걸기 (DM) ------------------
 @tasks.loop(minutes=10)
 async def proactive_loop() -> None:
+    hub.use(DM)                                    # DM 은 DM 전용 저장소
     if bot.paused:
         return
     now = engine.now()

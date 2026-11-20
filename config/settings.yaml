@@ -72,7 +72,7 @@ idle:
   active_hours: [10, 24]         # 이 시간대(KST)에만 (시작시, 끝시: 끝은 포함 안 함)
 
 memory:
-  db_path: "data/memory.db"
+  db_path: "data/memory.db"   # 서버별 분리 이전의 단일 DB 위치 (첫 실행 때 서버별로 나눈 뒤 백업). 서버별 DB 는 이 폴더 아래 guilds/<서버id>/memory.db
   history_turns: 10            # 프롬프트에 넣을 최근 채널 대화 개수(메시지 단위)
   extract_every: 10            # 유저에게 N번 대답할 때마다 장기 기억(사실) 추출
   max_facts_in_prompt: 8
@@ -221,7 +221,7 @@ web:
 #  /로그 명령으로 보기/상세/내보내기/통계, scripts/trace_report.py 로 요약 리포트.
 trace:
   enabled: true
-  dir: "data/logs"
+  dir: "data/logs"            # (서버별 저장으로 바뀌어서 실제로는 data/guilds/<서버id>/logs 를 쓴다)
   include_prompt: true         # 프롬프트 가변 부분(대화 기록+기분/기억/힌트)까지 저장 (용량이 걱정이면 false)
   retention_days: 30           # 이보다 오래된 파일은 자동 삭제 (0 = 삭제 안 함)
   max_text: 4000               # 문자열 하나의 최대 저장 길이

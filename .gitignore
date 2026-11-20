@@ -5,3 +5,4 @@ data/
 *.pyc
 AIGF_info.txt
 config/people.txt
+config/people/
