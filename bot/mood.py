@@ -190,7 +190,7 @@ EXPR: dict[str, Expr] = {
     "worried": Expr(0.45, ("ㅠㅠ", "ㅜㅜ"), "shock"),
     "anxious": Expr(0.5, ("ㅠㅠ", "ㅜㅜ", "ㅎㄷㄷ"), "shock"),
     "flustered": Expr(0.55, ("ㅇㅅㅇ", "ㅎㄷㄷ", "///"), "shock"),
-    "dumbfounded": Expr(0.45, (";;", "ㅡㅡ", "ㅇㅅㅇ"), "shock"),
+    "dumbfounded": Expr(0.45, ("ㅡㅡ", "ㅇㅅㅇ"), "shock"),
 }
 EMOTIONS = [replace(e, tone=TONES[e.id]) for e in EMOTIONS]
 EMO = {e.id: e for e in EMOTIONS}

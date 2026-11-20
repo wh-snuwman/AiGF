@@ -40,7 +40,7 @@ EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u231A\u23
 
 
 # 보호할 토큰: 멘션, 서버 이모지(:이름:), 숫자 속 . , :, 텍스트 이모티콘
-_PROTECT = re.compile(r"<[@#!&]\w+>|:[\w가-힣]{2,32}:|///|\^\^|;;|ㅡㅡ|\d[.,:]\d")
+_PROTECT = re.compile(r"<[@#!&]\w+>|:[\w가-힣]{2,32}:|///|\^\^|ㅡㅡ|\d[.,:]\d")
 
 
 def strip_symbols(t: str, lively: bool = False) -> str:
@@ -58,7 +58,7 @@ def strip_symbols(t: str, lively: bool = False) -> str:
     t = re.sub(r"[,，、]+", " ", t)
     t = re.sub(r"[.。]+", " ", t)
     t = re.sub(r"~+", "", t)
-    t = re.sub(r"[:：;]+(?=\s|$)|^[:：;]+", " ", t)
+    t = re.sub(r";{2,}|[:：;]+(?=\s|$)|^[:：;]+", " ", t)         # ';;' 같은 땀 이모티콘도 모델이 따라 하므로 걷어낸다
     if not lively:
         t = re.sub(r"[!！]+", "", t)
     return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], t)
@@ -85,6 +85,8 @@ def humanize(text: str, lively: bool = False) -> str:
     t = re.sub(r"\s+([,?!])", r"\1", t)
     t = re.sub(r"[.。]+$", "", t)                               # 문장 끝 마침표 제거
     t = re.sub(r"^[,\s]+", "", t)
+    # 말끝에 습관처럼 붙는 군더더기 '뭐' ('왜 그래 뭐' → '왜 그래'). '이게 뭐' 같은 진짜 질문은 앞말이 서술형 어미일 때만 건드린다.
+    t = re.sub(r"(?<=[어아야지래해네데까요다나])\s+뭐$", "", t.strip())
     return t.strip()
 
 
@@ -502,8 +504,9 @@ class ChatEngine:
                 else:
                     break
             m = re.search(r"[\s.,]+([가-힣A-Za-z]{1,6})[.!?~]*$", t)   # 뒤쪽: '그만해 됐어'
-            if m and _stem(m.group(1)) in banned:
-                t = t[: m.start()].rstrip(" ,.")
+            if m and _stem(m.group(1)) in banned and "?" not in t[m.start():] \
+                    and not re.search(r"(?:는|은|를|을|도|가|이|의|에|랑|라도|이나|한테)$", t[: m.start()].rstrip(" ,.")):
+                t = t[: m.start()].rstrip(" ,.")                 # (물음/조사 뒤에서 자르면 문장이 깨지므로 건드리지 않는다)
             if t and (t == before or len(re.sub(r"\W", "", t)) >= 3):   # 걷어낸 뒤 남은 말이 너무 짧으면('진짜') 버린다
                 out.append(t)
         return out
