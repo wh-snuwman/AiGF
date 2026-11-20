@@ -294,6 +294,18 @@ class ChatEngine:
         if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
             return res, None
         bubbles = self.to_bubbles(res.text, known, mode.max_bubbles, lively)
+        # 코드 차원의 말버릇 차단: 프롬프트에 '쓰지 마라'고 해도 모델이 어기면(예: 화났을 때 '됐어.' 반복) 출력에서 직접 걷어낸다.
+        if bubbles and banned:
+            stripped = self._strip_overused(bubbles, set(banned))
+            if not stripped:                       # 반복어뿐이었다 → 그 말을 빼고 한 번만 다시 생성, 또 그러면 말하지 않는다
+                retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
+                                    + "\n방금 답이 최근에 계속 쓴 말뿐이었다. 그 말은 빼고 전혀 다른 표현으로 다시 대답해라."}]
+                res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict, temperature=1.15)
+                b2 = self._strip_overused(self.to_bubbles(res2.text, known, mode.max_bubbles, lively), set(banned))
+                res2.prompt_tokens += res.prompt_tokens
+                res2.completion_tokens += res.completion_tokens
+                res, stripped = res2, b2
+            bubbles = stripped
         hits = [p for p in banned if any(p in b for b in bubbles)]
         # 속도: 다시 생성하면 응답 시간이 두 배가 된다. 기본은 꺼두고(프롬프트의 금지어 안내만 사용),
         # settings.yaml 의 quality.regen_on_repeat 를 켜면 심한 반복(3개 이상)일 때만 한 번 다시 생성한다.
@@ -314,6 +326,26 @@ class ChatEngine:
                 return res2, b2
             res.prompt_tokens, res.completion_tokens = res2.prompt_tokens, res2.completion_tokens
         return res, bubbles
+
+    @staticmethod
+    def _strip_overused(bubbles: list[str], banned: set[str]) -> list[str]:
+        """말풍선 앞/뒤에 붙은 과다어(최근에 너무 자주 쓴 말)를 제거한다. 예: '됐어. 그만해' → '그만해', '됐어' → (빈 말풍선 제거)"""
+        out: list[str] = []
+        for b in bubbles:
+            t = b.strip()
+            before = t
+            for _ in range(3):                          # 앞쪽: '됐어. 됐어 진짜' 처럼 겹쳐도 모두 제거
+                m = re.match(r"^([가-힣A-Za-z]{1,6})[\s.,!?~]*", t)
+                if m and _stem(m.group(1)) in banned:
+                    t = t[m.end():].lstrip()
+                else:
+                    break
+            m = re.search(r"[\s.,]+([가-힣A-Za-z]{1,6})[.!?~]*$", t)   # 뒤쪽: '그만해 됐어'
+            if m and _stem(m.group(1)) in banned:
+                t = t[: m.start()].rstrip(" ,.")
+            if t and (t == before or len(re.sub(r"\W", "", t)) >= 3):   # 걷어낸 뒤 남은 말이 너무 짧으면('진짜') 버린다
+                out.append(t)
+        return out
 
     async def _record(self, kind: str, res: LLMResult, target_id: int, target_name: str,
                       channel_id: int, snippet: str) -> None:
