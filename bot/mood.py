@@ -569,7 +569,6 @@ class Mood:
         """사람의 메시지를 보고 점수, 감정, 마음속 심정, 호감도를 움직인다."""
         self._tick()
         text = re.sub(r"^\(.*?에 답장\)\s*", "", text)
-        scale = 1.0 if directed else 0.25
         changed = False
         contagious = False
         first_special: Optional[Rule] = None       # RULES 순서가 우선순위 (모욕 > 칭찬 > ...)
