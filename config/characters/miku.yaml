@@ -98,3 +98,9 @@ fight_replies:
   - "미쿠는 그런 말 싫어"
   - "흥 말 안 해줄 거야"
   - "아 진짜 짜증나"
+
+# 가끔 인터넷에서 미리 받아 둘 '나 자신' 관련 검색어 (bot/web.py, 최대 4개)
+web_topics: ["하츠네 미쿠 최신 소식", "보컬로이드 신곡 화제"]
+
+# 감정 표현 프리셋 (config/emotions.yaml). 바꾸고 싶은 감정만 `emotions:` 로 덮어쓸 수 있다
+emotion_preset: energetic

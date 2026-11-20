@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ class LLM:
         self.model = cfg["model"]
         self.keep_alive = cfg.get("keep_alive", "24h")
         self.options = cfg.get("options", {})
+        self.temp_jitter = float(cfg.get("temp_jitter", 0.0))     # 호출마다 temperature 를 ±흔들어 말투 고착을 막는다
         # 최근 응답 시간 통계 (/상태 에서 평균 표시): (총, 로드, 프롬프트, 생성) 초
         self.stats: deque[tuple[float, float, float, float]] = deque(maxlen=30)
 
@@ -50,6 +52,8 @@ class LLM:
     async def chat(self, messages: list[dict[str, Any]], images: Optional[list[bytes]] = None,
                    **override: Any) -> LLMResult:
         opts = {**self.options, **override}
+        if self.temp_jitter and "temperature" not in override and "temperature" in opts:
+            opts["temperature"] = max(0.5, min(1.3, float(opts["temperature"]) + random.uniform(-self.temp_jitter, self.temp_jitter)))
         msgs = messages
         if images:                                   # 마지막 사용자 메시지에 이미지를 붙인다
             msgs = [dict(m) for m in messages]

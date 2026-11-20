@@ -98,3 +98,9 @@ fight_replies:
   - "아 진짜 짜증나게 하네"
   - "그건 연습이었거든"
   - "꺼져 빵이나 사 와"
+
+# 가끔 인터넷에서 미리 받아 둘 '나 자신' 관련 검색어 (bot/web.py, 최대 4개)
+web_topics: ["카사네 테토 최신 소식", "UTAU 테토 화제"]
+
+# 감정 표현 프리셋 (config/emotions.yaml). 바꾸고 싶은 감정만 `emotions:` 로 덮어쓸 수 있다
+emotion_preset: tsundere

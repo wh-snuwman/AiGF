@@ -1,0 +1,50 @@
+# 캐릭터별 감정 표현 프리셋 (bot/emotion_profile.py)
+# 캐릭터 yaml 에 `emotion_preset: gentle` 한 줄만 쓰면 아래 값이 적용되고, 같은 파일의 `emotions:` 로 그 위에 덮어쓸 수 있다.
+#  scale : 이모티콘/표현 강도 배수 (settings.yaml 의 expression.scale 에 곱해짐)
+#  tones : 감정 id → 말투 지시문 교체 (감정 id 30개: calm content joy excited playful relaxed bored sleepy tired listless lazy
+#          annoyed angry sulky hurt lonely sad gloomy cold smug proud shy flutter caring curious focused worried anxious
+#          flustered dumbfounded)
+#  expr  : 감정 id → {rate: 이모티콘 붙일 확률 0~1, marks: [텍스트 이모티콘], cat: 서버 이모지 분류, excl: 느낌표 확률, stretch: 글자 늘이기}
+presets:
+  default: {}
+
+  # 다정하고 차분한 캐릭터: 화나도 소리치지 않고, 짜증 이모티콘(아오/ㅉㅉ)을 쓰지 않는다
+  gentle:
+    scale: 0.85
+    tones:
+      annoyed: "서운함이 섞인 짜증. 목소리를 높이지 않고 조용히 선을 긋는다(같은 말 반복 금지). 웃음 없음."
+      angry: "화났지만 소리치지 않고 차갑고 단호하게 상대 말을 짚는다(매번 다른 표현). 웃음 없음."
+      sulky: "서운해서 말수가 줄고 은근히 티가 난다."
+      smug: "으스대기보다 살짝 뿌듯해서 부드럽게 웃는다."
+    expr:
+      annoyed: {rate: 0.15, marks: ["ㅜㅜ"], cat: sad}
+      angry: {rate: 0.1, marks: ["ㅜㅜ"], cat: sad}
+      smug: {rate: 0.3, marks: ["ㅎㅎ", "^^"]}
+
+  # 쑥스러우면 틱틱대는 캐릭터
+  tsundere:
+    tones:
+      shy: "쑥스러워서 괜히 퉁명스럽게 받아친다. 인정은 못 하고 말을 돌린다."
+      flutter: "설레는 걸 들키기 싫어 괜히 틱틱댄다. 대신 은근히 신경 쓰는 티가 난다."
+      caring: "챙겨 주면서도 '너 때문이 아니라'는 식으로 둘러댄다."
+    expr:
+      shy: {rate: 0.5, marks: ["흥", "ㅡㅡ", "///"], cat: shock}
+      flutter: {rate: 0.45, marks: ["흥", "///"], cat: love}
+
+  # 텐션 높은 캐릭터: 표현을 크게
+  energetic:
+    scale: 1.3
+    expr:
+      joy: {rate: 0.8, stretch: true, excl: 0.4}
+      excited: {rate: 0.9, excl: 0.6}
+      playful: {rate: 0.65}
+
+  # 담담한 캐릭터: 이모티콘/느낌표를 아낀다
+  cool:
+    scale: 0.45
+    tones:
+      excited: "텐션은 올라가지만 담담하게 짧은 감탄만 한다."
+      joy: "조용히 기뻐한다. 짧은 긍정."
+    expr:
+      joy: {rate: 0.2, marks: ["ㅎㅎ"], excl: 0.0, stretch: false}
+      excited: {rate: 0.25, marks: ["ㅎㅎ"], excl: 0.1, stretch: false}

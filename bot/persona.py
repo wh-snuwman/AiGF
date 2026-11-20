@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -161,11 +162,16 @@ class Persona:
             who = "(지금은 네가 먼저 말을 꺼내는 상황)\n"
         return f"[지금] {now_str}\n{scene or '(대화 시작)'}\n{who}{mood or '기분:평온'}"
 
-    def example_messages(self, limit: int | None = None) -> list[dict[str, str]]:
-        """few-shot 예시. 속도를 위해 앞에서부터 limit 쌍만 쓴다 (항상 같은 순서라 캐시에도 유리)."""
+    def example_messages(self, limit: int | None = None, rotate_min: float = 0) -> list[dict[str, str]]:
+        """few-shot 예시. limit 쌍만 쓴다. 예시가 limit 보다 많으면 rotate_min 분마다 다른 조합/순서로 바꾼다
+        (고정 예시를 계속 보여 주면 시작 단어·문장 틀을 복사하는 정형행동이 생긴다. 같은 시간대 안에서는
+        항상 같은 조합이라 KV 캐시는 유지된다. rotate_min=0 이면 앞에서부터 고정.)"""
         default_who = self.data.get("example_user", "유저")
         msgs: list[dict[str, str]] = []
-        exs = self.data.get("examples", []) or []
+        exs = list(self.data.get("examples", []) or [])
+        if limit and rotate_min and len(exs) > limit:
+            slot = int(time.time() // (float(rotate_min) * 60))
+            exs = random.Random(f"{self.char_id}:{slot}").sample(exs, limit)
         for ex in (exs[:limit] if limit else exs):
             who = ex.get("who", default_who)
             msgs.append({"role": "user", "content": f"{who}: {str(ex['user']).strip()}"})

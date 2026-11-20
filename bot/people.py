@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from .memory import Memory
@@ -33,6 +34,11 @@ HEADER = """\
 """
 
 
+def _clean(s: str) -> str:
+    """프롬프트에 들어가는 이름/인식 문구에서 제어문자, 백틱, 꺾쇠/대괄호 같은 구조 문자를 없앤다 (프롬프트 오염 방지)."""
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f`<>{}\[\]|]", " ", s)).strip()
+
+
 def parse(text: str) -> tuple[dict[int, tuple[str, str | None]], dict[int, str], list[str]]:
     names: dict[int, tuple[str, str | None]] = {}
     views: dict[int, str] = {}
@@ -48,12 +54,12 @@ def parse(text: str) -> tuple[dict[int, tuple[str, str | None]], dict[int, str],
             errors.append(f"{no}번째 줄: '유저아이디:이름:이미지' 형식이 아니에요 → {raw.strip()[:40]}")
             continue
         uid = int(uid_s)
-        name = parts[1].strip()
-        image = parts[2].strip() if len(parts) > 2 else ""
+        name = _clean(parts[1])[:30]
+        image = _clean(parts[2])[:300] if len(parts) > 2 else ""
         if name:
             names[uid] = (name, None)
         if image:
-            views[uid] = image[:300]
+            views[uid] = image
     return names, views, errors
 
 

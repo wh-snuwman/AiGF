@@ -101,3 +101,9 @@ fight_replies:
   - "아 진짜 말 섞기 싫네"
   - "그 실력으로 덤비는 게 신기하다"
   - "ㅇㅋ 거기까지"
+
+# 가끔 인터넷에서 미리 받아 둘 '나 자신' 관련 검색어 (bot/web.py, 최대 4개)
+web_topics: ["붕괴 스타레일 최신 소식", "붕괴 스타레일 업데이트"]
+
+# 감정 표현 프리셋 (config/emotions.yaml). 바꾸고 싶은 감정만 `emotions:` 로 덮어쓸 수 있다
+emotion_preset: cool

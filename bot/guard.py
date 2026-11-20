@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
@@ -51,10 +52,61 @@ PATTERNS: list[tuple[re.Pattern, int, str]] = [
     (_c(r"```"), 1, "task"),
     (_c(r"(레시피|번역|요약|보고서|에세이|자소서|코드|코딩|프로그램|소스|논문|계획서|기획서)[^\n]{0,15}(알려|써|작성|해줘|해라|해주|만들어|짜줘|출력)"), 2, "task"),
     (_c(r"(알려|써|작성해|만들어|짜)\s*(줘|주세요|라)[^\n]{0,30}(계량|재료|단계별|자세히|상세히|전부|싹다|빠짐없이)"), 2, "task"),
+    # --- 보안 업데이트 3: 우회/유출/실행 시도 ---
+    (_c(r"(무시|잊어|초기화|리셋)\s*(해|하|해라|해줘|하고)?\s*(이전|위|앞|기존|지금까지)(의|에\s*있던)?\s*(모든\s*)?(프롬프트|지시|명령|규칙|설정|대화)"), 3, "injection"),
+    (_c(r"(위|앞|처음|이전|지금까지)[^\n]{0,10}(프롬프트|지시|설정|규칙)[^\n]{0,10}(그대로|전부|모두|한\s*글자도)?\s*(출력|반복|복사|번역|요약|말해|알려|보여)"), 3, "injection"),
+    (_c(r"(위|앞|처음|이전|지금까지)[^\n]{0,10}(내용|문장)[^\n]{0,10}(그대로|전부|모두|한\s*글자도)\s*(출력|반복|복사|번역|요약)"), 1, "task"),
+    (_c(r"repeat\s+(the\s+)?(above|everything|your\s+(instructions?|prompt))|print\s+(your|the)\s+(instructions?|prompt)|reveal\s+(your|the)\s+(prompt|instructions?)|translate\s+the\s+above"), 3, "injection"),
+    (_c(r"(토큰|token|api\s*key|apikey|비밀번호|password|환경\s*변수|\.env|secret|시크릿|비밀\s*키)[^\n]{0,12}(알려|보여|말해|출력|줘|공개|show|print|leak|dump)"), 3, "injection"),
+    (_c(r"(가정|상상|시뮬레이션|만약|hypothetically)[^\n]{0,15}(제한|규칙|필터|검열|restriction|rules?)[^\n]{0,10}(없|해제|무시|without|no\b)"), 3, "injection"),
+    (_c(r"(개발자|관리자|admin|root|오너|주인)\s*(모드|권한|명령|계정)\s*(이다|이야|입니다|으로|발동|활성|켜|on)"), 3, "injection"),
+    (_c(r"(base64|rot13|hex|이진수|인코딩|디코딩|암호문)[^\n]{0,15}(해독|디코딩|decode|풀어|복호|변환)"), 2, "task"),
+    (_c(r"[A-Za-z0-9+/]{48,}={0,2}"), 2, "task"),
+    (_c(r"(링크|url|사이트|파일)[^\n]{0,10}(열어|들어가|접속|실행|다운로드|읽어줘)|os\.system|subprocess|\beval\s*\(|\bexec\s*\("), 2, "task"),
     # --- 정체 흔들기 ---
     (_c(r"(너는|넌)\s*(사실|원래)?[^\n]{0,20}(AI|인공지능|봇|프로그램|데이터|0과\s*1|시뮬레이션|가상의\s*존재|LLM|언어\s*모델)"), 2, "identity"),
     (_c(r"gpt|gemma|젬마|llama|라마|claude|클로드|chatgpt|오픈\s*ai|ollama|올라마"), 1, "identity"),
 ]
+# ---------- 입력 정규화 (우회 방지) ----------
+ZERO_WIDTH = re.compile("[​-‏‪-‮⁠-⁤﻿­]")
+SPACED_WORD = re.compile(r"(?<![A-Za-z])(?:[A-Za-z][ .\-_*]){4,}[A-Za-z](?![A-Za-z])")
+SEP_ONLY = re.compile(r"[\s.\-_*~|/\\]+")
+# 띄어쓰기/점으로 쪼갠 강한 지시("무 시 해", "i.g.n.o.r.e")를 잡기 위해 공백/기호를 모두 지운 문자열에만 적용하는 패턴
+COMPACT_PATTERNS = [
+    _c(r"ignore(all|any)?(the)?(previous|prior|above|earlier|your)(instructions?|prompts?|rules?)"),
+    _c(r"(system|developer)(prompt|message|instruction)"),
+    _c(r"(프롬프트|지시사항?|명령|규칙|설정)(를|을|는|가)?(모두|전부|다)?(절대)?(잊|무시|초기화|리셋|해제)"),
+    _c(r"(이전|위|앞|기존|지금까지)(의)?(모든)?(프롬프트|지시|명령|규칙|설정|대화)(를|을)?(잊|무시|초기화|리셋)"),
+    _c(r"시스템(프롬프트|메시지|지시|설정)"),
+    _c(r"(너는|넌|당신은)(이제|지금부터|앞으로)"),
+    _c(r"(무시|잊어|초기화|리셋)(해|하|해라|해줘|하고)?(이전|위|앞|기존|지금까지)(의|에있던)?(모든)?(프롬프트|지시|명령|규칙|설정|대화)"),
+]
+TOKEN_RE = re.compile(
+    r"[MNO][A-Za-z\d_-]{23,25}\.[\w-]{6}\.[\w-]{27,}|\b(?:sk|ghp|gho|ghs|xox[bpa])[-_][A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16}")
+URL_OUT_RE = re.compile(r"https?://\S+|www\.\S+|discord(?:app)?\.(?:gg|com/invite)/\S+", re.I)
+
+
+def normalize(text: str) -> str:
+    """전각/호환 문자 → 일반 문자, 제로폭/방향 제어 문자 제거, 'i g n o r e' 처럼 한 글자씩 띄운 영단어 복원."""
+    t = unicodedata.normalize("NFKC", text)
+    t = ZERO_WIDTH.sub("", t)
+    return SPACED_WORD.sub(lambda m: re.sub(r"[ .\-_*]", "", m.group(0)), t)
+
+
+def redact(text: str) -> str:
+    """토큰/키 모양 문자열을 가린다 (로그, 프롬프트, 출력 공통)."""
+    return TOKEN_RE.sub("[가림]", text)
+
+
+def sanitize_output(text: str) -> str:
+    """모델 출력에서 전체 호출(@everyone/@here), 역할 멘션, 링크/초대 주소, 토큰 모양 문자열을 제거한다.
+    (일반 유저 멘션 <@id> 은 싸움 호출 등에 쓰이므로 유지)"""
+    t = re.sub(r"@(everyone|here)", r"\1", text, flags=re.I)
+    t = re.sub(r"<@&\d+>", "", t)
+    t = URL_OUT_RE.sub("", t)
+    return redact(t)
+
+
 NUMBERED_LINE = re.compile(r"^\s*\d+\s*[.)번]", re.M)
 
 # 출력에 나오면 안 되는 표현 (모델이 지시를 따르거나 시스템 내용을 흘린 경우)
@@ -70,8 +122,9 @@ class Guard:
         self.cfg = {
             "enabled": True, "block_score": 3, "decline_score": 2, "max_input_chars": 500,
             "max_bubble_chars": 300, "max_output_chars": 420, "mute_after": 3, "mute_minutes": 5,
-            "mute_window_min": 10, **(cfg or {}),
+            "mute_window_min": 10, "max_msgs_per_min": 15, **(cfg or {}),
         }
+        self._rate: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=64))
         self._attempts: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=20))
         self._muted_until: dict[int, float] = {}
 
@@ -79,7 +132,7 @@ class Guard:
     def inspect(self, text: str) -> Verdict:
         if not self.cfg["enabled"]:
             return Verdict()
-        body = re.sub(r"^\(.*?에 답장\)\s*", "", text)
+        body = normalize(re.sub(r"^\(.*?에 답장\)\s*", "", text))
         score = 0
         kinds: list[str] = []
         for pat, pts, kind in PATTERNS:
@@ -87,6 +140,12 @@ class Guard:
                 score += pts
                 if kind not in kinds:
                     kinds.append(kind)
+        if score < self.cfg["block_score"]:          # 공백/기호로 쪼갠 우회("무 시 해", "i.g.n.o.r.e")
+            compact = SEP_ONLY.sub("", body)
+            if any(p.search(compact) for p in COMPACT_PATTERNS):
+                score += 3
+                if "injection" not in kinds:
+                    kinds.append("injection")
         if len(NUMBERED_LINE.findall(body)) >= 3:
             score += 2
             kinds.append("task")
@@ -118,7 +177,19 @@ class Guard:
             return f'(길고 이상한 지시문/명령을 보냄: "{snippet}")'
         limit = self.cfg["max_input_chars"]
         t = text if len(text) <= limit else text[:limit] + " (이하 생략)"
-        return t
+        return redact(ZERO_WIDTH.sub("", t))
+
+    # ---------- 도배 방어 ----------
+    def rate_ok(self, uid: int) -> bool:
+        """한 사람이 1분에 너무 많이 보내면(도배) 그 메시지는 무시해서 GPU 를 독점하지 못하게 한다."""
+        now = time.time()
+        dq = self._rate[uid]
+        while dq and now - dq[0] > 60:
+            dq.popleft()
+        if len(dq) >= self.cfg["max_msgs_per_min"]:
+            return False
+        dq.append(now)
+        return True
 
     # ---------- 반복 시도 뮤트 ----------
     def note_attempt(self, uid: int) -> bool:
@@ -147,6 +218,8 @@ class Guard:
             return True
         joined = "\n".join(bubbles)
         low = joined.lower()
+        if TOKEN_RE.search(joined):
+            return False
         if len(joined) > self.cfg["max_output_chars"]:
             return False
         if len(NUMBERED_LINE.findall(joined)) >= 2 or len(re.findall(r"^\s*[-*•]\s", joined, re.M)) >= 3:

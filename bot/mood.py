@@ -21,6 +21,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
+from .config import load_yaml
+from .emotion_profile import EmotionProfile, build_profile
 from .memory import Memory
 
 log = logging.getLogger("mood")
@@ -310,7 +312,30 @@ class Mood:
         self.expr_scale = 1.0             # 이모티콘/표현 강도 배수 (settings.yaml expression.scale)
         self.emoji_picker = None          # callable(카테고리)->':이름:' (서버 커스텀 이모지 선택, main 이 설정)
         self._deco_ts = 0.0               # 마지막으로 이모티콘을 붙인 시각 (연속 남발 억제)
+        self._prof: Optional[EmotionProfile] = None
+        self._legacy_ok = True
+        self._prof_key: tuple = ()
         self.s: dict[str, float] = self.baseline()
+
+    # ---------- 캐릭터별 감정 표현 프로필 ----------
+    @property
+    def profile(self) -> EmotionProfile:
+        """기본값 + config/emotions.yaml 프리셋 + 캐릭터 yaml 의 emotions. persona.data 가 바뀌면(스왑/리로드) 자동으로 다시 만든다."""
+        data = self.persona.data if self.persona else {}
+        key = (getattr(self.persona, "char_id", ""), id(data))
+        if self._prof_key != key:
+            try:
+                presets = (load_yaml("emotions.yaml").get("presets") or {})
+            except Exception:  # noqa: BLE001
+                presets = {}
+            self._prof = build_profile(data, presets, TONES, EXPR, key[0])
+            self._prof_key = key
+            for w in self._prof.warnings:
+                log.warning("감정 설정: %s", w)
+        return self._prof
+
+    def tone_of(self, emo_id: str) -> str:
+        return self.profile.tone(emo_id, EMO[emo_id].tone)
 
     # ---------- 기준값 / 저장 ----------
     def baseline(self) -> dict[str, float]:
@@ -349,8 +374,28 @@ class Mood:
             self.override = None
         self._save()
 
+    def _state_key(self) -> str:
+        """캐릭터마다 기분/호감도를 따로 저장한다 (스왑해도 각자의 상태가 유지됨)."""
+        return f"mood_state:{self.persona.char_id}" if self.persona else "mood_state"
+
+    async def switch(self) -> None:
+        """persona 가 다른 캐릭터로 바뀐 직후 호출: 새 캐릭터의 저장된 상태를 불러오고, 처음이면 그 캐릭터의 기준값으로 시작한다.
+        (바꾸기 전에 mood._save() 를 호출해 두면 이전 캐릭터 상태가 이전 키로 저장된다.)"""
+        self.override = None
+        self.thoughts.clear()
+        self.recent.clear()
+        self.aff = {}
+        self.cur_id = "calm"
+        self.last_ts = time.time()
+        self._legacy_ok = False
+        self.s = self.baseline()
+        await self.load()
+
     async def load(self) -> None:
-        raw = await self.mem.kv_get("mood_state")
+        raw = await self.mem.kv_get(self._state_key())
+        if not raw and self._legacy_ok:
+            raw = await self.mem.kv_get("mood_state")      # 예전(캐릭터 공용) 저장값은 처음 한 번만 이어받는다
+            self._legacy_ok = False
         if not raw:
             return
         try:
@@ -368,7 +413,7 @@ class Mood:
         data = json.dumps({"s": self.s, "cur": self.cur_id, "override": self.override, "ts": self.last_ts,
                            "aff": {str(k): round(v, 3) for k, v in self.aff.items()}})
         try:
-            t = asyncio.get_running_loop().create_task(self.mem.kv_set("mood_state", data))
+            t = asyncio.get_running_loop().create_task(self.mem.kv_set(self._state_key(), data))
         except RuntimeError:
             return
         self._tasks.add(t)
@@ -497,17 +542,18 @@ class Mood:
         if uid is not None:
             label, guide = self.aff_label(self.affinity(uid))
             lines.append(f"{who or '상대'} 호감도:{label}→{guide}")
-        lines.append(f"말투:{e.tone} [{' '.join(self.knobs(uid))}]")
+        lines.append(f"말투:{self.tone_of(e.id)} [{' '.join(self.knobs(uid))}]")
         return "\n".join(lines)
 
     def decorate(self, text: str, is_last: bool = True) -> str:
         """감정에 맞는 텍스트 이모티콘/서버 이모지/글자 늘이기/느낌표를 코드로 붙인다.
         기쁠 땐 ㅋㅋㅋㅋ·ㅎㅎ·! 를 적극적으로, 슬플 땐 ㅠㅠ 를 섞고, 짜증/냉담은 거의 붙이지 않는다. 감정 강도가 높을수록 자주 붙는다."""
-        x = EXPR.get(self.current().id)
+        x = self.profile.expr.get(self.current().id)
         if not x or not text:
             return text
         inten = 0.55 + 0.9 * self.intensity()                   # 0.55 ~ 1.45
-        rate = x.rate * self.expr_scale * inten * (1.0 if is_last else 0.3)
+        scale = self.expr_scale * self.profile.scale             # 전체 설정 x 캐릭터 프리셋
+        rate = x.rate * scale * inten * (1.0 if is_last else 0.3)
         if time.time() - self._deco_ts < 150:
             rate *= 0.25                                         # 방금도 붙였으면 연달아 붙이지 않는다
         out = text
@@ -515,7 +561,7 @@ class Mood:
             out = re.sub(r"ㅋ{2,3}(?!ㅋ)", lambda m: "ㅋ" * random.randint(3, 5) if random.random() < 0.6 else m.group(0), out)
             out = re.sub(r"ㅠ{2}(?!ㅠ)", lambda m: "ㅠ" * random.randint(2, 4) if random.random() < 0.4 else m.group(0), out)
         already = re.search(r"([ㅠㅜㅋㅎㅡㅇ]{2,}|[;^]{2,}|/{3}|:[\w가-힣]+:|zzz)\s*$", out)
-        if is_last and not already and x.excl and random.random() < x.excl * self.expr_scale and not out.endswith(("?", "!")):
+        if is_last and not already and x.excl and random.random() < x.excl * scale and not out.endswith(("?", "!")):
             out += "!"
         if not already and random.random() < rate:
             tok = None

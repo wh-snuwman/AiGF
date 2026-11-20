@@ -17,6 +17,7 @@ from discord.ext import tasks
 
 from . import initiative, targeting, vision
 from .chat import ChatEngine
+from .guard import redact
 from .config import discord_token, load_settings
 from .emoji import Emojis
 from .fight import Fight
@@ -31,6 +32,24 @@ logging.basicConfig(
     level=getattr(logging, settings.get("log_level", "INFO")),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+
+class _RedactFilter(logging.Filter):
+    """로그에 토큰/API 키 모양 문자열이 찍히면 가린다."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            red = redact(msg)
+            if red != msg:
+                record.msg, record.args = red, ()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_RedactFilter())
 log = logging.getLogger("bot")
 
 dcfg = settings["discord"]
@@ -126,7 +145,9 @@ class AdminTree(app_commands.CommandTree):
 
 class GirlBot(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=intents)
+        # 보안: 모델이 뭐라고 쓰든 @everyone/@here/역할 호출은 발송되지 않게 하고, 유저 멘션(싸움 호출)과 답장 알림만 허용한다
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions(
+            everyone=False, roles=False, users=True, replied_user=True))
         self.tree = AdminTree(self)
         self.started_at = time.time()
         self.gpu_lock = engine.gpu_lock
@@ -168,6 +189,7 @@ class GirlBot(discord.Client):
         idle_loop.start()
         fight_loop.start()
         initiative_loop.start()
+        web_loop.start()
         if pcfg["enabled"]:
             proactive_loop.change_interval(minutes=pcfg["check_interval_min"])
             proactive_loop.start()
@@ -443,6 +465,8 @@ async def on_message(message: discord.Message) -> None:
     # 명령/주입을 반복 시도한 사람은 잠시 무시한다 (관리자는 제외)
     if engine.guard.is_muted(message.author.id) and message.author.id not in ADMIN_IDS:
         return
+    if message.author.id not in ADMIN_IDS and not engine.guard.rate_ok(message.author.id):
+        return                                  # 도배(1분에 너무 많은 메시지)는 무시해서 GPU 독점을 막는다
 
     # ----- DM: 1:1 이므로 바로 대답 -----
     if isinstance(message.channel, discord.DMChannel):
@@ -852,6 +876,24 @@ async def _init_ready() -> None:
     await bot.wait_until_ready()
 
 
+@tasks.loop(minutes=15)
+async def web_loop() -> None:
+    """유행어/캐릭터 소식을 백그라운드에서 미리 받아 캐시한다 (답변 속도에 영향 없음). 오래된 항목만 갱신."""
+    w = engine.web
+    if not w.enabled or not w.stale([engine.web_key(), "slang"]):
+        return
+    try:
+        await w.refresh(engine.web_topics())
+    except Exception:  # noqa: BLE001
+        log.exception("웹 정보 갱신 실패")
+
+
+@web_loop.before_loop
+async def _web_ready() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(45)                      # 시작 직후 모델 웜업과 겹치지 않게
+
+
 @tasks.loop(seconds=5)
 async def fight_loop() -> None:
     """상대가 대꾸하지 않으면 봇이 먼저 다시 도발하고(재촉), 한동안 말이 없는 싸움은 마무리한다."""
@@ -1158,8 +1200,10 @@ async def swap_character(
         await interaction.response.send_message(
             "없는 캐릭터예요. 목록: " + ", ".join(sorted(ids)), ephemeral=True)
         return
+    engine.mood._save()                 # 지금 캐릭터의 기분/호감도를 먼저 저장 (캐릭터마다 따로 저장됨)
     persona.load(character)
-    engine.mood.reset()                 # 새 캐릭터의 기준 기분으로 시작
+    await engine.mood.switch()          # 새 캐릭터의 저장된 기분을 불러오고, 처음이면 그 캐릭터의 기준 기분으로 시작
+    engine.div._lines.clear()           # 이전 캐릭터가 했던 말은 반복 감시 대상이 아니다
     engine.fights.stop_all()            # 진행 중인 말싸움은 종료
     await memory.kv_set("character", persona.char_id)
     if clear_history:
@@ -1195,8 +1239,10 @@ async def status(interaction: discord.Interaction, action: Optional[app_commands
         persona.reload()
         n = engine.people.reload()
         err = ("\n형식 오류: " + "; ".join(engine.people.errors[:4])) if engine.people.errors else ""
+        ew = engine.mood.profile.warnings
+        err += ("\n감정 설정 경고: " + "; ".join(ew[:4])) if ew else ""
         await interaction.response.send_message(
-            f"다시 불러왔어요. 캐릭터 **{persona.name}** (`{persona.char_id}`), people.txt {n}명.{err}", ephemeral=True)
+            f"다시 불러왔어요. 캐릭터 **{persona.name}** (`{persona.char_id}`) · 감정 프리셋 `{engine.mood.profile.preset}`, people.txt {n}명.{err}", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1220,6 +1266,7 @@ async def status(interaction: discord.Interaction, action: Optional[app_commands
              if avg else "아직 기록 없음")
     nf = len(engine.fights.active)
     lvl = engine.fights.cfg.get("level_text") or engine.fights.cfg["level"]
+    div_line = " / ".join(f"<#{c}> {engine.div.stats(c)}" for c in sorted(bot.channels)[:3]) or "기록 없음"
     await interaction.followup.send(
         f"**봇 상태** {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
         f"- 캐릭터 **{persona.name}** (`{persona.char_id}`) · 모델 `{llm.model}` · 기분 {engine.mood.current().label}\n"
@@ -1227,6 +1274,8 @@ async def status(interaction: discord.Interaction, action: Optional[app_commands
         f"- 적극성 {engine.mood.engage:g} · 쿨다운 {bot.cooldown:g}초 · 채팅 비율(현재/목표): {ratios}\n"
         f"- 먼저 말걸기: {'켜짐' if bot.init_enabled else '꺼짐'} (10~24시) · 혼잣말 이벤트 {'켜짐' if bot.idle_enabled else '꺼짐'}\n"
         f"- 말싸움: {'켜짐' if engine.fights.cfg['enabled'] else '꺼짐'} (수위 {trunc(str(lvl), 30)}) · 진행 중 {nf}건\n"
+        f"- 감정 프리셋 `{engine.mood.profile.preset}` · 웹 정보 {'켜짐' if engine.web.enabled else '꺼짐'}\n"
+        f"- 반복 감시: {div_line}\n"
         f"- 서버 이모지 {len(emojis.custom)}개 · 이미지 인식 {'켜짐' if vcfg.get('enabled', True) else '꺼짐'}\n"
         f"- 대화 채널: {ch}\n"
         f"- 대기 메시지 {pend}개 · 저장 기록 {fmt(total_msgs)}개({n_ch}개 채널) · 가동 {fmt_uptime(time.time() - bot.started_at)} · 지연 {bot.latency * 1000:.0f}ms\n"
@@ -1384,7 +1433,7 @@ async def mood_cmd(
         f"외로움 {bar(sc['lonely'])} {sc['lonely']}",
         f"흥미   {bar(sc['interest'])} {sc['interest']}",
         "```",
-        f"말투: {e.tone}",
+        f"말투: {engine.mood.tone_of(e.id)}",
         "조절: " + " / ".join(snap["knobs"]),
         "마음속: " + (" / ".join(snap["thoughts"]) if snap["thoughts"] else "(특별한 일 없음)"),
         f"-# 타이핑 속도 x{e.speed:g} · 끼어들기 x{e.reply:g} · 쿨다운 x{e.cooldown:g}",
@@ -1570,6 +1619,36 @@ async def idle_cmd(
     finally:
         bot.busy.discard(target.id)
     await interaction.followup.send(f"실행 결과: {result}", ephemeral=True)
+
+
+# ---- 12. 웹 (인터넷 정보) ----
+@bot.tree.command(name="웹", description="유행어/최신 정보 가져오기를 켜고 끄거나, 새로고침/현황을 봐요")
+@app_commands.describe(action="보기(기본) / 켜기 / 끄기 / 새로고침")
+@app_commands.rename(action="동작")
+@app_commands.choices(action=[
+    app_commands.Choice(name="보기", value="show"),
+    app_commands.Choice(name="켜기", value="on"),
+    app_commands.Choice(name="끄기", value="off"),
+    app_commands.Choice(name="새로고침", value="refresh"),
+])
+async def web_cmd(interaction: discord.Interaction, action: Optional[app_commands.Choice[str]] = None) -> None:
+    w = engine.web
+    act = action.value if action else "show"
+    if act in ("on", "off"):
+        w.set_enabled(act == "on")
+        await memory.kv_set("web_enabled", "1" if w.enabled else "0")
+        await interaction.response.send_message(f"웹 정보를 {'켰' if w.enabled else '껐'}어요.", ephemeral=True)
+        return
+    if act == "refresh":
+        await interaction.response.defer(ephemeral=True)
+        n = await w.refresh(engine.web_topics())
+        await interaction.followup.send(f"새로 받은 항목 {n}개. {w.summary()}" + (f"\n오류: {w.last_error}" if w.last_error else ""),
+                                        ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"**웹 정보** {'켜짐' if w.enabled else '꺼짐'} · 방식 {w.cfg['provider']} · 캐시: {w.summary()}\n"
+        f"사용 확률 {int(w.cfg['chance'] * 100)}% · 실시간 조회 {'허용' if w.cfg.get('realtime') else '안 함'}"
+        f" (제한 {w.cfg['timeout_sec']}초, 분당 {w.cfg['per_min']}회)" + (f"\n최근 오류: {w.last_error}" if w.last_error else ""), ephemeral=True)
 
 
 def run() -> None:
