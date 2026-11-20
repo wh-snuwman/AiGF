@@ -46,13 +46,15 @@ def _backend_searxng(base: str, query: str, n: int) -> list[tuple[str, str]]:
 
 
 class WebInfo:
-    def __init__(self, cfg: dict | None, memory, guard=None, backend: Callable[[str, int], list] | None = None) -> None:
+    def __init__(self, cfg: dict | None, memory, guard=None, backend: Callable[[str, int], list] | None = None,
+                 kv_key: str = "web_cache") -> None:
         self.cfg = {
             "enabled": True, "provider": "ddgs", "searxng_url": "", "chance": 0.12, "refresh_hours": 6,
             "timeout_sec": 2.5, "refresh_timeout_sec": 8, "per_min": 2, "max_items": 3, "item_chars": 100,
             "slang_queries": ["요즘 유행어 신조어", "요즘 유행하는 밈"], "realtime": True, **(cfg or {}),
         }
         self.mem = memory
+        self.kv_key = kv_key                       # 캐릭터마다 따로 저장 (서버에 캐릭터가 여럿이어도 서로 덮어쓰지 않게)
         self.guard = guard
         self._backend = backend
         self.cache: dict[str, dict] = {}
@@ -69,7 +71,7 @@ class WebInfo:
         self.cfg["enabled"] = on
 
     async def load(self) -> None:
-        raw = await self.mem.kv_get("web_cache")
+        raw = await self.mem.kv_get(self.kv_key)
         if raw:
             try:
                 self.cache = json.loads(raw)
@@ -80,7 +82,7 @@ class WebInfo:
             self.cfg["enabled"] = flag == "1"
 
     async def _save(self) -> None:
-        await self.mem.kv_set("web_cache", json.dumps(self.cache, ensure_ascii=False))
+        await self.mem.kv_set(self.kv_key, json.dumps(self.cache, ensure_ascii=False))
 
     # ---------- 검색 ----------
     def _search_sync(self, query: str, n: int) -> list[tuple[str, str]]:

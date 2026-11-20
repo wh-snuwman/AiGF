@@ -230,3 +230,16 @@ trace:
 style:
   short_bias: 1.6              # 1.0=기존, 클수록 짧은 답(초단문/한 줄) 비중이 커짐
   trim: true                   # 말풍선이 길이 모드의 글자 수 상한(10/30/45/60자)을 넘으면 문장 단위로 잘라냄 (싸움 중엔 x1.4)
+
+# 한 서버에 캐릭터가 여럿일 때 (/캐릭터스왑 동작:추가)
+#  webhook: 웹훅으로 캐릭터마다 다른 이름/아바타로 말한다 (봇에 '웹훅 관리' 권한 필요. 없으면 이름을 앞에 붙여 말함)
+#  chain_chance: 한 캐릭터가 사람에게 대답한 뒤 다른 캐릭터가 그 말에 받아칠 확률 (이후 chain_decay 배씩 줄고 max_chain 번까지)
+#  human_window_sec: 사람이 이 시간(초) 안에 말했을 때만 캐릭터끼리 대화 (사람 없이 끝없이 떠들지 않게)
+multi:
+  webhook: true
+  webhook_name: "AIGF"
+  chain_chance: 0.45
+  chain_decay: 0.5
+  max_chain: 2
+  chain_delay_sec: [2.5, 6.0]
+  human_window_sec: 600

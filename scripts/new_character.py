@@ -44,6 +44,9 @@ fight_replies:
 concept_strength: 0.5
 concept_hooks: []
 web_topics: ["{name} 최신 소식"]   # 가끔 인터넷에서 미리 받아 둘 검색어 (최대 4개)
+# 여러 캐릭터가 한 서버에 있을 때 (/캐릭터스왑 동작:추가)
+avatar_url: ""       # 웹훅으로 말할 때 보이는 아바타 이미지 주소 (https://...png). 비우면 웹훅 기본 그림
+talk_weight: 1.0     # 말 많은 정도 (클수록 대답 대상으로 자주 뽑힘)
 '''
 
 

@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from . import trace as tracelib
 from .config import discord_token, load_settings
 from .emoji import Emojis
 from .fight import Fight
-from .guilds import DM, Hub, Proxy
+from .guilds import DM, Hub, Proxy, char_uid
 from .llm import LLM
 from .mood import EMO, EMOTIONS
 from .persona import Persona
@@ -63,6 +64,9 @@ emojis = Emojis()
 ecfg = settings.get("emoji", {})
 vcfg = settings.get("vision", {})
 inicfg = settings.get("initiative", {})
+# 한 서버에 캐릭터가 여럿일 때: 웹훅으로 캐릭터마다 이름/아바타를 바꿔 말하고, 캐릭터끼리도 가끔 주고받는다
+mcfg = {"webhook": True, "webhook_name": "AIGF", "chain_chance": 0.45, "chain_decay": 0.5, "max_chain": 2,
+        "chain_delay_sec": [2.5, 6.0], "human_window_sec": 600, **settings.get("multi", {})}
 
 # 서버(길드)마다 따로 저장/동작한다 (bot/guilds.py). engine/memory/persona/ratio 는 '지금 처리 중인 서버'의 객체로 연결되는 프록시.
 hub = Hub(settings, llm, defaults={
@@ -144,6 +148,13 @@ IDLE_EVENTS: dict[int, list[tuple[str, float, str]]] = {
 class AdminTree(app_commands.CommandTree):
     """모든 슬래시 명령을 관리자만 쓸 수 있게 한다."""
 
+    async def _call(self, interaction: discord.Interaction) -> None:
+        await super()._call(interaction)
+        try:
+            hub.sync_peers()          # 적극성/싸움 기본값/기록·웹 켜기 같은 서버 공통 설정을 같은 서버의 모든 캐릭터에 맞춘다
+        except Exception:  # noqa: BLE001
+            log.exception("서버 공통 설정 동기화 실패")
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id in ADMIN_IDS:
             gid = interaction.guild_id or DM
@@ -181,6 +192,11 @@ class GirlBot(discord.Client):
         self.init_unanswered: dict[int, int] = {}        # 먼저 말했는데 아직 사람이 답하지 않은 횟수
         self.init_gap: dict[int, float] = {}             # 채널별 이번 능동 대화 쿨타임(랜덤)
         self.init_target: dict[int, tuple] = {}          # 채널별 마지막으로 먼저 말 건 대상 (uid, 시각)
+        self.webhooks: dict[int, discord.Webhook] = {}   # 채널(부모) id → 이 봇이 만든 웹훅
+        self.webhook_failed: dict[int, float] = {}       # 웹훅을 못 만든 채널 (잠시 뒤 다시 시도)
+        self.our_webhooks: set[int] = set()              # 이 봇의 웹훅 id (캐릭터 메시지에 답장했는지 알아보는 데 사용)
+        self.last_char: dict[int, str] = {}              # 채널별 마지막으로 말한 캐릭터
+        self.last_human_ts: dict[int, float] = {}        # 채널별 사람이 마지막으로 말한 시각
         self.unaddressed: dict[int, list] = {}           # 대답 후보에서 탈락해 답을 못 받은 메시지 (uid, 이름, 글, 시각)
 
     # 런타임 상태: 서버마다 따로 (서버별 DB 의 kv 에 저장되어 재시작 후에도 유지). 지금 처리 중인 서버의 값을 읽고 쓴다.
@@ -273,21 +289,117 @@ def clean_text(message: discord.Message) -> str:
     return text
 
 
+def char_names() -> dict[str, tuple[str, str]]:
+    """현재 서버의 캐릭터 id → (이름, 별명)"""
+    return {cid: (c.persona.name, c.persona.nickname) for cid, c in hub.ctx().chars.items()}
+
+
+def is_our_webhook(msg: discord.Message) -> bool:
+    """이 봇의 웹훅(캐릭터)이 보낸 메시지인가"""
+    if not getattr(msg, "webhook_id", None):
+        return False
+    return msg.webhook_id in bot.our_webhooks or msg.author.name in {n for n, _ in char_names().values()}
+
+
+def replied_char(message: discord.Message | None) -> str | None:
+    """사용자가 어느 캐릭터의 메시지에 답장했는가 (웹훅 메시지의 표시 이름으로 판별)"""
+    ref = getattr(message, "reference", None)
+    if not ref or not isinstance(ref.resolved, discord.Message) or not is_our_webhook(ref.resolved):
+        return None
+    for cid, (name, nick) in char_names().items():
+        if ref.resolved.author.name in (name, nick):
+            return cid
+    return None
+
+
+def named_chars(text: str) -> list[str]:
+    """글에서 이름(또는 별명)으로 불린 캐릭터들"""
+    body = re.sub(r"^\(.*?에 답장\)\s*", "", text)
+    return [cid for cid, (name, nick) in char_names().items() if (name and name in body) or (nick and nick in body)]
+
+
+def active_fight(channel_id: int, uid: int):
+    """이 유저와 싸우는 중인 캐릭터가 있으면 (캐릭터 id, Fight)"""
+    for cid, c in hub.ctx().chars.items():
+        f = c.engine.fights.get(channel_id, uid)
+        if f is not None:
+            return cid, f
+    return None
+
+
+def pick_speaker(channel_id: int, text: str, uid: int, message: discord.Message | None = None) -> str:
+    """사람의 메시지에 어느 캐릭터가 대답할지: 싸우는 중인 캐릭터 > 답장한 캐릭터 > 이름이 불린 캐릭터 > 말 많은 정도로 가중 랜덤"""
+    ctx = hub.ctx()
+    if len(ctx.chars) == 1:
+        return ctx.primary
+    hit = active_fight(channel_id, uid)
+    if hit:
+        return hit[0]
+    rc = replied_char(message)
+    if rc in ctx.chars:
+        return rc
+    named = named_chars(text)
+    pool = named or list(ctx.chars)
+    weights = []
+    for cid in pool:
+        c = ctx.chars[cid]
+        w = float(c.persona.data.get("talk_weight", 1.0)) * max(0.2, c.engine.mood.reply_mult)
+        if bot.last_char.get(channel_id) == cid and not named:
+            w *= 0.55                                  # 같은 캐릭터만 계속 말하지 않게
+        weights.append(max(0.05, w))
+    return random.choices(pool, weights=weights, k=1)[0]
+
+
+def pick_free_speaker(channel_id: int) -> str:
+    """조용한 채널에서 먼저 말을 꺼낼 캐릭터"""
+    ctx = hub.ctx()
+    pool = list(ctx.chars)
+    weights = [max(0.05, float(ctx.chars[c].persona.data.get("talk_weight", 1.0)))
+               * (0.4 if bot.last_char.get(channel_id) == c else 1.0) for c in pool]
+    return random.choices(pool, weights=weights, k=1)[0]
+
+
 def is_priority(message: discord.Message) -> bool:
-    """봇을 멘션했거나, 봇의 메시지에 답장한 경우"""
+    """봇을 멘션했거나, 봇(또는 캐릭터)의 메시지에 답장한 경우"""
     if bot.user and bot.user in message.mentions:
         return True
     ref = message.reference
     if ref and isinstance(ref.resolved, discord.Message):
-        return ref.resolved.author.id == (bot.user.id if bot.user else 0)
+        return ref.resolved.author.id == (bot.user.id if bot.user else 0) or is_our_webhook(ref.resolved)
     return False
 
 
 def replies_to_human(message: discord.Message) -> bool:
-    """봇이 아닌 다른 사람의 메시지에 대한 답장인가"""
+    """봇(캐릭터)이 아닌 다른 사람의 메시지에 대한 답장인가"""
     ref = message.reference
     return bool(ref and isinstance(ref.resolved, discord.Message)
-                and bot.user and ref.resolved.author.id != bot.user.id)
+                and bot.user and ref.resolved.author.id != bot.user.id and not is_our_webhook(ref.resolved))
+
+
+async def get_webhook(channel) -> discord.Webhook | None:
+    """채널의 캐릭터용 웹훅 (없으면 만든다). 권한이 없으면 None (잠시 뒤 다시 시도)."""
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    pid = getattr(parent, "id", None)
+    if pid is None:
+        return None
+    wh = bot.webhooks.get(pid)
+    if wh is not None:
+        return wh
+    if time.time() - bot.webhook_failed.get(pid, 0) < 600:
+        return None
+    try:
+        name = mcfg["webhook_name"]
+        hooks = await parent.webhooks()
+        wh = next((h for h in hooks if h.name == name and h.user and bot.user and h.user.id == bot.user.id), None)
+        if wh is None:
+            wh = await parent.create_webhook(name=name, reason="캐릭터마다 다른 이름/아바타로 말하기")
+        bot.webhooks[pid] = wh
+        bot.our_webhooks.add(wh.id)
+        return wh
+    except (discord.Forbidden, discord.HTTPException, AttributeError) as e:
+        bot.webhook_failed[pid] = time.time()
+        log.warning("웹훅을 만들 수 없어요 (채널 %s): %s → 웹훅 관리 권한을 주세요. 그동안은 이름 앞붙임으로 말해요.", pid, e)
+        return None
 
 
 async def send_bubbles(
@@ -298,6 +410,10 @@ async def send_bubbles(
     t_send = time.time()
     sent_ids: list[int] = []
     rendered: list[str] = []
+    multi = len(hub.ctx().chars) > 1 and mcfg.get("webhook", True) and not isinstance(channel, discord.DMChannel)
+    wh = await get_webhook(channel) if multi else None              # 캐릭터가 여럿이면 웹훅으로 캐릭터 이름/아바타로 말한다
+    cname = persona.name
+    avatar = persona.data.get("avatar_url") or None
     for i, raw in enumerate(bubbles):
         # 서버 커스텀 이모지 `:이름:` 을 실제 이모지로 바꿔서 보낸다
         text = emojis.render(raw) if ecfg.get("enabled", True) else raw
@@ -307,13 +423,29 @@ async def send_bubbles(
             delay = min(engine.typing_delay(raw), 0.4) if i == 0 else min(engine.typing_delay(raw), 1.5)
             async with channel.typing():
                 await asyncio.sleep(delay)
-        if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id):
+        if wh is not None:
+            try:
+                kw: dict = {"content": text, "username": cname[:80], "wait": True,
+                            "allowed_mentions": discord.AllowedMentions(everyone=False, roles=False, users=True)}
+                if avatar:
+                    kw["avatar_url"] = avatar
+                if isinstance(channel, discord.Thread):
+                    kw["thread"] = channel
+                m_ = await wh.send(**kw)
+                sent_ids.append(m_.id)
+                continue
+            except discord.HTTPException as e:
+                log.warning("웹훅 전송 실패, 일반 메시지로 대체: %s", e)
+                bot.webhooks.pop(getattr(getattr(channel, "parent", channel), "id", 0), None)
+        if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id) and not multi:
             try:
                 m_ = await reply_to.reply(text, mention_author=False)
                 sent_ids.append(m_.id)
                 continue
             except discord.HTTPException:
                 pass
+        if multi and i == 0:
+            text = f"**{cname}** {text}"                          # 웹훅을 쓸 수 없을 때는 누가 말하는지 이름을 앞에 붙인다
         m_ = await channel.send(text)
         sent_ids.append(m_.id)
     cid = getattr(channel, "id", None)
@@ -343,7 +475,7 @@ def next_cooldown(channel_id: int | None = None) -> float:
 
 def is_directed(text: str) -> bool:
     """멘션이 아니어도 캐릭터 이름/봇 이름을 불렀으면 봇에게 하는 말로 본다."""
-    names = {persona.name, persona.nickname}
+    names = {n for pair in char_names().values() for n in pair}
     if bot.user:
         names.add(bot.user.display_name)
     return any(n and n in text for n in names)
@@ -360,10 +492,11 @@ async def gpu_lines() -> list[tuple[str, float, float, float]]:
 
 async def warmup_and_report() -> None:
     seen: set[str] = set()
-    for c in list(hub.ctxs.values()):             # 고정 프롬프트를 미리 계산해 KV 캐시에 올린다 (캐릭터가 다른 서버는 각각)
-        if c.persona.char_id not in seen:
-            seen.add(c.persona.char_id)
-            await llm.warmup(c.engine.warm_messages())
+    for g in list(hub.ctxs.values()):             # 고정 프롬프트를 미리 계산해 KV 캐시에 올린다 (캐릭터가 다른 서버/캐릭터는 각각)
+        for c in list(g.chars.values()):
+            if c.persona.char_id not in seen:
+                seen.add(c.persona.char_id)
+                await llm.warmup(c.engine.warm_messages())
     try:
         for name, size, vram, pct in await gpu_lines():
             if pct < 99:
@@ -378,18 +511,20 @@ async def warmup_and_report() -> None:
 
 
 def apply_emojis(ctx) -> None:
-    """서버별 엔진에 이모지 안내/선택기를 연결한다 (새 서버 저장소가 만들어질 때도 호출)."""
-    if ecfg.get("enabled", True) and ecfg.get("custom", True):
-        ctx.engine.emoji_hint = emojis.prompt_block(ecfg.get("max_custom_in_prompt", 40))
-        ctx.engine.mood.emoji_picker = emojis.text_token          # 감정 표현에 서버 이모지를 섞는다
-    else:
-        ctx.engine.emoji_hint = ""
+    """서버별(캐릭터별) 엔진에 이모지 안내/선택기를 연결한다 (새 서버 저장소/캐릭터가 만들어질 때도 호출)."""
+    for c in ctx.chars.values():
+        if ecfg.get("enabled", True) and ecfg.get("custom", True):
+            c.engine.emoji_hint = emojis.prompt_block(ecfg.get("max_custom_in_prompt", 40))
+            c.engine.mood.emoji_picker = emojis.text_token        # 감정 표현에 서버 이모지를 섞는다
+        else:
+            c.engine.emoji_hint = ""
 
 
 def setup_ctx(ctx) -> None:
     apply_emojis(ctx)
-    # 대화가 바쁠 때는 기억 추출을 미룬다 (GPU 양보)
-    ctx.engine.busy_check = lambda: bool(bot.busy) or any(bot.pending.values()) or bot.gpu_lock.locked()
+    for c in ctx.chars.values():
+        # 대화가 바쁠 때는 기억 추출을 미룬다 (GPU 양보)
+        c.engine.busy_check = lambda: bool(bot.busy) or any(bot.pending.values()) or bot.gpu_lock.locked()
 
 
 hub.on_create = setup_ctx
@@ -570,7 +705,12 @@ async def on_message(message: discord.Message) -> None:
     await memory.add_message(ch, uid, display, "user", stored)
     mark_human_activity(ch)
     directed = bool(mentioned) or is_directed(text)
-    engine.mood.observe(stored, directed=directed, uid=uid, who=who)
+    hits = named_chars(text)                                    # 이름이 불린 캐릭터들
+    rc = replied_char(message)                                  # 답장한 캐릭터
+    for cid, c in hub.ctx().chars.items():                      # 모든 캐릭터가 듣고 기분이 움직이지만, '나한테 한 말'은 해당 캐릭터만
+        d = (bool(mentioned) and rc is None) or cid in hits or cid == rc
+        c.engine.mood.observe(stored, directed=d, uid=uid, who=who)
+    bot.last_human_ts[ch] = time.time()
     bot.chan_events.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
     ratio.record(ch, "h")
     # 먼저 한 말에 '답이 왔다'고 보는 경우: 봇을 부르거나(멘션/이름/답장) 먼저 말 건 상대가 3분 안에 말했을 때만.
@@ -581,17 +721,23 @@ async def on_message(message: discord.Message) -> None:
     bot.last_speaker[ch] = who
 
     # ---- 말싸움: 도발/모욕을 받았고 기분이 상했으면 붙는다 ----
-    in_fight = engine.fights.get(ch, uid) is not None
+    in_fight = active_fight(ch, uid) is not None
     if (not in_fight and directed and not bot.paused
             and engine.guard.inspect(text).level != "block"):
-        m = engine.mood
-        if engine.fights.should_start(ch, uid, text, directed, m.current().id, m.s["irritation"], m.affinity(uid)):
-            engine.fights.start(ch, uid, display)
-            m.on_fight_start(uid, who)
-            in_fight = True
-            engine.tracer.log("event", what="fight_start", channel_id=ch, user_id=uid, user_name=display,
-                              detail=text, emotion=m.current().label, irritation=round(m.s["irritation"], 2))
-            log.info("말싸움 시작: channel=%s user=%s(%s)", ch, uid, display)
+        ctx_ = hub.ctx()
+        for cid in (hits or ([rc] if rc else [ctx_.primary])):  # 시비를 받은 캐릭터가 싸움에 붙을지 정한다
+            c = ctx_.chars.get(cid)
+            if c is None:
+                continue
+            e, m = c.engine, c.engine.mood
+            if e.fights.should_start(ch, uid, text, directed, m.current().id, m.s["irritation"], m.affinity(uid)):
+                e.fights.start(ch, uid, display)
+                m.on_fight_start(uid, who)
+                in_fight = True
+                e.tracer.log("event", what="fight_start", channel_id=ch, user_id=uid, user_name=display,
+                             detail=text, emotion=m.current().label, irritation=round(m.s["irritation"], 2), char=cid)
+                log.info("말싸움 시작: channel=%s user=%s(%s) char=%s", ch, uid, display, cid)
+                break
     if bot.paused:
         trace_recv(message, text, "recorded:paused", directed=directed, mentioned=bool(mentioned), in_fight=in_fight,
                    stored=stored)
@@ -732,6 +878,9 @@ async def respond_group(channel_id: int, target: Pending) -> None:
             latest = getattr(channel, "last_message_id", None)
             reply_to = msg if (latest and latest != msg.id and target.kind == "msg") else None
             await send_bubbles(channel, bubbles, reply_to)
+            cur = hub.ctx().char().cid
+            bot.last_char[channel_id] = cur
+            maybe_chain(channel, cur, bubbles, 1)                  # 다른 캐릭터가 그 말에 받아칠 수도 있다
             t_end = time.monotonic()
             # 어디서 시간이 걸리는지 로그로 남긴다: 수신 후 대기(묶음/쿨다운/GPU 대기) · 생성(LLM) · 전송
             log.info("응답 완료: 메시지 수신 후 %.1fs (대기 %.1fs · 생성 %.1fs · 전송 %.1fs)",
@@ -752,7 +901,7 @@ def to_candidate(p: Pending, now: float, channel_id: int) -> targeting.Candidate
     text = p.text or clean_text(p.message)
     return targeting.Candidate(
         uid=uid, text=text, age=now - p.ts, priority=p.priority,
-        in_fight=engine.fights.get(channel_id, uid) is not None, directed=is_directed(text),
+        in_fight=active_fight(channel_id, uid) is not None, directed=is_directed(text),
         human_reply=p.human_reply, has_image=bool(p.images), affinity=engine.mood.affinity(uid),
         since_replied=time.time() - bot.last_replied.get(uid, 0),
         is_last_target=bot.last_target.get(channel_id) == uid,
@@ -868,7 +1017,60 @@ async def group_loop() -> None:
                                    for p in items if p not in same][:5]},
         )
         items[:] = [p for p in items if p not in same]
-        asyncio.create_task(respond_group(channel_id, merged))
+        speaker = pick_speaker(channel_id, text, tuid, merged.message)   # 여러 캐릭터 중 누가 대답할지
+        merged.meta["speaker"] = speaker
+        hub.use_char(speaker)
+        asyncio.create_task(respond_group(channel_id, merged))           # (현재 캐릭터가 작업으로 이어진다)
+        hub.use_char(None)
+
+
+def maybe_chain(channel, speaker_cid: str, bubbles: list[str], depth: int) -> None:
+    """방금 한 캐릭터의 말에 같은 방의 다른 캐릭터가 가끔 받아친다. 사람이 한동안 없으면 안 하고, 횟수/확률을 줄여 가며 끝없이 이어지지 않게 한다."""
+    ctx = hub.ctx()
+    if len(ctx.chars) < 2 or bot.paused or depth > int(mcfg["max_chain"]) or not bubbles:
+        return
+    ch = channel.id
+    if time.time() - bot.last_human_ts.get(ch, 0) > float(mcfg["human_window_sec"]):
+        return                                               # 사람이 없으면 캐릭터끼리만 계속 떠들지 않는다
+    if ratio.over_cap(ch):
+        return                                               # 봇이 이미 너무 말을 많이 했다
+    p = float(mcfg["chain_chance"]) * float(mcfg["chain_decay"]) ** (depth - 1) * min(1.6, max(0.6, engine.mood.engage))
+    if random.random() >= p:
+        return
+    others = [c for c in ctx.chars if c != speaker_cid]
+    weights = [max(0.05, float(ctx.chars[c].persona.data.get("talk_weight", 1.0)) * max(0.2, ctx.chars[c].engine.mood.reply_mult))
+               for c in others]
+    cid = random.choices(others, weights=weights, k=1)[0]
+    asyncio.create_task(respond_chain(channel, ctx.gid, cid, speaker_cid, " ".join(bubbles), depth))
+
+
+async def respond_chain(channel, gid: int, cid: str, from_cid: str, text: str, depth: int) -> None:
+    """캐릭터 cid 가 같은 방 캐릭터 from_cid 의 말에 반응한다 (사람 메시지가 기다리고 있으면 사람이 먼저)."""
+    hub.use(gid)
+    hub.use_char(cid)
+    ch = channel.id
+    await asyncio.sleep(random.uniform(*[float(x) for x in mcfg["chain_delay_sec"]]))
+    if ch in bot.busy or bot.paused or bot.pending.get(ch):
+        return
+    bot.busy.add(ch)
+    try:
+        ctx = hub.ctx()
+        from_name = ctx.chars[from_cid].persona.name if from_cid in ctx.chars else "친구"
+        async with bot.gpu_lock:
+            async with channel.typing():
+                bubbles = await engine.reply(
+                    ch, char_uid(from_cid), from_name, text, can_skip=True, priority=False,
+                    extra_note=f"방금 같은 방 친구 캐릭터 {from_name}이(가) 한 말에 대한 반응이다. 사람이 아니라 친구 캐릭터에게 하는 말이니 "
+                               "자기 말투 그대로 가볍게 받아치거나 한마디 덧붙여라.")
+        if bubbles:
+            await send_bubbles(channel, bubbles)
+            bot.last_char[ch] = cid
+            maybe_chain(channel, cid, bubbles, depth + 1)
+    except Exception:  # noqa: BLE001
+        log.exception("캐릭터 간 대화 실패 (channel=%s, %s→%s)", ch, from_cid, cid)
+    finally:
+        bot.busy.discard(ch)
+        bot.next_ok[ch] = max(bot.next_ok.get(ch, 0), time.monotonic() + 2.0)
 
 
 async def run_fight_open(channel, f: Fight) -> None:
@@ -996,7 +1198,10 @@ async def _initiative_tick() -> None:
         adj = ratio.adjust(ch_id)
         dec = initiative.decide(snap, inicfg, engine.mood.engage, adj.initiate)
         if dec.fire:
+            hub.use_char(pick_free_speaker(ch_id))          # 캐릭터가 여럿이면 그중 하나가 먼저 말을 꺼낸다
             await run_initiative(ch_id, dec, snap, adj)
+            bot.last_char[ch_id] = hub.ctx().char().cid
+            hub.use_char(None)
 
 
 @initiative_loop.before_loop
@@ -1007,11 +1212,13 @@ async def _init_ready() -> None:
 @tasks.loop(minutes=15)
 async def web_loop() -> None:
     for gid in hub.gids():
-        hub.use(gid)
-        try:
-            await _web_tick()
-        except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
-            log.exception("web_loop 처리 실패 (서버 %s)", gid)
+        for cid in list(hub.ctx(gid).chars):
+            hub.use(gid)
+            hub.use_char(cid)
+            try:
+                await _web_tick()
+            except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
+                log.exception("web_loop 처리 실패 (서버 %s)", gid)
 
 
 async def _web_tick() -> None:
@@ -1034,11 +1241,13 @@ async def _web_ready() -> None:
 @tasks.loop(seconds=5)
 async def fight_loop() -> None:
     for gid in hub.gids():
-        hub.use(gid)
-        try:
-            await _fight_tick()
-        except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
-            log.exception("fight_loop 처리 실패 (서버 %s)", gid)
+        for cid in list(hub.ctx(gid).chars):
+            hub.use(gid)
+            hub.use_char(cid)
+            try:
+                await _fight_tick()
+            except Exception:  # noqa: BLE001  (한 서버의 오류가 다른 서버를 멈추지 않게)
+                log.exception("fight_loop 처리 실패 (서버 %s)", gid)
 
 
 async def _fight_tick() -> None:
@@ -1209,7 +1418,10 @@ async def _idle_tick() -> None:
             continue
         bot.busy.add(ch_id)
         try:
+            hub.use_char(pick_free_speaker(ch_id))
             result = await run_idle_event(ch_id, st)
+            bot.last_char[ch_id] = hub.ctx().char().cid
+            hub.use_char(None)
             log.info("혼잣말 이벤트 (channel=%s, stage=%s): %s", ch_id, st.stage, result)
         except Exception:  # noqa: BLE001
             log.exception("혼잣말 이벤트 실패 (channel=%s)", ch_id)
@@ -1347,33 +1559,98 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     ][:25]
 
 
-@bot.tree.command(name="캐릭터스왑", description="봇의 캐릭터를 바꿔요")
-@app_commands.describe(character="바꿀 캐릭터", clear_history="이전 캐릭터와의 대화 기록을 지울지 (기본: 지움)",
+async def guild_char_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    """이 서버에 있는 캐릭터만 보여 준다"""
+    ctx = hub.ctxs.get(interaction.guild_id or DM)
+    cur = current.lower()
+    return [
+        app_commands.Choice(name=f"{c.persona.name} ({cid})", value=cid)
+        for cid, c in (ctx.chars.items() if ctx else [])
+        if cur in cid.lower() or cur in c.persona.name.lower()
+    ][:25]
+
+
+@bot.tree.command(name="캐릭터스왑", description="이 서버의 캐릭터를 교체하거나, 캐릭터를 더 추가/제거해요 (여러 명이면 웹훅으로 각자 이름/아바타로 말해요)")
+@app_commands.describe(character="대상 캐릭터 (목록일 땐 생략)", mode="교체(기본) / 추가(같이 활동) / 제거 / 목록",
+                       old="교체할 기존 캐릭터 (생략하면 기본 캐릭터)",
+                       clear_history="교체할 때 대화 기록을 지울지 (기본: 지움)",
                        greet="바꾼 뒤 이 채널에 캐릭터 첫 인사를 보낼지 (기본: 보냄)")
-@app_commands.rename(character="캐릭터", clear_history="기록초기화", greet="인사")
-@app_commands.autocomplete(character=character_autocomplete)
+@app_commands.rename(character="캐릭터", mode="동작", old="기존", clear_history="기록초기화", greet="인사")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="교체", value="replace"),
+    app_commands.Choice(name="추가", value="add"),
+    app_commands.Choice(name="제거", value="remove"),
+    app_commands.Choice(name="목록", value="list"),
+])
+@app_commands.autocomplete(character=character_autocomplete, old=guild_char_autocomplete)
 async def swap_character(
-    interaction: discord.Interaction, character: str, clear_history: bool = True, greet: bool = True
+    interaction: discord.Interaction, character: Optional[str] = None,
+    mode: Optional[app_commands.Choice[str]] = None, old: Optional[str] = None,
+    clear_history: bool = True, greet: bool = True,
 ) -> None:
-    ids = {cid for cid, _ in Persona.available()}
-    if character not in ids:
+    act = mode.value if mode else "replace"
+    ctx = hub.ctx()
+    avail = dict(Persona.available())
+    if act == "list":
+        here = "\n".join(f"{'⭐' if cid == ctx.primary else '•'} **{c.persona.name}** (`{cid}`) · 감정 {c.engine.mood.current().label} · "
+                         f"{'아바타 있음' if c.persona.data.get('avatar_url') else '아바타 없음(yaml 에 avatar_url)'}"
+                         for cid, c in ctx.chars.items())
+        rest = ", ".join(f"{n}(`{i}`)" for i, n in avail.items() if i not in ctx.chars) or "(없음)"
         await interaction.response.send_message(
-            "없는 캐릭터예요. 목록: " + ", ".join(sorted(ids)), ephemeral=True)
+            f"**이 서버의 캐릭터** ({len(ctx.chars)}명, ⭐=기본)\n{here}\n추가할 수 있는 캐릭터: {rest}", ephemeral=True)
         return
-    engine.mood._save()                 # 지금 캐릭터의 기분/호감도를 먼저 저장 (캐릭터마다 따로 저장됨)
-    persona.load(character)
-    await engine.mood.switch()          # 새 캐릭터의 저장된 기분을 불러오고, 처음이면 그 캐릭터의 기준 기분으로 시작
-    engine.div._lines.clear()           # 이전 캐릭터가 했던 말은 반복 감시 대상이 아니다
-    engine.fights.stop_all()            # 진행 중인 말싸움은 종료
-    await memory.kv_set("character", persona.char_id)
+    if not character or character not in avail:
+        await interaction.response.send_message("없는 캐릭터예요. 목록: " + ", ".join(sorted(avail)), ephemeral=True)
+        return
+    channel = interaction.channel
+    if act == "add":
+        if character in ctx.chars:
+            await interaction.response.send_message("이미 이 서버에 있는 캐릭터예요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        c = await hub.add_character(ctx, character)
+        extra = ""
+        if channel is not None and isinstance(channel, (discord.TextChannel, discord.Thread)):
+            if await get_webhook(channel) is None:
+                extra = "\n⚠ 이 채널에 웹훅을 만들 수 없어요. 봇에게 **웹훅 관리** 권한을 주세요 (그전에는 이름을 앞에 붙여서 말해요)."
+        await interaction.followup.send(
+            f"**{c.persona.name}** (`{c.cid}`) 을(를) 이 서버에 추가했어요. 지금 {len(ctx.chars)}명이 함께 있어요."
+            f"{'' if c.persona.data.get('avatar_url') else chr(10) + '-# 아바타를 쓰려면 캐릭터 yaml 에 avatar_url 을 적어 주세요.'}{extra}",
+            ephemeral=True)
+        if greet and c.persona.greeting and channel is not None:
+            hub.use_char(c.cid)
+            await send_bubbles(channel, [c.persona.greeting])
+        return
+    if act == "remove":
+        if character not in ctx.chars:
+            await interaction.response.send_message("이 서버에 없는 캐릭터예요.", ephemeral=True)
+            return
+        if not await hub.remove_character(ctx, character):
+            await interaction.response.send_message("마지막 한 명은 뺄 수 없어요. 다른 캐릭터로 교체하세요.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"`{character}` 을(를) 뺐어요. (기분/호감도는 저장돼 있어서 다시 추가하면 이어져요) 남은 캐릭터: "
+            + ", ".join(c.persona.name for c in ctx.chars.values()), ephemeral=True)
+        return
+    # ---- 교체 ----
+    target = old or ctx.primary
+    if target not in ctx.chars:
+        await interaction.response.send_message("교체할 기존 캐릭터가 이 서버에 없어요. (`/캐릭터스왑 동작:목록`)", ephemeral=True)
+        return
+    if character in ctx.chars and character != target:
+        await interaction.response.send_message("그 캐릭터는 이미 이 서버에 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    c = await hub.replace_character(ctx, target, character)     # 이전 캐릭터의 기분/호감도는 저장하고, 새 캐릭터의 저장된 상태를 불러온다
     if clear_history:
         await memory.clear_all_history()
     bot.pending.clear()
-    await interaction.response.send_message(
-        f"캐릭터를 **{persona.name}** (`{persona.char_id}`)(으)로 바꿨어요."
-        + (" 대화 기록을 초기화했어요." if clear_history else ""), ephemeral=True)
-    if greet and persona.greeting and interaction.channel:
-        await interaction.channel.send(persona.greeting)
+    await interaction.followup.send(
+        f"캐릭터를 **{c.persona.name}** (`{c.cid}`)(으)로 바꿨어요." + (" 대화 기록을 초기화했어요." if clear_history else ""),
+        ephemeral=True)
+    if greet and c.persona.greeting and channel is not None:
+        hub.use_char(c.cid)
+        await send_bubbles(channel, [c.persona.greeting])
 
 
 # ---- 4. 상태 (보기 + 일시정지 + 리로드 통합) ----
@@ -1396,7 +1673,10 @@ async def status(interaction: discord.Interaction, action: Optional[app_commands
             "⏸ 일시정지했어요. 이제 대답하지 않아요." if bot.paused else "▶ 다시 대화에 참여해요.", ephemeral=True)
         return
     if act == "reload":
-        persona.reload()
+        ctx_ = hub.ctx()
+        for c in ctx_.chars.values():
+            c.persona.reload()
+        hub.refresh_peers(ctx_)
         n = engine.people.reload()
         err = ("\n형식 오류: " + "; ".join(engine.people.errors[:4])) if engine.people.errors else ""
         ew = engine.mood.profile.warnings
@@ -1426,10 +1706,12 @@ async def status(interaction: discord.Interaction, action: Optional[app_commands
              if avg else "아직 기록 없음")
     nf = len(engine.fights.active)
     lvl = engine.fights.cfg.get("level_text") or engine.fights.cfg["level"]
+    chars_line = ", ".join(f"{c.persona.name}{'⭐' if cid == hub.ctx().primary else ''}" for cid, c in hub.ctx().chars.items())
     div_line = " / ".join(f"<#{c}> {engine.div.stats(c)}" for c in sorted(bot.channels)[:3]) or "기록 없음"
     await interaction.followup.send(
         f"**봇 상태** {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
         f"- 캐릭터 **{persona.name}** (`{persona.char_id}`) · 모델 `{llm.model}` · 기분 {engine.mood.current().label}\n"
+        f"- 서버 캐릭터({len(hub.ctx().chars)}명): {chars_line}\n"
         f"- 응답 속도: {speed}\n"
         f"- 적극성 {engine.mood.engage:g} · 쿨다운 {bot.cooldown:g}초 · 채팅 비율(현재/목표): {ratios}\n"
         f"- 먼저 말걸기: {'켜짐' if bot.init_enabled else '꺼짐'} (10~24시) · 혼잣말 이벤트 {'켜짐' if bot.idle_enabled else '꺼짐'}\n"
@@ -1547,19 +1829,23 @@ def bar(value: int, lo: int = 0, hi: int = 100, width: int = 10) -> str:
 
 
 @bot.tree.command(name="기분", description="캐릭터의 기분/상태 점수를 확인하거나 감정을 바꿔요")
-@app_commands.describe(action="보기/설정/초기화/목록", emotion="설정할 감정 (설정 시)", minutes="유지 시간(분, 기본 30)")
-@app_commands.rename(action="동작", emotion="감정", minutes="분")
+@app_commands.describe(action="보기/설정/초기화/목록", emotion="설정할 감정 (설정 시)", minutes="유지 시간(분, 기본 30)",
+                       character="대상 캐릭터 (여러 캐릭터일 때, 생략하면 기본 캐릭터)")
+@app_commands.rename(action="동작", emotion="감정", minutes="분", character="캐릭터")
 @app_commands.choices(action=[
     app_commands.Choice(name="보기", value="show"),
     app_commands.Choice(name="설정", value="set"),
     app_commands.Choice(name="초기화", value="reset"),
     app_commands.Choice(name="목록", value="list"),
 ])
-@app_commands.autocomplete(emotion=emotion_autocomplete)
+@app_commands.autocomplete(emotion=emotion_autocomplete, character=guild_char_autocomplete)
 async def mood_cmd(
     interaction: discord.Interaction, action: app_commands.Choice[str],
     emotion: Optional[str] = None, minutes: Optional[app_commands.Range[int, 1, 720]] = None,
+    character: Optional[str] = None,
 ) -> None:
+    if character and character in hub.ctx().chars:
+        hub.use_char(character)
     m = engine.mood
     if action.value == "list":
         score = " ".join(e.label for e in EMOTIONS if not e.special)
@@ -1647,8 +1933,10 @@ LEVEL_DESC = {1: "순화된 말싸움만", 2: "가벼운 욕까지", 3: "욕설�
 @bot.tree.command(name="싸움", description="유저를 고르면 즉시 싸움을 겁니다. 수위는 자유롭게 써요. 동작으로 켜기/끄기/중단/필터/상태")
 @app_commands.describe(user="싸울 상대 (고르면 봇이 바로 먼저 시비를 걸어요)",
                        level_text="수위를 자유롭게 (예: 거칠게 욕하고 서럽게 따져). 1/2/3 은 프리셋. 유저 없이 쓰면 기본 수위로 저장",
-                       action="상태(기본) / 켜기 / 끄기 / 중단(이 채널 싸움 종료) / 필터(출력 필터 전환)")
-@app_commands.rename(user="유저", level_text="수위", action="동작")
+                       action="상태(기본) / 켜기 / 끄기 / 중단(이 채널 싸움 종료) / 필터(출력 필터 전환)",
+                       character="싸울 캐릭터 (여러 캐릭터일 때, 생략하면 기본 캐릭터)")
+@app_commands.rename(user="유저", level_text="수위", action="동작", character="캐릭터")
+@app_commands.autocomplete(character=guild_char_autocomplete)
 @app_commands.choices(action=[
     app_commands.Choice(name="상태", value="status"),
     app_commands.Choice(name="켜기", value="on"),
@@ -1661,7 +1949,10 @@ async def fight_cmd(
     user: Optional[discord.User] = None,
     level_text: Optional[app_commands.Range[str, 1, 300]] = None,
     action: Optional[app_commands.Choice[str]] = None,
+    character: Optional[str] = None,
 ) -> None:
+    if character and character in hub.ctx().chars:
+        hub.use_char(character)
     fm = engine.fights
     act = action.value if action else ""
     if act in ("on", "off"):
@@ -1680,7 +1971,7 @@ async def fight_cmd(
             else "출력 필터를 **껐어요**. 검열 없이 감정 그대로 나가요.", ephemeral=True)
         return
     if act == "stop":
-        n = fm.stop_all(interaction.channel_id)
+        n = sum(c.engine.fights.stop_all(interaction.channel_id) for c in hub.ctx().chars.values())
         await interaction.response.send_message(f"이 채널의 말싸움 {n}건을 중단했어요.", ephemeral=True)
         return
 
@@ -1717,9 +2008,9 @@ async def fight_cmd(
             f"기본 수위를 바꿨어요: **{LEVEL_DESC[int(t)] if t in ('1', '2', '3') else trunc(t, 120)}**", ephemeral=True)
         return
 
-    fights = list(fm.active.values())
+    fights = [(c.persona.name, f) for c in hub.ctx().chars.values() for f in c.engine.fights.active.values()]
     body = "\n".join(
-        f"<#{f.channel_id}> {f.user_name}: 라운드 {f.rounds} · 흐름 {f.advantage}" for f in fights) or "(진행 중인 싸움 없음)"
+        f"<#{f.channel_id}> {cn} ↔ {f.user_name}: 라운드 {f.rounds} · 흐름 {f.advantage}" for cn, f in fights) or "(진행 중인 싸움 없음)"
     cur = fm.cfg.get("level_text") or f"{fm.cfg['level']} ({LEVEL_DESC[int(fm.cfg['level'])]})"
     await interaction.response.send_message(
         f"**말싸움** {'켜짐' if fm.cfg['enabled'] else '꺼짐'} · 기본 수위 {trunc(str(cur), 100)} · "

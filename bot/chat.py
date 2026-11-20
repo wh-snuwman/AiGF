@@ -223,7 +223,9 @@ class ChatEngine:
         self._init_recent: dict[int, list[str]] = {}      # 채널별 최근에 먼저 건 말 (중복 방지)
         self._last_move: dict[int, str] = {}              # 채널별 직전 대화 주도 방식 (연속 반복 방지)
         self.div = Diversity(settings.get("diversity", {}))   # 정형행동(같은 말/틀 반복) 추적기
-        self.web = WebInfo(settings.get("web", {}), memory, self.guard)   # 가끔 인터넷 정보 (캐시 + 제한 시간)
+        self.web = WebInfo(settings.get("web", {}), memory, self.guard,
+                           kv_key=f"web_cache:{persona.char_id}")   # 가끔 인터넷 정보 (캐시 + 제한 시간, 캐릭터별)
+        self.peers: list[str] = []                         # 같은 서버(방)에 있는 다른 캐릭터 이름 (guilds.Hub 이 채움)
         self._bg: set[asyncio.Task] = set()
 
     @property
@@ -242,6 +244,10 @@ class ChatEngine:
         await self.people.init()
         await self.mood.load()
         await self.web.load()
+
+    def _peers_line(self) -> str:
+        return (f"같은 방 캐릭터(친구): {', '.join(self.peers)}. 이름은 필요할 때만 부르고 사람(유저) 말이 우선이지만, "
+                "그 캐릭터가 한 말에 가끔 자연스럽게 받아치거나 끼어들어도 된다. 그들의 말투를 따라 하지 않는다.")
 
     # ---------- 웹 정보 ----------
     def web_key(self) -> str:
@@ -307,6 +313,10 @@ class ChatEngine:
                 role, text = "user", f"{self.label(h['user_id'], h['author'])}: {safe}"
                 if prev_ts and h["ts"] - prev_ts >= 600:
                     text = f"(약 {int((h['ts'] - prev_ts) // 60)}분 지남)\n" + text
+            elif h.get("author") in self.peers:
+                # 같은 방의 다른 캐릭터가 한 말: 내 말(assistant)이 아니라 이름이 붙은 상대의 말로 보여 준다
+                cleaned = [humanize(ln) for ln in h["content"].split("\n")]
+                role, text = "user", f"{h['author']}: " + ("\n".join(ln for ln in cleaned if ln) or h["content"])
             else:
                 # 예전에 남은 '…' 같은 버릇이 모델에게 전염되지 않도록 기록도 정리해서 보여준다
                 cleaned = [humanize(ln) for ln in h["content"].split("\n")]
@@ -329,10 +339,11 @@ class ChatEngine:
             else:
                 merged.append({"role": role, "content": text})
 
-        own = [humanize(ln) for h in hist if h["role"] == "assistant" for ln in h["content"].split("\n")]
+        own = [humanize(ln) for h in hist if h["role"] == "assistant" and h.get("author") not in self.peers
+               for ln in h["content"].split("\n")]
         own = [ln for ln in own if ln]
         scene, activity = await self._scene(hist)
-        known: set[str] = set()
+        known: set[str] = set(self.peers)
         for h in hist:
             if h["role"] == "user":
                 known |= {h["author"], clean_name(h["author"]), self.label(h["user_id"], h["author"]),
@@ -586,6 +597,8 @@ class ChatEngine:
         ]
         for n in notes:
             parts.append(f"추가:{n}")
+        if self.peers:
+            parts.append(self._peers_line())
         if move:
             parts.append(f"대화주도:{move[1]} (억지로 하지 말고 자연스러울 때만)")
         if fight is None and verdict.level == "ok":
@@ -667,7 +680,8 @@ class ChatEngine:
         if fight is not None and fight.ending:   # 싸움이 끝났다 → 결과를 기분/호감도에 반영
             self.apply_fight_result(fight)
             self.fights.finish(fight)
-        self._schedule_extract(channel_id, target_id, target_name)
+        if target_id > 0:                       # 다른 캐릭터(음수 id)에게 한 말에서는 '사람 기억'을 뽑지 않는다
+            self._schedule_extract(channel_id, target_id, target_name)
         return bubbles
 
     # ---------- 기록(trace) 래퍼: 응답 한 번을 한 줄(JSON)로 남긴다 ----------
@@ -757,6 +771,8 @@ class ChatEngine:
         if unanswered:
             parts.append(f"네가 먼저 말했는데 답 없던 횟수:{unanswered}")
         parts += [f"길이:[{mode.label}]{mode.desc}", own_text]
+        if self.peers:
+            parts.append(self._peers_line())
         web_line = self.web.hint(self.web_key(), free=True)
         if web_line:
             parts.append(web_line)
@@ -844,7 +860,7 @@ class ChatEngine:
 
     def _scrub_ghosts(self, text: str, allowed: set[str]) -> str:
         """대화 참여자도 등록된 사람도 아닌 이름(예시 속 철수/영희 등)이 나오면 그 이름만 걷어낸다."""
-        allow = set(allowed) | {self.persona.name, self.persona.nickname}
+        allow = set(allowed) | {self.persona.name, self.persona.nickname} | set(self.peers)
         for real, call in self.names.values():
             allow |= {real, call or ""}
         allow = {a for a in allow if a}
