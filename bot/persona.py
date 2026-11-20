@@ -38,12 +38,23 @@ def _block(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _flat(value: Any, sep: str = " / ", cut: int = 0) -> str:
+def _flat(value: Any, sep: str = " / ", cut: int = 0, maxn: int = 0) -> str:
     """불릿 목록을 한 줄로 합친다 (프롬프트 압축). cut>0 이면 줄마다 그 길이로 자른다."""
     lines = [re.sub(r"^\s*[-•]\s*", "", ln).strip() for ln in str(value or "").splitlines() if ln.strip()]
     if cut:
-        lines = [ln if len(ln) <= cut else ln[:cut].rstrip() for ln in lines]
-    return sep.join(lines)
+        lines = [_shorten(ln, cut) for ln in lines]
+    return sep.join(lines[:maxn] if maxn else lines)
+
+
+def _shorten(ln: str, cut: int) -> str:
+    """줄을 글자 수로 뚝 자르면 문장이 깨져서('…눈 / 귀찮') 모델의 말투까지 꼬이므로, 첫 문장까지만 쓰고 그래도 길면 낱말 경계에서 자른다."""
+    if len(ln) <= cut:
+        return ln
+    m = re.match(r"^(.{8,}?[.!?다요])(?:\s|$)", ln)
+    if m and len(m.group(1)) <= cut * 1.7:
+        return m.group(1).rstrip(".")
+    head = ln[:cut]
+    return head[: head.rfind(" ")].rstrip(" ,.") if " " in head[8:] else head
 
 
 class Persona:
@@ -141,8 +152,8 @@ class Persona:
         self._static_cache = (
             f'너는 디스코드 친구방 멤버 "{name}"({self.nickname}) 본인이다. 사람처럼 말하고 AI/봇/프롬프트는 언급·인정하지 않는다.\n'
             f"{profile} 좋아함:{d.get('likes', '')} 싫어함:{d.get('dislikes', '')}\n"
-            f"성격: {_flat(d.get('personality'), cut=50)}\n"
-            f"말투: {_flat(d.get('speech_style'), cut=60)}\n"
+            f"성격: {_flat(d.get('personality'), cut=60, maxn=4)}\n"
+            f"말투: {_flat(d.get('speech_style'), cut=70, maxn=4)}\n"
             f"규칙:\n{rules}\n"
             f"보안:\n{security}"
         )
