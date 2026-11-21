@@ -422,6 +422,8 @@ async def send_bubbles(
     wh = await get_webhook(channel) if multi else None              # 캐릭터가 여럿이면 웹훅으로 캐릭터 이름/아바타로 말한다
     cname = persona.name
     avatar = persona.data.get("avatar_url") or None
+    if not avatar and persona.char_id == hub.ctx().primary and bot.user:
+        avatar = bot.user.display_avatar.url          # 아바타를 따로 안 정한 기본 캐릭터는 봇 계정 프로필 사진으로 (웹훅이어도 같은 얼굴)
     for i, raw in enumerate(bubbles):
         # 서버 커스텀 이모지 `:이름:` 을 실제 이모지로 바꿔서 보낸다
         text = emojis.render(raw) if ecfg.get("enabled", True) else raw
@@ -1779,7 +1781,7 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
 
 
 @bot.tree.command(name="캐릭터", description="캐릭터를 부르거나 내보내고, 캐릭터끼리 대화를 시작/중지해요")
-@app_commands.describe(mode="부르기/내보내기/목록 · 대화시작/대화중지 · 자동대화켜기/끄기(사람 말에 다른 캐릭터가 알아서 끼어드는 것)",
+@app_commands.describe(mode="부르기/내보내기/목록 · 대화시작/대화중지 · 상호작용켜기/끄기(캐릭터끼리 알아서 받아치기) · 상태",
                        character="부를/내보낼 캐릭터, 대화시작일 땐 먼저 말할 캐릭터 (생략하면 아무나)",
                        topic="대화시작할 때 이야기 주제 (생략하면 자유)", rounds="대화시작: 말을 주고받을 횟수 (기본 6, 최대 20)")
 @app_commands.rename(mode="동작", character="캐릭터", topic="주제", rounds="횟수")
@@ -1789,8 +1791,9 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
     app_commands.Choice(name="목록", value="list"),
     app_commands.Choice(name="대화시작", value="talk"),
     app_commands.Choice(name="대화중지", value="stop"),
-    app_commands.Choice(name="자동대화켜기", value="auto_on"),
-    app_commands.Choice(name="자동대화끄기", value="auto_off"),
+    app_commands.Choice(name="상호작용켜기", value="auto_on"),
+    app_commands.Choice(name="상호작용끄기", value="auto_off"),
+    app_commands.Choice(name="상태", value="status"),
 ])
 @app_commands.autocomplete(character=character_autocomplete)
 async def character_cmd(
@@ -1806,12 +1809,18 @@ async def character_cmd(
         await swap_character.callback(interaction, character, app_commands.Choice(name=act, value=act), None, True, True)
         return
     ch = interaction.channel
+    if act == "status":
+        names = ", ".join(c.persona.name + (" (기본)" if cid == ctx.primary else "") for cid, c in ctx.chars.items())
+        await interaction.response.send_message(
+            f"활성 캐릭터: {names or '없음'}\n상호작용(캐릭터끼리 받아치기): {'켜짐' if ctx.state.chain_auto else '꺼짐'}"
+            f" · 지금 이 채널 캐릭터 대화: {'진행 중' if ch is not None and ch.id in talking else '없음'}", ephemeral=True)
+        return
     if act in ("auto_on", "auto_off"):
         ctx.state.chain_auto = act == "auto_on"
         await memory.kv_set("chain_auto", "1" if ctx.state.chain_auto else "0")
         await interaction.response.send_message(
-            "자동 대화 **켜짐**: 한 캐릭터가 사람에게 대답하면 다른 캐릭터가 가끔 받아쳐요." if ctx.state.chain_auto
-            else "자동 대화 **꺼짐**: 캐릭터끼리 알아서 말을 주고받지 않아요. (`동작:대화시작`으로 직접 시킬 수는 있어요)", ephemeral=True)
+            "상호작용 **켜짐**: 한 캐릭터가 사람에게 대답하면 다른 캐릭터가 가끔 받아쳐요." if ctx.state.chain_auto
+            else "상호작용 **꺼짐**: 캐릭터끼리 알아서 말을 주고받지 않아요. (`동작:대화시작`으로 직접 시킬 수는 있어요)", ephemeral=True)
         return
     if act == "stop":
         was = ch is not None and ch.id in talking
