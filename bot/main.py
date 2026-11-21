@@ -26,6 +26,7 @@ from .emoji import Emojis
 from .fight import Fight
 from .guilds import DM, Hub, Proxy, char_uid
 from .llm import LLM, ModelMissing
+from .web import ipv6_reachable
 from .mood import EMO, EMOTIONS
 from .persona import Persona
 
@@ -497,6 +498,13 @@ async def gpu_lines() -> list[tuple[str, float, float, float]]:
     return out
 
 
+async def check_ipv6() -> None:
+    ok = await asyncio.to_thread(ipv6_reachable)
+    if ok is False:
+        log.warning("이 서버는 IPv6 로 나갈 수 없어요 → 인터넷 검색 엔진 일부가 간헐적으로 실패할 수 있어요(봇은 실패한 엔진을 쉬게 하고 다른 엔진으로 자동 전환합니다). "
+                    "근본 해결: README '문제 해결'의 IPv6 안내")
+
+
 async def check_model() -> bool:
     """시작할 때 Ollama 연결/모델 설치 여부를 확인하고, 문제가 있으면 해결 방법을 크게 알린다."""
     ok, note = await llm.check()
@@ -647,6 +655,7 @@ async def on_ready() -> None:
     await prepare_guilds()
     await sync_commands()
     refresh_emojis()
+    asyncio.create_task(check_ipv6())          # IPv6 가 막힌 서버인지 알려 둔다 (검색 엔진 일부가 간헐적으로 실패하는 원인)
     asyncio.create_task(warmup_and_report())   # 첫 응답이 느리지 않도록 모델을 미리 올리고 GPU 적재 상태를 점검한다
 
 

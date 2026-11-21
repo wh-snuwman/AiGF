@@ -19,6 +19,7 @@ import json
 import logging
 import random
 import re
+import socket
 import threading
 import time
 import unicodedata
@@ -36,6 +37,19 @@ LOOKUP_RE = re.compile(r"검색|찾아\s*(봐|줘)|최신|요즘\s*(뭐|뭘|무�
 FILLER_RE = re.compile(r"(검색|찾아|알려|말해|좀|해줘|해봐|해라|해주세요|줄래|좀만|뭐야|뭐임|뭔데|궁금)\S*|[?!~.,ㅋㅎㅠㅜ]+")
 UA = "friend-bot/1.0 (discord hobby bot)"
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+
+
+def ipv6_reachable(timeout: float = 1.5) -> bool | None:
+    """서버가 IPv6 로 나갈 수 있는가. True/False, 판단 불가(시간 초과 등)면 None. (Cloudflare DNS 주소로 TCP 접속만 시험)"""
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("2606:4700:4700::1111", 53))
+        return True
+    except OSError as e:
+        return False if getattr(e, "errno", None) in (101, 113, 97) else None      # 101 ENETUNREACH, 113 EHOSTUNREACH, 97 EAFNOSUPPORT
+    finally:
+        s.close()
 
 
 class SearchBusy(RuntimeError):
@@ -154,6 +168,8 @@ class SearchHub:
         self._busy_until = 0.0
         self._busy_gen = 0                                # 옛 스레드가 새 검색의 busy 표시를 지우지 않게 하는 세대 번호
         self._busy_lock = threading.Lock()
+        self.engines: dict[str, dict] = {}                # 엔진별 상태: {bad_until, fails, last}
+        self._eng_lock = threading.Lock()
 
     def lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -172,6 +188,36 @@ class SearchHub:
         self.last_error = err
         self.next_try = time.time() + min(6 * 3600, 1800 * 2 ** (self.fail_streak - 1))
         return self.next_try - time.time()
+
+    # ---- 엔진별 건강 상태: 실패한 엔진은 잠시 쉬고(5분→최대 1시간) 다른 엔진으로 자동 전환, 성공하면 바로 복귀 ----
+    def engine_order(self, names: list[str], limit: int = 0) -> list[str]:
+        now = time.time()
+        with self._eng_lock:
+            good = [n for n in names if self.engines.get(n, {}).get("bad_until", 0) <= now]
+            out = good or sorted(names, key=lambda n: self.engines.get(n, {}).get("bad_until", 0))   # 전부 쉬는 중이면 가장 먼저 풀리는 순서로(완전히 멈추진 않는다)
+        return out[:limit] if limit else out
+
+    def engine_ok(self, name: str) -> None:
+        with self._eng_lock:
+            self.engines[name] = {"bad_until": 0.0, "fails": 0, "last": ""}
+
+    def engine_fail(self, name: str, reason: str) -> None:
+        with self._eng_lock:
+            e = self.engines.get(name) or {"fails": 0}
+            fails = int(e.get("fails", 0)) + 1
+            self.engines[name] = {"fails": fails, "last": reason, "bad_until": time.time() + min(3600, 300 * 2 ** (fails - 1))}
+
+    def engine_status(self, names: list[str]) -> str:
+        now = time.time()
+        parts = []
+        with self._eng_lock:
+            for n in names:
+                e = self.engines.get(n, {})
+                if e.get("bad_until", 0) > now:
+                    parts.append(f"{n}(쉬는 중 {int((e['bad_until'] - now) // 60) + 1}분, {e.get('last', '')[:14]})")
+                else:
+                    parts.append(f"{n}(정상)" if e or self.last_engine == n else n)
+        return " > ".join(parts)
 
     def backing_off(self) -> bool:
         return time.time() < self.next_try
@@ -319,22 +365,32 @@ class WebInfo:
     def _runner(self, query: str, timeout: float, fast: bool = False):
         """허브가 부르는 실제 검색: 설정한 엔진을 순서대로 시도해 첫 성공에서 멈춘다. (items, 엔진, 실패 이유) 를 돌려준다."""
         backends = list(self.cfg.get("backends") or ["auto"])
-        if fast:
-            backends = backends[:1]                # 실시간 조회는 제한 시간이 짧아 첫 엔진만
 
         async def run():
             errs: list[str] = []
 
             def job():
-                for b in backends:
-                    try:
-                        rows = self._search_one(query, 6, b)
-                    except Exception as e:  # noqa: BLE001
-                        errs.append(f"{b}:{classify_error(e)}")
+                for b in HUB.engine_order(backends, 1 if fast else 0):         # 쉬는 중인 엔진은 건너뛰고, 실시간 조회는 가장 좋은 엔진 하나만
+                    rows = None
+                    for attempt in (0, 1):
+                        try:
+                            rows = self._search_one(query, 6, b)
+                            break
+                        except Exception as e:  # noqa: BLE001
+                            why = classify_error(e)
+                            if attempt == 0 and "ENETUNREACH" in why:
+                                continue                                       # IPv6 로 먼저 붙었다 실패하는 일시적 오류 → 같은 엔진 한 번 더
+                            errs.append(f"{b}:{why}")
+                            HUB.engine_fail(b, why)
+                            rows = None
+                            break
+                    if rows is None:
                         continue
                     if rows:
+                        HUB.engine_ok(b)
                         return rows, b
                     errs.append(f"{b}:결과 없음")
+                    HUB.engine_fail(b, "결과 없음")
                 return [], ""
 
             try:
@@ -553,7 +609,7 @@ class WebInfo:
         now = time.time()
         ok = f"{int((now - HUB.last_ok) // 60)}분 전({HUB.last_engine or '?'})" if HUB.last_ok else "아직 없음"
         nxt = f"{int((HUB.next_try - now) // 60) + 1}분 뒤(연속 실패 {HUB.fail_streak}회)" if HUB.backing_off() else "지금 가능"
-        line = f"엔진 {','.join(self.cfg.get('backends') or ['auto'])} · 마지막 성공 {ok} · 다음 검색 {nxt}"
+        line = f"엔진 {HUB.engine_status(list(self.cfg.get('backends') or ['auto']))} · 마지막 성공 {ok} · 다음 검색 {nxt}"
         if self.last_round:
             line += f"\n최근 갱신: {self.last_round[:300]}"
         err = self.last_error or HUB.last_error

@@ -96,6 +96,13 @@ async def run() -> int:
             if names:
                 print(f"     (또는 config/settings.yaml 의 ollama.model 을 설치된 모델 {', '.join(names[:4])} 중 하나로 바꿔도 되지만 말투/속도가 달라지고, 12GB VRAM 에는 26b 급이 너무 커요)")
 
+    from .web import ipv6_reachable
+    v6 = await asyncio.to_thread(ipv6_reachable)
+    if v6 is False:
+        print(f"{WARN}IPv6 로 나갈 수 없는 서버예요 → 검색 엔진 일부가 간헐적으로 실패할 수 있어요(봇이 자동으로 다른 엔진으로 전환). 근본 해결은 README '문제 해결'의 IPv6 안내")
+    elif v6:
+        print(f"{OK} IPv6 사용 가능")
+
     import importlib.util
     if importlib.util.find_spec("ddgs") or importlib.util.find_spec("duckduckgo_search"):
         print(f"{OK} ddgs 설치됨 (인터넷 정보 사용 가능)")
