@@ -105,9 +105,19 @@ async def run() -> int:
 
     import importlib.util
     if importlib.util.find_spec("ddgs") or importlib.util.find_spec("duckduckgo_search"):
-        print(f"{OK} ddgs 설치됨 (인터넷 정보 사용 가능)")
+        from .web import ddgs_version
+        print(f"{OK} ddgs {ddgs_version() or ''} 설치됨 (무료 검색 엔진)")
     else:
-        print(f"{WARN}ddgs 가 없어요 → 인터넷 정보 기능만 꺼집니다 (`pip install ddgs`). 봇 동작에는 영향 없음")
+        print(f"{WARN}ddgs 가 없어요 → 무료 검색 엔진은 꺼집니다 (`pip install ddgs`). 봇 동작에는 영향 없음")
+    try:
+        from .web import WebInfo
+        chain, skipped = WebInfo(settings.get("web", {}), None).chain()
+        names = [n if n == u else f"{n}[{u}]" for n, u in chain]
+        print(f"{OK if chain else WARN}검색 순서: {' > '.join(names) or '없음'}" + (f"  (제외: {', '.join(skipped)})" if skipped else ""))
+        if not any(n in ("naver", "searxng") for n, _u in chain):
+            print("     무료 엔진은 서버 요청을 자주 막아요. 안정적으로 쓰려면 .env 에 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET (README '인터넷 정보')")
+    except Exception as e:  # noqa: BLE001
+        print(f"{WARN}검색 설정 확인 실패: {type(e).__name__}")
 
     try:
         from .persona import Persona

@@ -206,17 +206,20 @@ web:
   enabled: true
   provider: ddgs               # ddgs | searxng
   searxng_url: ""
-  # 무료 검색 엔진은 서버 요청을 자주 막는다(429/403). 서버에서 `python scripts/web_probe.py` 로 잘 되는 엔진을 찾아
-  # 위에서부터 적으면 순서대로 시도한다. ["auto"] = ddgs 가 알아서(차단된 엔진까지 다 두드려 느림).
-  # 실패한 엔진은 5분(최대 1시간) 쉬고 다음 엔진으로 자동 전환, 성공하면 바로 복귀한다.
-  # (2026-11 서버 probe: yahoo/google 이 번갈아 성공(간헐적), duckduckgo/brave/mojeek/yandex/bing 은 차단·IPv6 불가, auto 는 느림)
-  backends: ["yahoo", "google", "duckduckgo"]
+  # 검색 순서 (위에서부터 시도, 실패하면 다음으로 자동 전환). 설정 안 된 것/설치된 ddgs 에서 꺼진 이름은 자동으로 빠진다.
+  #  naver   : 네이버 검색 공식 API (가장 안정적, 무료 하루 25,000회). .env 에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 필요
+  #  searxng : 직접 띄운 SearXNG (searxng_url 필요)
+  #  그 외   : ddgs 무료 엔진 (스크래핑이라 자주 막힘). 괄호는 실제 업스트림 — 같은 업스트림은 같이 막혀서 같이 쉰다
+  #            yahoo(bing) startpage(google) brave mojeek duckduckgo(bing). ddgs 9.16 에서 google/bing/yandex 는 꺼져 있음
+  backends: ["naver", "searxng", "yahoo", "startpage", "brave", "mojeek", "duckduckgo"]
+  naver_kind: "blog"           # 네이버 검색 종류: blog | webkr | news
   region: "kr-kr"
   proxy: ""                    # (선택) 예: socks5://127.0.0.1:9050 (로그에 찍지 않음)
   engine_timeout_sec: 4        # 엔진 한 번 접속 제한
   refresh_timeout_sec: 12      # 백그라운드 갱신 한 번의 전체 제한
   max_per_min: 6               # 프로세스 전체 검색 분당 상한 (서버/캐릭터가 많아도 합산)
-  min_gap_sec: 1.5             # 검색 사이 최소 간격
+  min_gap_sec: 4               # 검색 사이 최소 간격 (실제로는 x1.0~1.5 랜덤)
+  max_queries_per_round: 4     # 갱신 한 번에 실제로 보내는 검색 수 상한 (연속 2번 실패하면 나머지는 폴백)
   chance: 0.12                 # 답변마다 캐시된 정보를 곁들일 확률
   refresh_hours: 12            # 캐시 갱신 주기
   realtime: true               # '검색/최신' 질문일 때 실시간 조회 (연속 실패로 쉬는 중이면 안 함)

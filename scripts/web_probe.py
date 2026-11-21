@@ -1,6 +1,7 @@
 """서버 전용 진단:  python scripts/web_probe.py [검색어]
-인터넷 정보(ddgs)가 왜 실패하는지 엔진별로 한 번씩 시험해 표로 보여 준다. 성공한 엔진을 config/settings.yaml 의
-web.backends 에 위에서부터 적으면 된다. (ddgs 가 없으면 안내만 하고 끝난다.)
+인터넷 정보가 왜 실패하는지 검색 순서(web.backends)의 엔진을 하나씩 시험해 표로 보여 준다.
+설치된 ddgs 에서 켜진 엔진만 시험하고, 차단(HTTP 403/429/202, 봇 확인 페이지)과 진짜 '결과 없음'을 구분한다.
+.env 에 네이버 키가 있으면 네이버 검색 API 도 시험한다.
 """
 import importlib.util
 import socket
@@ -9,8 +10,6 @@ import time
 import urllib.request
 
 QUERY = " ".join(sys.argv[1:]) or "요즘 유행어 신조어"
-# ddgs 9.x 에서 쓰이는 이름들 (버전에 따라 다를 수 있다 → 지원하지 않는 이름은 오류로 표시됨)
-ENGINES = ["auto", "duckduckgo", "yahoo", "bing", "brave", "mojeek", "google", "yandex", "wikipedia"]
 
 
 def classify(e: BaseException) -> str:
@@ -50,35 +49,45 @@ def net_checks() -> None:
 
 def main() -> None:
     net_checks()
-    spec = importlib.util.find_spec("ddgs")
-    if spec is None:
-        print("\nddgs 가 설치돼 있지 않아요 (pip install ddgs). 설치 전에는 위키백과/slang.txt 폴백만 쓰여요.")
-        return
-    from importlib.metadata import version
-    print(f"\n== ddgs {version('ddgs')} 엔진별 시험 (검색어: {QUERY!r}) ==")
-    print(f"{'엔진':<12}{'결과':<8}{'건수':<6}{'시간':<8}비고")
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+    from bot.config import load_settings
+    from bot.web import WebInfo, classify_error, ddgs_text_engines, ddgs_version
+    avail = ddgs_text_engines()
+    print(f"\n== ddgs {ddgs_version() or '(없음)'}: 켜진 엔진 → 업스트림 ==")
+    print("  " + (", ".join(f"{n}({u})" for n, u in sorted(avail.items())) if avail else "ddgs 가 없어요 (pip install ddgs)"))
+    w = WebInfo(load_settings().get("web", {}), None)
+    chain, skipped = w.chain()
+    names = [n for n, _u in chain]
+    for n in sorted(avail or {}):                       # 설정에 없지만 켜진 엔진도 참고로 시험
+        if n not in names and n not in ("wikipedia", "grokipedia"):
+            names.append(n)
+    up = {**(avail or {}), **dict(chain)}
+    if skipped:
+        print(f"  설정에서 제외: {', '.join(skipped)}")
+    print(f"\n== 엔진별 시험 (검색어: {QUERY!r}) ==")
+    print(f"{'엔진':<12}{'업스트림':<10}{'결과':<8}{'건수':<6}{'시간':<7}비고")
     good = []
-    for b in ENGINES:
+    for b in names:
         t0 = time.time()
         try:
-            sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
-            from bot.web import _backend_ddgs
-            rows = _backend_ddgs(QUERY, 5, b, "kr-kr", None, 6)
+            rows = w._search_one(QUERY, 5, b)
             dt = time.time() - t0
             if rows:
                 good.append(b)
-                print(f"{b:<12}{'성공':<8}{len(rows):<6}{dt:<8.1f}{rows[0][0][:30]}")
+                print(f"{b:<12}{up.get(b, b):<10}{'성공':<8}{len(rows):<6}{dt:<7.1f}{rows[0][0][:30]}")
             else:
-                print(f"{b:<12}{'빈 결과':<8}{0:<6}{dt:<8.1f}")
+                print(f"{b:<12}{up.get(b, b):<10}{'빈 결과':<8}{0:<6}{dt:<7.1f}(200 이지만 비어 있음: 몰래 막힌 경우가 많음)")
         except Exception as e:  # noqa: BLE001
-            print(f"{b:<12}{'실패':<8}{'-':<6}{time.time() - t0:<8.1f}{classify(e)} | {str(e)[:60]}")
-        time.sleep(2)                                   # 엔진에 부담을 주지 않는다
+            print(f"{b:<12}{up.get(b, b):<10}{'실패':<8}{'-':<6}{time.time() - t0:<7.1f}{classify_error(e)}")
+        time.sleep(3)                                   # 엔진에 부담을 주지 않는다
     print("\n== 결론 ==")
-    if good:
-        print("config/settings.yaml 의 web: 에 아래처럼 적으세요 (잘 되는 순서):")
-        print(f"  backends: {good[:3]}")
+    if any(n in ("naver", "searxng") for n in good):
+        print("공식 API/자가호스팅 검색이 동작해요. 그대로 두면 됩니다.")
+    elif good:
+        print(f"지금 되는 무료 엔진: {good}. 무료 엔진은 시간에 따라 되다 말다 해요 → 안정적으로 쓰려면 네이버 검색 API 키를 .env 에 넣으세요.")
     else:
-        print("성공한 엔진이 없어요. 폴백(위키백과 / config/slang.txt)이 쓰입니다. IPv6 접속 실패가 보이면 IPv4 우선 설정(README '문제 해결')을 해 보세요.")
+        print("성공한 엔진이 없어요. 폴백(위키백과 / config/slang.txt)이 쓰입니다. 네이버 검색 API 키를 넣는 게 가장 확실해요 (README '인터넷 정보').")
+    print("IPv6 접속 실패가 보이면 IPv4 우선 설정(README '문제 해결')도 해 두세요.")
 
 
 if __name__ == "__main__":

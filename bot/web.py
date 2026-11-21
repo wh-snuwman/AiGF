@@ -56,10 +56,39 @@ class SearchBusy(RuntimeError):
     """이전 검색(스레드)이 아직 끝나지 않았다."""
 
 
+class NoDirect(Exception):
+    """ddgs 엔진을 직접 부를 준비가 안 됨 (내부 구조가 바뀜) → 공식 DDGS().text 로 후퇴."""
+
+
+class Blocked(RuntimeError):
+    """검색 엔진이 HTTP 200 이 아닌 응답을 줬다 (차단/요청 제한). ddgs 는 이걸 '결과 없음'으로 숨기므로 따로 구분한다."""
+
+
+def ddgs_text_engines() -> dict[str, str] | None:
+    """설치된 ddgs 에서 지금 켜져 있는 text 엔진 → 업스트림(provider) 이름. ddgs 가 없으면 None.
+    (ddgs 9.16.1: google/bing/yandex 는 꺼짐, duckduckgo·yahoo 의 업스트림은 bing, startpage 는 google)"""
+    try:
+        from ddgs.engines import ENGINES
+    except Exception:  # noqa: BLE001
+        return None
+    return {str(n): str(getattr(c, "provider", "") or n) for n, c in (ENGINES.get("text") or {}).items()}
+
+
+def ddgs_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("ddgs")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def classify_error(e: BaseException) -> str:
     """검색 예외를 사람이 알아볼 짧은 말로 바꾼다 (로그/ /웹 에 표시)."""
     msg = str(e)
     low = msg.lower()
+    if isinstance(e, Blocked):
+        code = msg[5:8] if msg.startswith("HTTP ") else ""
+        return {"401": "401 인증 실패(API 키 확인)", "403": "403 차단", "429": "429 요청 제한", "202": "202 봇 확인"}.get(code, f"차단({msg})")
     if "429" in msg or "ratelimit" in low or "rate limit" in low:
         return "429 요청 제한"
     if "403" in msg or "forbidden" in low:
@@ -99,6 +128,68 @@ def _backend_ddgs(query: str, n: int, backend: str = "auto", region: str = "kr-k
         except TypeError:                           # 옛 버전에 backend 인자가 없다
             rows = d.text(query, region=region, max_results=n) or []
     return [(str(r.get("title", "")), str(r.get("body", ""))) for r in rows]
+
+
+def _backend_ddgs_engine(query: str, n: int, name: str, region: str = "kr-kr",
+                         proxy: str | None = None, timeout: float = 4) -> list[tuple[str, str]]:
+    """ddgs 엔진 하나를 직접 부른다 (auto 로 새지 않고, HTTP 상태를 보고 차단과 진짜 '결과 없음'을 구분).
+    ddgs 내부 구조가 바뀌어 직접 호출이 안 되면 NoDirect → 호출한 쪽이 DDGS().text 로 후퇴한다."""
+    try:
+        from ddgs.engines import ENGINES
+        cls = ENGINES["text"][name]
+        eng = cls(proxy=proxy, timeout=int(timeout))
+        client = eng.http_client
+        orig = client.request
+    except Exception as e:  # noqa: BLE001
+        raise NoDirect(f"ddgs 엔진 직접 호출 불가: {type(e).__name__}") from e
+    seen: dict[str, int | None] = {}
+
+    def req(*a, **k):
+        r = orig(*a, **k)
+        seen["code"] = getattr(r, "status_code", None)
+        try:
+            seen["challenge"] = bool(CHALLENGE_RE.search(str(getattr(r, "text", "") or "")[:30000]))
+        except Exception:  # noqa: BLE001
+            seen["challenge"] = False
+        return r
+
+    client.request = req
+    rows = eng.search(query, region=region, safesearch="moderate", page=1) or []
+    code = seen.get("code")
+    if not rows and code not in (None, 200):
+        raise Blocked(f"HTTP {code}")
+    if not rows and seen.get("challenge"):
+        raise Blocked("봇 확인 페이지")                 # 200 이지만 캡차/작업증명 페이지 (startpage 등)
+    out = []
+    for r in rows[:n]:
+        get = r.get if isinstance(r, dict) else (lambda k, d="", _r=r: getattr(_r, k, d))
+        out.append((str(get("title", "") or ""), str(get("body", "") or "")))
+    return out
+
+
+TAG_RE = re.compile(r"<[^>]+>")
+CHALLENGE_RE = re.compile(r"captcha|\"challenge\"\s*:|are you a robot|unusual traffic|verify you are human", re.I)
+
+
+def _backend_naver(query: str, n: int, cid: str, secret: str, kind: str = "blog",
+                   timeout: float = 4, proxy: str | None = None) -> list[tuple[str, str]]:
+    """네이버 검색 오픈 API (공식, 키 필요, 하루 25,000회 무료). 스크래핑이 아니라 차단이 없다. kind: blog | webkr | news"""
+    import html as _html
+    import urllib.error
+    kind = kind if kind in ("blog", "webkr", "news", "encyc", "kin") else "blog"
+    url = f"https://openapi.naver.com/v1/search/{kind}.json?" + urllib.parse.urlencode({"query": query, "display": max(1, min(n, 20))})
+    req = urllib.request.Request(url, headers={"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": secret, "User-Agent": UA})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy})) if proxy else urllib.request.build_opener()
+    try:
+        with opener.open(req, timeout=timeout) as r:            # noqa: S310 (고정된 네이버 주소)
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as e:
+        raise Blocked(f"HTTP {e.code}") from None                # 키 값이 예외 메시지/로그로 새지 않게 원인을 끊는다
+
+    def txt(s: object) -> str:
+        return _html.unescape(TAG_RE.sub("", str(s or ""))).strip()
+
+    return [(txt(x.get("title")), txt(x.get("description"))) for x in (data.get("items") or [])[:n] if isinstance(x, dict)]
 
 
 def _backend_searxng(base: str, query: str, n: int) -> list[tuple[str, str]]:
@@ -189,12 +280,14 @@ class SearchHub:
         self.next_try = time.time() + min(6 * 3600, 1800 * 2 ** (self.fail_streak - 1))
         return self.next_try - time.time()
 
-    # ---- 엔진별 건강 상태: 실패한 엔진은 잠시 쉬고(5분→최대 1시간) 다른 엔진으로 자동 전환, 성공하면 바로 복귀 ----
-    def engine_order(self, names: list[str], limit: int = 0) -> list[str]:
+    # ---- 업스트림별 건강 상태: 실패한 업스트림은 잠시 쉬고(5분→최대 1시간) 다른 엔진으로 자동 전환, 성공하면 바로 복귀 ----
+    #      yahoo·duckduckgo 는 둘 다 bing 이라 하나가 막히면 같이 쉰다 (key 로 엔진 → 업스트림을 넘긴다)
+    def engine_order(self, names: list[str], limit: int = 0, key: Callable[[str], str] | None = None) -> list[str]:
+        k = key or (lambda n: n)
         now = time.time()
         with self._eng_lock:
-            good = [n for n in names if self.engines.get(n, {}).get("bad_until", 0) <= now]
-            out = good or sorted(names, key=lambda n: self.engines.get(n, {}).get("bad_until", 0))   # 전부 쉬는 중이면 가장 먼저 풀리는 순서로(완전히 멈추진 않는다)
+            good = [n for n in names if self.engines.get(k(n), {}).get("bad_until", 0) <= now]
+            out = good or sorted(names, key=lambda n: self.engines.get(k(n), {}).get("bad_until", 0))   # 전부 쉬는 중이면 가장 먼저 풀리는 순서로(완전히 멈추진 않는다)
         return out[:limit] if limit else out
 
     def engine_ok(self, name: str) -> None:
@@ -207,16 +300,19 @@ class SearchHub:
             fails = int(e.get("fails", 0)) + 1
             self.engines[name] = {"fails": fails, "last": reason, "bad_until": time.time() + min(3600, 300 * 2 ** (fails - 1))}
 
-    def engine_status(self, names: list[str]) -> str:
+    def engine_status(self, names: list[str], key: Callable[[str], str] | None = None) -> str:
+        k = key or (lambda n: n)
         now = time.time()
         parts = []
         with self._eng_lock:
             for n in names:
-                e = self.engines.get(n, {})
+                up = k(n)
+                label = n if up == n else f"{n}[{up}]"
+                e = self.engines.get(up, {})
                 if e.get("bad_until", 0) > now:
-                    parts.append(f"{n}(쉬는 중 {int((e['bad_until'] - now) // 60) + 1}분, {e.get('last', '')[:14]})")
+                    parts.append(f"{label}(쉬는 중 {int((e['bad_until'] - now) // 60) + 1}분, {e.get('last', '')[:16]})")
                 else:
-                    parts.append(f"{n}(정상)" if e or self.last_engine == n else n)
+                    parts.append(f"{label}(정상)" if e or self.last_engine == n else label)
         return " > ".join(parts)
 
     def backing_off(self) -> bool:
@@ -275,8 +371,8 @@ class SearchHub:
                 if not wait:
                     return {"items": [], "engine": "", "err": "분당 검색 상한", "src": "rate"}
                 await asyncio.sleep(max(0.0, 60 - (now - calls[0])) + 0.1)
-            if calls and min_gap > 0:
-                await asyncio.sleep(max(0.0, min_gap - (time.time() - calls[-1])))
+            if calls and min_gap > 0:                                 # 기계처럼 일정한 간격은 봇 차단에 잘 걸린다 → 랜덤으로 조금 더 쉰다
+                await asyncio.sleep(max(0.0, min_gap * random.uniform(1.0, 1.5) - (time.time() - calls[-1])))
             calls.append(time.time())
             items, engine, err = await runner()
             res = {"ts": time.time(), "items": items, "engine": engine, "err": err}
@@ -293,6 +389,10 @@ class SearchHub:
 
 HUB = SearchHub()
 
+# 공식 API(키/주소가 있을 때만) → 업스트림이 서로 다른 무료 엔진 순서. 설치된 ddgs 에 없는/꺼진 이름은 자동으로 빠진다.
+DEFAULT_BACKENDS = ("naver", "searxng", "yahoo", "startpage", "brave", "mojeek", "duckduckgo")
+_WARNED: set[str] = set()
+
 
 class WebInfo:
     def __init__(self, cfg: dict | None, memory, guard=None, backend: Callable[[str, int], list] | None = None,
@@ -300,7 +400,8 @@ class WebInfo:
         self.cfg = {
             "enabled": True, "provider": "ddgs", "searxng_url": "", "chance": 0.12, "refresh_hours": 12,
             "timeout_sec": 2.5, "refresh_timeout_sec": 12, "engine_timeout_sec": 4, "per_min": 2, "max_per_min": 6,
-            "min_gap_sec": 1.5, "max_items": 3, "item_chars": 100, "backends": ["auto"], "region": "kr-kr", "proxy": "",
+            "min_gap_sec": 4, "max_items": 3, "item_chars": 100, "backends": list(DEFAULT_BACKENDS), "region": "kr-kr", "proxy": "",
+            "naver_kind": "blog", "max_queries_per_round": 4,
             "wiki_fallback": True, "slang_file": "slang.txt", "file_ttl_hours": 1,
             "slang_queries": ["최신 신조어 TOP 20 뜻", "요즘 유행하는 밈 정리", "요즘 유행어 신조어", "MZ 신조어 모음"], "realtime": True, **(cfg or {}),
         }
@@ -354,24 +455,99 @@ class WebInfo:
         await self.mem.kv_set(self.kv_key, json.dumps(self.cache, ensure_ascii=False))
 
     # ---------- 검색 ----------
+    # ---------- 프로바이더 체인 ----------
+    def _naver_keys(self) -> tuple[str, str]:
+        import os
+        return os.environ.get("NAVER_CLIENT_ID", "").strip(), os.environ.get("NAVER_CLIENT_SECRET", "").strip()
+
+    def _available(self) -> dict[str, str] | None:
+        """ddgs 엔진 → 업스트림. (테스트는 _avail 을 직접 넣는다)"""
+        if "_avail" not in self.__dict__:
+            self._avail = ddgs_text_engines()
+        return self._avail
+
+    def chain(self) -> tuple[list[tuple[str, str]], list[str]]:
+        """설정한 순서대로 [(이름, 업스트림)] 과, 쓸 수 없어 뺀 이름들의 설명."""
+        names = [str(b).strip().lower() for b in (self.cfg.get("backends") or DEFAULT_BACKENDS) if str(b).strip()]
+        if self.cfg.get("provider") == "searxng" and "searxng" not in names:
+            names.insert(0, "searxng")                     # 옛 설정(provider: searxng) 호환
+        avail = self._available()
+        out: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        for b in dict.fromkeys(names):
+            if b == "naver":
+                if all(self._naver_keys()):
+                    out.append(("naver", "naver"))
+                else:
+                    skipped.append("naver(키 없음)")
+            elif b == "searxng":
+                if self.cfg.get("searxng_url"):
+                    out.append(("searxng", "searxng"))
+                else:
+                    skipped.append("searxng(주소 없음)")
+            elif b == "auto":
+                out.append(("auto", "auto"))
+            elif avail is None and self._backend is None:
+                skipped.append(f"{b}(ddgs 없음)")
+            elif avail is not None and b not in avail:
+                skipped.append(f"{b}(설치된 ddgs 에서 꺼짐)")
+            else:
+                out.append((b, (avail or {}).get(b, b)))
+        for x in skipped:
+            if "꺼짐" in x and x not in _WARNED:            # 한 번만 알린다 (예전엔 경고 없이 auto 로 새어 'google 성공'처럼 보였다)
+                _WARNED.add(x)
+                log.warning("web.backends 의 %s → 건너뜁니다. 설치된 ddgs %s 에서 쓸 수 있는 엔진: %s", x, ddgs_version() or "?",
+                            ", ".join(sorted(avail or {})))
+        return out, skipped
+
     def _search_one(self, query: str, n: int, backend: str) -> list[tuple[str, str]]:
         if self._backend:
             return self._backend(query, n)
-        if self.cfg["provider"] == "searxng" and self.cfg.get("searxng_url"):
+        px = self.cfg.get("proxy") or None
+        tmo = float(self.cfg["engine_timeout_sec"])
+        if backend == "naver":
+            cid, sec = self._naver_keys()
+            return _backend_naver(query, n, cid, sec, str(self.cfg.get("naver_kind") or "blog"), tmo, px)
+        if backend == "searxng":
             return _backend_searxng(self.cfg["searxng_url"], query, n)
-        return _backend_ddgs(query, n, backend, self.cfg.get("region") or "kr-kr",
-                             self.cfg.get("proxy") or None, float(self.cfg["engine_timeout_sec"]))
+        region = self.cfg.get("region") or "kr-kr"
+        if backend != "auto":
+            try:
+                return _backend_ddgs_engine(query, n, backend, region, px, tmo)
+            except NoDirect:
+                pass                                                   # ddgs 내부가 바뀜 → 공식 인터페이스로 후퇴
+        try:
+            return _backend_ddgs(query, n, backend, region, px, tmo)
+        except Exception as e:  # noqa: BLE001
+            if "no results" in str(e).lower():
+                return []                                              # 공식 인터페이스는 빈 결과를 예외로 준다
+            raise
 
     def _runner(self, query: str, timeout: float, fast: bool = False):
-        """허브가 부르는 실제 검색: 설정한 엔진을 순서대로 시도해 첫 성공에서 멈춘다. (items, 엔진, 실패 이유) 를 돌려준다."""
-        backends = list(self.cfg.get("backends") or ["auto"])
+        """허브가 부르는 실제 검색: 체인을 순서대로 시도해 첫 성공에서 멈춘다. (items, 엔진, 실패 이유) 를 돌려준다.
+        - 차단/네트워크 오류: 그 업스트림을 쉬게 한다 (같은 업스트림의 다른 엔진도 이번엔 건너뜀)
+        - 진짜 빈 결과(HTTP 200): 뒤 엔진이 결과를 냈을 때만 막힌 것으로 본다 (전부 비면 검색어 탓)"""
+        chain, _ = self.chain()
+        names = [n for n, _u in chain]
+        up = dict(chain)
 
         async def run():
             errs: list[str] = []
 
             def job():
-                empties: list[str] = []                                        # 결과가 비어 돌아온 엔진 (뒤 엔진이 성공했을 때만 '막힌 엔진'으로 친다)
-                for b in HUB.engine_order(backends, 2 if fast else 0):         # 쉬는 중인 엔진은 건너뛰고, 실시간 조회는 가장 좋은 엔진 둘까지만(빠르게)
+                if not names:
+                    errs.append("쓸 수 있는 검색 엔진 없음")
+                    return [], ""
+                empties: list[str] = []
+                failed_up: set[str] = set()
+                order = HUB.engine_order(names, 0, key=lambda x: up.get(x, x))
+                if fast:                                               # 실시간 조회는 업스트림이 다른 엔진 둘까지만(빠르게)
+                    seen_up: set[str] = set()
+                    order = [x for x in order if not (up.get(x, x) in seen_up or seen_up.add(up.get(x, x)))][:2]
+                for b in order:
+                    u = up.get(b, b)
+                    if u in failed_up:
+                        continue                                       # 같은 업스트림이 방금 막혔다
                     rows = None
                     for attempt in (0, 1):
                         try:
@@ -380,20 +556,22 @@ class WebInfo:
                         except Exception as e:  # noqa: BLE001
                             why = classify_error(e)
                             if attempt == 0 and "ENETUNREACH" in why:
-                                continue                                       # IPv6 로 먼저 붙었다 실패하는 일시적 오류 → 같은 엔진 한 번 더
+                                continue                               # IPv6 로 먼저 붙었다 실패하는 일시적 오류 → 한 번 더
                             errs.append(f"{b}:{why}")
-                            HUB.engine_fail(b, why)
+                            HUB.engine_fail(u, why)
+                            failed_up.add(u)
                             rows = None
                             break
                     if rows is None:
                         continue
                     if rows:
-                        HUB.engine_ok(b)
-                        for eb in empties:                                     # 다른 엔진은 결과를 냈는데 이 엔진만 비었다 → 막힌 것
-                            HUB.engine_fail(eb, "결과 없음")
+                        HUB.engine_ok(u)
+                        for eb in empties:                             # 다른 엔진은 결과를 냈는데 이 엔진만 비었다 → 막힌 것
+                            if up.get(eb, eb) != u and eb not in ("naver", "searxng"):   # 공식 API 의 빈 결과는 진짜 빈 결과
+                                HUB.engine_fail(up.get(eb, eb), "결과 없음")
                         return rows, b
                     errs.append(f"{b}:결과 없음")
-                    empties.append(b)                                          # 전부 비면 검색어 탓일 수 있으니 엔진을 쉬게 하지 않는다
+                    empties.append(b)
                 return [], ""
 
             try:
@@ -410,7 +588,8 @@ class WebInfo:
 
     async def _search(self, query: str, timeout: float, fast: bool = False, wait: bool = True) -> list[str]:
         r = await HUB.fetch(query, self._runner(query, timeout, fast), float(self.cfg["refresh_hours"]) * 3600, wait=wait,
-                            max_per_min=int(self.cfg["max_per_min"]), min_gap=float(self.cfg["min_gap_sec"]))
+                            max_per_min=int(self.cfg["max_per_min"]),
+                            min_gap=min(1.5, float(self.cfg["min_gap_sec"])) if fast else float(self.cfg["min_gap_sec"]))   # 대화 중 조회는 짧게 기다린다
         items = self.clean(r["items"])                  # 허브에는 원본 결과가 공유된다 → 정리/안전 필터는 인스턴스마다 자기 기준으로
         self.last_error = "" if items else (r["err"] or "결과가 모두 필터에 걸림")
         if not items and r["src"] == "net":
@@ -475,12 +654,31 @@ class WebInfo:
             fresh_ok = False                         # 이번에 실제 네트워크 검색이 성공했는가 (백오프 해제 근거는 이것뿐)
             hard: list[str] = []                     # 진짜 검색 실패 이유 (필터/진행 중/쉬는 중은 제외)
             errs: list[str] = []
+            net_calls = 0
+            hard_run = 0                             # 연달아 '진짜 실패'한 검색 수
+            cap = max(1, int(self.cfg.get("max_queries_per_round") or 4))
+            slang_cap = max(1, cap // 2) if topics else cap    # 유행어가 상한을 다 써서 캐릭터 소식을 못 받는 일이 없게
+            slang_calls = 0
+            ttl_s = float(self.cfg["refresh_hours"]) * 3600
             for key, q in qs:
                 if key == "slang" and len(by_key.get("slang", [])) >= 8:
                     continue                                 # 유행어는 앞에서 충분히(8개) 받았으면 나머지 검색어는 건너뛴다 (요청 절약)
+                if key in by_key and key != "slang":
+                    continue                                 # 같은 키는 하나만 성공하면 충분
+                cached = HUB.cache.get(q)
+                fresh = bool(cached and cached["items"] and time.time() - cached["ts"] < ttl_s)
+                over = net_calls >= cap or (key == "slang" and slang_calls >= slang_cap)
+                if not fresh and (over or hard_run >= 2):
+                    notes.append(f"{key}=건너뜀({'라운드 상한' if over else '연속 실패'})")
+                    continue                                 # 한 라운드에 너무 많이 두드리면 봇 차단을 스스로 부른다 → 남은 건 폴백/다음 라운드
                 r = await HUB.fetch(q, self._runner(q, float(self.cfg["refresh_timeout_sec"])),
                                     float(self.cfg["refresh_hours"]) * 3600,
                                     max_per_min=int(self.cfg["max_per_min"]), min_gap=float(self.cfg["min_gap_sec"]))
+                if r["src"] == "net":
+                    net_calls += 1
+                    slang_calls += key == "slang"
+                    blocked = not r["items"] and r["err"] and not all(x.endswith("결과 없음") for x in r["err"].split(", "))
+                    hard_run = hard_run + 1 if blocked else 0       # 검색어 탓 빈 결과는 '연속 실패'로 세지 않는다
                 items = self.clean(r["items"])            # 허브 캐시는 원본이라 인스턴스마다 자기 안전 필터로 정리한다
                 if items:
                     primary_ok = True
@@ -614,7 +812,10 @@ class WebInfo:
         now = time.time()
         ok = f"{int((now - HUB.last_ok) // 60)}분 전({HUB.last_engine or '?'})" if HUB.last_ok else "아직 없음"
         nxt = f"{int((HUB.next_try - now) // 60) + 1}분 뒤(연속 실패 {HUB.fail_streak}회)" if HUB.backing_off() else "지금 가능"
-        line = f"엔진 {HUB.engine_status(list(self.cfg.get('backends') or ['auto']))} · 마지막 성공 {ok} · 다음 검색 {nxt}"
+        chain, skipped = self.chain()
+        line = f"엔진 {HUB.engine_status([n for n, _u in chain], key=dict(chain).get) or '없음'} · 마지막 성공 {ok} · 다음 검색 {nxt}"
+        if skipped:
+            line += f"\n제외: {', '.join(skipped)}"
         if self.last_round:
             line += f"\n최근 갱신: {self.last_round[:300]}"
         err = self.last_error or HUB.last_error
