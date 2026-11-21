@@ -200,7 +200,8 @@ class GirlBot(discord.Client):
         self.init_unanswered: dict[int, int] = {}        # 먼저 말했는데 아직 사람이 답하지 않은 횟수
         self.init_gap: dict[int, float] = {}             # 채널별 이번 능동 대화 쿨타임(랜덤)
         self.init_target: dict[int, tuple] = {}          # 채널별 마지막으로 먼저 말 건 대상 (uid, 시각)
-        self.webhooks: dict[int, discord.Webhook] = {}   # 채널(부모) id → 이 봇이 만든 웹훅
+        self.webhooks: dict[tuple[int, str], discord.Webhook] = {}   # (채널(부모) id, 캐릭터 id) → 이 봇이 만든 웹훅
+        self.webhook_ver: dict[tuple[int, str], float] = {}          # 웹훅에 반영한 프로필 사진 버전 (파일 수정 시각)
         self.webhook_failed: dict[int, float] = {}       # 웹훅을 못 만든 채널 (잠시 뒤 다시 시도)
         self.our_webhooks: set[int] = set()              # 이 봇의 웹훅 id (캐릭터 메시지에 답장했는지 알아보는 데 사용)
         self.last_char: dict[int, str] = {}              # 채널별 마지막으로 말한 캐릭터
@@ -384,27 +385,61 @@ def replies_to_human(message: discord.Message) -> bool:
                 and bot.user and ref.resolved.author.id != bot.user.id and not is_our_webhook(ref.resolved))
 
 
-async def get_webhook(channel) -> discord.Webhook | None:
-    """채널의 캐릭터용 웹훅 (없으면 만든다). 권한이 없으면 None (잠시 뒤 다시 시도)."""
+AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"   # /캐릭터 동작:프로필 로 올린 프로필 사진 (git 에 안 올라감)
+
+
+DEFAULT_AVATAR_DIR = Path(__file__).resolve().parent.parent / "config" / "characters" / "avatars"   # 저장소에 들어 있는 기본 사진
+
+
+def avatar_file(cid: str) -> Path | None:
+    """올린 사진(data/avatars) > 기본 사진(config/characters/avatars) 순서."""
+    for d in (AVATAR_DIR, DEFAULT_AVATAR_DIR):
+        p = d / f"{cid}.png"
+        if p.is_file():
+            return p
+    return None
+
+
+def avatar_version(cid: str) -> float:
+    p = avatar_file(cid)
+    return p.stat().st_mtime if p else 0.0
+
+
+async def get_webhook(channel, cid: str | None = None) -> discord.Webhook | None:
+    """채널의 캐릭터용 웹훅 (없으면 만든다). 캐릭터마다 웹훅을 따로 둬서 프로필 사진을 웹훅 자체에 저장한다
+    (메시지마다 넘기는 이미지 주소는 만료될 수 있지만 웹훅 아바타는 디스코드에 계속 남는다). 권한이 없으면 None."""
     parent = channel.parent if isinstance(channel, discord.Thread) else channel
     pid = getattr(parent, "id", None)
     if pid is None:
         return None
-    wh = bot.webhooks.get(pid)
+    key = (pid, cid or "")
+    wh = bot.webhooks.get(key)
+    ver = avatar_version(cid) if cid else 0.0
     if wh is not None:
+        if cid and bot.webhook_ver.get(key) != ver:                # 프로필 사진이 바뀌었다 → 웹훅 아바타 갱신
+            try:
+                p = avatar_file(cid)
+                wh = await wh.edit(avatar=p.read_bytes() if p else None, reason="캐릭터 프로필 변경")
+                bot.webhooks[key] = wh
+                bot.webhook_ver[key] = ver
+            except (discord.HTTPException, OSError) as e:
+                log.warning("웹훅 프로필 갱신 실패 (채널 %s, %s): %s", pid, cid, e)
         return wh
     if time.time() - bot.webhook_failed.get(pid, 0) < 600:
         return None
     try:
-        name = mcfg["webhook_name"]
+        name = f"{mcfg['webhook_name']}-{cid}"[:80] if cid else mcfg["webhook_name"]
         hooks = await parent.webhooks()
         wh = next((h for h in hooks if h.name == name and h.user and bot.user and h.user.id == bot.user.id), None)
         if wh is None:
-            wh = await parent.create_webhook(name=name, reason="캐릭터마다 다른 이름/아바타로 말하기")
-        bot.webhooks[pid] = wh
+            p = avatar_file(cid) if cid else None
+            wh = await parent.create_webhook(name=name, avatar=p.read_bytes() if p else None,
+                                             reason="캐릭터마다 다른 이름/아바타로 말하기")
+            bot.webhook_ver[key] = ver
+        bot.webhooks[key] = wh
         bot.our_webhooks.add(wh.id)
         return wh
-    except (discord.Forbidden, discord.HTTPException, AttributeError) as e:
+    except (discord.Forbidden, discord.HTTPException, AttributeError, OSError) as e:
         bot.webhook_failed[pid] = time.time()
         log.warning("웹훅을 만들 수 없어요 (채널 %s): %s → 웹훅 관리 권한을 주세요. 그동안은 이름 앞붙임으로 말해요.", pid, e)
         return None
@@ -419,10 +454,10 @@ async def send_bubbles(
     sent_ids: list[int] = []
     rendered: list[str] = []
     multi = len(hub.ctx().chars) > 1 and mcfg.get("webhook", True) and not isinstance(channel, discord.DMChannel)
-    wh = await get_webhook(channel) if multi else None              # 캐릭터가 여럿이면 웹훅으로 캐릭터 이름/아바타로 말한다
+    wh = await get_webhook(channel, persona.char_id) if multi else None   # 캐릭터가 여럿이면 캐릭터별 웹훅으로 이름/아바타를 달고 말한다
     cname = persona.name
-    avatar = persona.data.get("avatar_url") or None
-    if not avatar and persona.char_id == hub.ctx().primary and bot.user:
+    avatar = None if avatar_file(persona.char_id) else (persona.data.get("avatar_url") or None)   # 올린 사진이 있으면 웹훅 자체 아바타를 쓴다
+    if not avatar and not avatar_file(persona.char_id) and persona.char_id == hub.ctx().primary and bot.user:
         avatar = bot.user.display_avatar.url          # 아바타를 따로 안 정한 기본 캐릭터는 봇 계정 프로필 사진으로 (웹훅이어도 같은 얼굴)
     for i, raw in enumerate(bubbles):
         # 서버 커스텀 이모지 `:이름:` 을 실제 이모지로 바꿔서 보낸다
@@ -446,7 +481,7 @@ async def send_bubbles(
                 continue
             except discord.HTTPException as e:
                 log.warning("웹훅 전송 실패, 일반 메시지로 대체: %s", e)
-                bot.webhooks.pop(getattr(getattr(channel, "parent", channel), "id", 0), None)
+                bot.webhooks.pop((getattr(getattr(channel, "parent", channel), "id", 0), persona.char_id), None)
         if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id) and not multi:
             try:
                 m_ = await reply_to.reply(text, mention_author=False)
@@ -1679,11 +1714,11 @@ async def swap_character(
         c = await hub.add_character(ctx, character)
         extra = ""
         if channel is not None and isinstance(channel, (discord.TextChannel, discord.Thread)):
-            if await get_webhook(channel) is None:
+            if await get_webhook(channel, c.cid) is None:
                 extra = "\n⚠ 이 채널에 웹훅을 만들 수 없어요. 봇에게 **웹훅 관리** 권한을 주세요 (그전에는 이름을 앞에 붙여서 말해요)."
         await interaction.followup.send(
             f"**{c.persona.name}** (`{c.cid}`) 을(를) 이 서버에 추가했어요. 지금 {len(ctx.chars)}명이 함께 있어요."
-            f"{'' if c.persona.data.get('avatar_url') else chr(10) + '-# 아바타를 쓰려면 캐릭터 yaml 에 avatar_url 을 적어 주세요.'}{extra}",
+            f"{'' if (c.persona.data.get('avatar_url') or avatar_file(c.cid)) else chr(10) + '-# 프로필 사진은 `/캐릭터 동작:프로필 캐릭터:… 이미지:(첨부)` 로 바꿀 수 있어요.'}{extra}",
             ephemeral=True)
         if greet and c.persona.greeting and channel is not None:
             hub.use_char(c.cid)
@@ -1780,11 +1815,59 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
         bot.next_ok[ch] = max(bot.next_ok.get(ch, 0), time.monotonic() + 2.0)
 
 
+AVATAR_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+
+
+async def set_avatar(interaction: discord.Interaction, character: Optional[str], image: Optional[discord.Attachment]) -> None:
+    """/캐릭터 동작:프로필 — 올린 사진을 512px 정사각형 PNG 로 저장하고(data/avatars/<id>.png), 캐릭터 웹훅 아바타를 바꾼다.
+    이미지를 비우면 저장한 사진을 지워 원래(yaml avatar_url 또는 봇 프로필)로 되돌린다. 모든 서버에 공통."""
+    ids = dict(Persona.available())
+    cid = character or hub.ctx().primary
+    if cid not in ids:
+        await interaction.response.send_message("그런 캐릭터가 없어요. 캐릭터를 골라 주세요.", ephemeral=True)
+        return
+    name = ids[cid]
+    if image is None:
+        p = AVATAR_DIR / f"{cid}.png"
+        p = p if p.is_file() else None
+        if p:
+            p.unlink(missing_ok=True)
+        await interaction.response.send_message(
+            f"**{name}** 프로필 사진을 원래대로 되돌렸어요." if p else f"**{name}** 은(는) 올린 프로필 사진이 없어요. `이미지`에 사진을 첨부해 주세요.",
+            ephemeral=True)
+        return
+    ctype = (image.content_type or "").split(";")[0].lower()
+    if ctype not in AVATAR_TYPES or image.size > 8_000_000:
+        await interaction.response.send_message("png/jpg/webp/gif 이미지, 8MB 이하만 쓸 수 있어요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        raw = await image.read()
+        from io import BytesIO
+        from PIL import Image
+        im = Image.open(BytesIO(raw)).convert("RGBA")
+        w, h = im.size
+        s = min(w, h)
+        top = 0 if h <= w else min(int(h * 0.08), h - s)            # 세로로 긴 그림은 얼굴이 있는 윗부분 쪽으로
+        im = im.crop(((w - s) // 2, top, (w - s) // 2 + s, top + s)).resize((512, 512), Image.LANCZOS)
+        AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+        im.save(AVATAR_DIR / f"{cid}.png", optimize=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("프로필 사진 저장 실패 (%s): %s", cid, e)
+        await interaction.followup.send("이미지를 읽지 못했어요. 다른 사진으로 해 주세요.", ephemeral=True)
+        return
+    note = ""
+    if cid == hub.ctx().primary and len(hub.ctx().chars) < 2:
+        note = "\n-# 지금은 캐릭터가 한 명이라 봇 계정 프로필로 말해요. 캐릭터가 둘 이상이면 이 사진이 쓰여요 (봇 계정 사진은 디스코드 개발자 포털에서 바꿔요)."
+    await interaction.followup.send(f"**{name}** 프로필 사진을 바꿨어요. 다음 말부터 적용돼요.{note}", ephemeral=True)
+
+
 @bot.tree.command(name="캐릭터", description="캐릭터를 부르거나 내보내고, 캐릭터끼리 대화를 시작/중지해요")
 @app_commands.describe(mode="부르기/내보내기/목록 · 대화시작/대화중지 · 상호작용켜기/끄기(캐릭터끼리 알아서 받아치기) · 상태",
                        character="부를/내보낼 캐릭터, 대화시작일 땐 먼저 말할 캐릭터 (생략하면 아무나)",
-                       topic="대화시작할 때 이야기 주제 (생략하면 자유)", rounds="대화시작: 말을 주고받을 횟수 (기본 6, 최대 20)")
-@app_commands.rename(mode="동작", character="캐릭터", topic="주제", rounds="횟수")
+                       topic="대화시작할 때 이야기 주제 (생략하면 자유)", rounds="대화시작: 말을 주고받을 횟수 (기본 6, 최대 20)",
+                       image="프로필: 새 프로필 사진 (png/jpg/webp/gif, 8MB 이하). 비우면 원래 사진으로 되돌림")
+@app_commands.rename(mode="동작", character="캐릭터", topic="주제", rounds="횟수", image="이미지")
 @app_commands.choices(mode=[
     app_commands.Choice(name="부르기", value="add"),
     app_commands.Choice(name="내보내기", value="remove"),
@@ -1794,14 +1877,19 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
     app_commands.Choice(name="상호작용켜기", value="auto_on"),
     app_commands.Choice(name="상호작용끄기", value="auto_off"),
     app_commands.Choice(name="상태", value="status"),
+    app_commands.Choice(name="프로필", value="avatar"),
 ])
 @app_commands.autocomplete(character=character_autocomplete)
 async def character_cmd(
     interaction: discord.Interaction, mode: app_commands.Choice[str], character: Optional[str] = None,
     topic: Optional[str] = None, rounds: app_commands.Range[int, 2, 20] = 6,
+    image: Optional[discord.Attachment] = None,
 ) -> None:
     act = mode.value
     ctx = hub.ctx()
+    if act == "avatar":
+        await set_avatar(interaction, character, image)
+        return
     if act in ("add", "remove", "list"):
         if act != "list" and not character:
             await interaction.response.send_message("캐릭터를 골라 주세요. (`/캐릭터 동작:목록`으로 확인)", ephemeral=True)

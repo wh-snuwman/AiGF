@@ -104,8 +104,7 @@ fight_replies:
   - "더 할 말 있어요?"
   - "됐어요 시간 낭비예요"
 
-# 캐릭터가 여럿일 때 웹훅으로 말할 때 쓰는 프로필 이미지
-avatar_url: "https://raw.githubusercontent.com/wh-snuwman/AiGF/main/config/characters/avatars/kei.png"
+# 프로필 사진: config/characters/avatars/kei.png (기본). 디스코드에서 /캐릭터 동작:프로필 로 바꿀 수 있다
 
 # 가끔 인터넷에서 미리 받아 둘 '나 자신' 관련 검색어 (현재 검색 기능은 꺼져 있음)
 web_topics: ["블루 아카이브 케이", "블루 아카이브 업데이트"]
