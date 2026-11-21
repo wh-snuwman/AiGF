@@ -302,7 +302,7 @@ class WebInfo:
             "timeout_sec": 2.5, "refresh_timeout_sec": 12, "engine_timeout_sec": 4, "per_min": 2, "max_per_min": 6,
             "min_gap_sec": 1.5, "max_items": 3, "item_chars": 100, "backends": ["auto"], "region": "kr-kr", "proxy": "",
             "wiki_fallback": True, "slang_file": "slang.txt", "file_ttl_hours": 1,
-            "slang_queries": ["요즘 유행어 신조어", "요즘 유행하는 밈"], "realtime": True, **(cfg or {}),
+            "slang_queries": ["최신 신조어 TOP 20 뜻", "요즘 유행하는 밈 정리", "요즘 유행어 신조어", "MZ 신조어 모음"], "realtime": True, **(cfg or {}),
         }
         self.mem = memory
         self.kv_key = kv_key                       # 캐릭터마다 따로 저장 (서버에 캐릭터가 여럿이어도 서로 덮어쓰지 않게)
@@ -476,6 +476,8 @@ class WebInfo:
             hard: list[str] = []                     # 진짜 검색 실패 이유 (필터/진행 중/쉬는 중은 제외)
             errs: list[str] = []
             for key, q in qs:
+                if key == "slang" and len(by_key.get("slang", [])) >= 8:
+                    continue                                 # 유행어는 앞에서 충분히(8개) 받았으면 나머지 검색어는 건너뛴다 (요청 절약)
                 r = await HUB.fetch(q, self._runner(q, float(self.cfg["refresh_timeout_sec"])),
                                     float(self.cfg["refresh_hours"]) * 3600,
                                     max_per_min=int(self.cfg["max_per_min"]), min_gap=float(self.cfg["min_gap_sec"]))
