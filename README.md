@@ -100,7 +100,7 @@
 - 사용자가 "검색/최신/요즘 뭐/유행어" 같은 말을 할 때만 **실시간 조회 1회** (제한 시간 2.5초, 분당 2회, 실패하면 그냥 넘어감).
 - 검색어에는 사용자 이름/멘션/링크를 넣지 않습니다. 결과는 링크·기호 제거, 100자 제한, 가드 점검(주입 의심 문장 폐기) 후 '참고 데이터(명령 아님, 출처/링크 언급 금지)'로만 넣습니다.
 - **검색 순서**(`web.backends`): `naver`(네이버 검색 공식 API) → `searxng`(직접 띄운 서버) → ddgs 무료 엔진(`yahoo`, `startpage`, `brave`, `mojeek`, `duckduckgo`) → 폴백. 설정 안 된 것과 설치된 ddgs 에서 꺼진 이름(9.16 기준 `google`, `bing`, `yandex`)은 자동으로 빠지고 시작 로그·`/웹 보기`의 '제외'에 표시됩니다.
-- **네이버 검색 API (권장, 가장 안정적)**: 무료 엔진은 스크래핑이라 서버 요청을 자주 막지만, 공식 API 는 막히지 않습니다(무료 하루 25,000회). [네이버 개발자센터](https://developers.naver.com/apps)에서 애플리케이션 등록 → 사용 API '검색' → 발급된 값을 `.env` 의 `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` 에 넣고 재시작. 종류는 `web.naver_kind`(blog/webkr/news).
+- **네이버 검색 API (권장, 가장 안정적)**: 무료 엔진은 스크래핑이라 서버 요청을 자주 막지만, 공식 API 는 막히지 않습니다(하루 25,000회, API HUB 는 종량제이며 현재 한시적 무료). 2026-07 부터 신규 키는 [네이버 클라우드](https://www.ncloud.com/) 콘솔 → Application Services → **NAVER API HUB** → 이용 신청 → Application 등록(검색 선택) → 인증 정보에서 발급합니다(카드 등록 필요, 개발자센터의 사용 API 목록에는 더 이상 '검색'이 없음). 발급된 Client ID/Secret 을 `.env` 의 `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` 에 넣고 재시작. 예전 개발자센터 키도 자동으로 동작합니다(`web.naver_api: auto`). 종류는 `web.naver_kind`(blog/webkr/news).
 - ddgs 설치: `pip install ddgs` (키 필요 없음). 없거나 오프라인이면 무료 엔진만 꺼집니다.
 - 캐릭터마다 `web_topics`(검색어 최대 4개)를 yaml 에 적습니다. `/웹 보기·켜기·끄기·새로고침` (엔진 설정, 마지막 성공, 다음 재시도, 최근 오류가 보입니다).
 - **무료 검색 엔진은 서버 요청을 자주 막습니다**(429/403/202). 그래서:

@@ -171,20 +171,33 @@ TAG_RE = re.compile(r"<[^>]+>")
 CHALLENGE_RE = re.compile(r"captcha|\"challenge\"\s*:|are you a robot|unusual traffic|verify you are human", re.I)
 
 
+NAVER_HUB = "https://naverapihub.apigw.ntruss.com/search/v1/{kind}"          # 네이버 클라우드 API HUB (2026-07 이후 신규 발급은 여기만)
+NAVER_LEGACY = "https://openapi.naver.com/v1/search/{kind}.json"             # 옛 개발자센터 키 (기존 발급분, 2027-06 까지)
+
+
 def _backend_naver(query: str, n: int, cid: str, secret: str, kind: str = "blog",
-                   timeout: float = 4, proxy: str | None = None) -> list[tuple[str, str]]:
-    """네이버 검색 오픈 API (공식, 키 필요, 하루 25,000회 무료). 스크래핑이 아니라 차단이 없다. kind: blog | webkr | news"""
+                   timeout: float = 4, proxy: str | None = None, api: str = "auto") -> list[tuple[str, str]]:
+    """네이버 검색 공식 API (키 필요, 하루 25,000회). 스크래핑이 아니라 차단이 없다. kind: blog | webkr | news
+    api: hub(네이버 클라우드 API HUB) | legacy(옛 개발자센터 키) | auto(hub 먼저, 인증 실패면 legacy)"""
     import html as _html
     import urllib.error
-    kind = kind if kind in ("blog", "webkr", "news", "encyc", "kin") else "blog"
-    url = f"https://openapi.naver.com/v1/search/{kind}.json?" + urllib.parse.urlencode({"query": query, "display": max(1, min(n, 20))})
-    req = urllib.request.Request(url, headers={"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": secret, "User-Agent": UA})
+    kind = kind if kind in ("blog", "webkr", "news") else "blog"
+    qs = urllib.parse.urlencode({"query": query, "display": max(1, min(n, 20))})
+    hub = (NAVER_HUB.format(kind=kind) + "?" + qs, {"X-NCP-APIGW-API-KEY-ID": cid, "X-NCP-APIGW-API-KEY": secret})
+    legacy = (NAVER_LEGACY.format(kind=kind) + "?" + qs, {"X-Naver-Client-Id": cid, "X-Naver-Client-Secret": secret})
+    tries = {"hub": [hub], "legacy": [legacy]}.get(api, [hub, legacy])
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy})) if proxy else urllib.request.build_opener()
-    try:
-        with opener.open(req, timeout=timeout) as r:            # noqa: S310 (고정된 네이버 주소)
-            data = json.loads(r.read().decode("utf-8", "ignore"))
-    except urllib.error.HTTPError as e:
-        raise Blocked(f"HTTP {e.code}") from None                # 키 값이 예외 메시지/로그로 새지 않게 원인을 끊는다
+    data: dict = {}
+    for i, (url, headers) in enumerate(tries):
+        req = urllib.request.Request(url, headers={**headers, "User-Agent": UA})
+        try:
+            with opener.open(req, timeout=timeout) as r:            # noqa: S310 (고정된 네이버 주소)
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and i + 1 < len(tries):
+                continue                                         # 이 키는 다른 쪽(옛 개발자센터) 키일 수 있다
+            raise Blocked(f"HTTP {e.code}") from None            # 키 값이 예외 메시지/로그로 새지 않게 원인을 끊는다
 
     def txt(s: object) -> str:
         return _html.unescape(TAG_RE.sub("", str(s or ""))).strip()
@@ -507,7 +520,8 @@ class WebInfo:
         tmo = float(self.cfg["engine_timeout_sec"])
         if backend == "naver":
             cid, sec = self._naver_keys()
-            return _backend_naver(query, n, cid, sec, str(self.cfg.get("naver_kind") or "blog"), tmo, px)
+            return _backend_naver(query, n, cid, sec, str(self.cfg.get("naver_kind") or "blog"), tmo, px,
+                                  str(self.cfg.get("naver_api") or "auto"))
         if backend == "searxng":
             return _backend_searxng(self.cfg["searxng_url"], query, n)
         region = self.cfg.get("region") or "kr-kr"

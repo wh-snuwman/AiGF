@@ -207,12 +207,14 @@ web:
   provider: ddgs               # ddgs | searxng
   searxng_url: ""
   # 검색 순서 (위에서부터 시도, 실패하면 다음으로 자동 전환). 설정 안 된 것/설치된 ddgs 에서 꺼진 이름은 자동으로 빠진다.
-  #  naver   : 네이버 검색 공식 API (가장 안정적, 무료 하루 25,000회). .env 에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 필요
+  #  naver   : 네이버 검색 공식 API (가장 안정적, 하루 25,000회). .env 에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 필요
+  #            (2026-07 부터 신규 키는 네이버 클라우드 'NAVER API HUB' 에서만 발급. 옛 개발자센터 키도 그대로 동작)
   #  searxng : 직접 띄운 SearXNG (searxng_url 필요)
   #  그 외   : ddgs 무료 엔진 (스크래핑이라 자주 막힘). 괄호는 실제 업스트림 — 같은 업스트림은 같이 막혀서 같이 쉰다
   #            yahoo(bing) startpage(google) brave mojeek duckduckgo(bing). ddgs 9.16 에서 google/bing/yandex 는 꺼져 있음
   backends: ["naver", "searxng", "yahoo", "startpage", "brave", "mojeek", "duckduckgo"]
   naver_kind: "blog"           # 네이버 검색 종류: blog | webkr | news
+  naver_api: "auto"            # hub(API HUB 키) | legacy(옛 개발자센터 키) | auto(hub 먼저, 인증 실패면 legacy)
   region: "kr-kr"
   proxy: ""                    # (선택) 예: socks5://127.0.0.1:9050 (로그에 찍지 않음)
   engine_timeout_sec: 4        # 엔진 한 번 접속 제한

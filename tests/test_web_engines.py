@@ -166,6 +166,34 @@ class NaverTests(unittest.TestCase):
             rows = web._backend_naver("럭키비키", 3, "id", "sec")
         self.assertEqual(rows, [("럭키비키 뜻", '요즘 "밈" 정리')])
 
+    def test_hub_first_then_legacy_on_auth_error(self):
+        import urllib.error
+        body = json.dumps({"items": [{"title": "t", "description": "d"}]}).encode()
+        seen = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return body
+
+        def fake_open(_self, req, timeout=None):
+            seen.append((req.full_url.split("?")[0], sorted(k.lower() for k in req.headers)))
+            if "ntruss" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+            return Resp()
+
+        with mock.patch("urllib.request.OpenerDirector.open", fake_open):
+            rows = web._backend_naver("q", 3, "id", "sec")
+        self.assertEqual(rows, [("t", "d")])
+        self.assertIn("naverapihub.apigw.ntruss.com", seen[0][0])
+        self.assertIn("x-ncp-apigw-api-key-id", seen[0][1])
+        self.assertIn("openapi.naver.com", seen[1][0])
+
     def test_http_error_becomes_blocked_without_keys(self):
         import urllib.error
         err = urllib.error.HTTPError("https://openapi.naver.com", 401, "Unauthorized", {}, None)
