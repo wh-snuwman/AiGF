@@ -370,7 +370,8 @@ class WebInfo:
             errs: list[str] = []
 
             def job():
-                for b in HUB.engine_order(backends, 1 if fast else 0):         # 쉬는 중인 엔진은 건너뛰고, 실시간 조회는 가장 좋은 엔진 하나만
+                empties: list[str] = []                                        # 결과가 비어 돌아온 엔진 (뒤 엔진이 성공했을 때만 '막힌 엔진'으로 친다)
+                for b in HUB.engine_order(backends, 2 if fast else 0):         # 쉬는 중인 엔진은 건너뛰고, 실시간 조회는 가장 좋은 엔진 둘까지만(빠르게)
                     rows = None
                     for attempt in (0, 1):
                         try:
@@ -388,9 +389,11 @@ class WebInfo:
                         continue
                     if rows:
                         HUB.engine_ok(b)
+                        for eb in empties:                                     # 다른 엔진은 결과를 냈는데 이 엔진만 비었다 → 막힌 것
+                            HUB.engine_fail(eb, "결과 없음")
                         return rows, b
                     errs.append(f"{b}:결과 없음")
-                    HUB.engine_fail(b, "결과 없음")
+                    empties.append(b)                                          # 전부 비면 검색어 탓일 수 있으니 엔진을 쉬게 하지 않는다
                 return [], ""
 
             try:

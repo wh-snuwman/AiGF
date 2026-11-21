@@ -106,8 +106,9 @@
   - **연속 실패 백오프**: 한 라운드가 전부 실패하면 30분 → 1시간 → … 최대 6시간 쉬었다 합니다(쉬는 동안 실시간 조회도 안 함).
   - **폴백**: 검색이 모두 실패하면 캐릭터 소식은 **위키백과 공식 API**, 유행어는 **`config/slang.txt`**(직접 편집, `말 - 뜻` 한 줄에 하나)로 채웁니다. 폴백 항목은 `file_ttl_hours`(1시간) 뒤 다시 검색을 시도해 살아나면 교체합니다.
   - **엔진 자동 전환**: `web.backends` 의 엔진이 실패(차단/결과 없음/IPv6 오류)하면 그 엔진을 5분(연속 실패하면 최대 1시간) 쉬게 하고 바로 다음 엔진으로 넘어갑니다. 성공하면 즉시 복귀하고, 일시적인 `ENETUNREACH` 는 같은 엔진으로 한 번 더 시도합니다. `/웹 보기` 에 엔진별 상태(정상/쉬는 중 N분)가 보입니다. 무료 엔진은 시간에 따라 되다 말다 하므로 기본은 `["yahoo", "google", "duckduckgo"]` 입니다.
-  - **엔진 고르기(서버에서)**: `python scripts/web_probe.py` 가 IPv4/IPv6 접속과 엔진별(`duckduckgo`, `yahoo`, `brave`…) 성공 여부를 표로 보여 줍니다. 잘 되는 엔진을 `web.backends: ["yahoo", "duckduckgo"]` 처럼 위에서부터 적으세요(기본 `["auto"]`).
-  - `Network is unreachable (os error 101)` 가 간헐적으로 보이고 probe 에서 IPv6 접속만 실패하면, 서버에 IPv6 경로가 없어서입니다. 시스템 설정이라 직접 하셔야 해요: `echo 'precedence ::ffff:0:0/96  100' | sudo tee -a /etc/gai.conf` (IPv4 우선, 되돌리려면 그 줄을 지우면 됩니다).
+  - **엔진 고르기(서버에서)**: `python scripts/web_probe.py` 가 IPv4/IPv6 접속과 엔진별(`duckduckgo`, `yahoo`, `brave`…) 성공 여부를 표로 보여 줍니다. 잘 되는 엔진을 `web.backends: ["yahoo", "duckduckgo"]` 처럼 위에서부터 적으세요(기본 `["yahoo", "google", "duckduckgo"]`).
+  - `Network is unreachable (os error 101)` 가 간헐적으로 보이고 probe 에서 IPv6 접속만 실패하면, 서버에 IPv6 경로가 없어서입니다. 시스템 설정이라 직접 하셔야 해요: `echo 'precedence ::ffff:0:0/96  100' | sudo tee -a /etc/gai.conf` (IPv4 우선, 되돌리려면 그 줄을 지우면 됩니다). IPv6 를 아예 끄려면 `sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1` (영구 적용은 `/etc/sysctl.conf` 에 같은 값을 `net.ipv6.conf.all.disable_ipv6 = 1` 로 추가).
+  - 엔진이 비어 돌아온 경우는, 같은 검색에서 다른 엔진이 결과를 냈을 때만 그 엔진을 쉬게 합니다(모든 엔진이 비면 검색어 탓일 수 있어 쉬게 하지 않습니다). 실시간 조회는 엔진 최대 2개까지 시도합니다.
 
 ### 글 모양: 짧게, 기호 없이, 담백하게 (`style:`)
 실제 로그에서 "디코 쓰는 사람에 비해 너무 길고, 특수문자가 많고, 유치한 드립을 친다"는 문제를 고쳤습니다.
