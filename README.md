@@ -348,7 +348,7 @@ scripts/                  설치, 모델 확인, 모델 경로 이동, systemd
 3. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 4. `.env`에 `DISCORD_TOKEN=...` 입력
 5. 디스코드 개발자 포털에서 **Message Content Intent**를 켜고 봇을 서버에 초대 (`bot`, `applications.commands`)
-6. `.venv/bin/python -m bot.main`
+6. `bash run.sh` (= `.venv/bin/python -m bot.main`)
 7. 서버 채널에서 `/채널 동작:추가`로 대화할 채널을 등록
 
 상시 구동은 `scripts/aigirl.service`를 systemd에 등록합니다.
