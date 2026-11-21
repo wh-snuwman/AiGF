@@ -80,16 +80,21 @@ async def run() -> int:
             bad += 1
             print(f"{BAD} 모델 {model} 이 이 Ollama 서버에 없어요.")
             dirs = find_model_dirs(model)
-            cur = os.environ.get("OLLAMA_MODELS", "(설정 안 함 → 기본 ~/.ollama/models)")
             if dirs:
                 d = dirs[0]
-                print(f"     모델 파일은 {d} 에 있어요. 지금 켜진 Ollama 는 다른 폴더를 보고 있어요 (이 셸의 OLLAMA_MODELS={cur}).")
-                print("     → 켜져 있는 ollama 를 끄고(Ctrl+C) 이렇게 다시 켜세요:")
-                print("        bash scripts/run_ollama.sh")
-                print(f"        (또는 OLLAMA_MODELS={d} ollama serve)")
+                cands = [Path(os.environ["OLLAMA_MODELS"])] if os.environ.get("OLLAMA_MODELS") else []
+                cands += [Path("/mnt/hdd/ollama/models"), Path.home() / ".ollama" / "models"]
+                target = next((c for c in cands if c.exists() and c != d), Path("/mnt/hdd/ollama/models"))
+                print(f"     모델 파일은 {d} 에 있어요. 지금 켜진 Ollama 는 다른 폴더를 보고 있어요.")
+                print("     방법 A) 그 파일을 지금 쓰는 폴더로 복사 (다운로드 없음, 권장):")
+                print(f"        sudo cp -a {d}/. {target}/ && sudo chown -R $USER: {target}")
+                print("     방법 B) 그 폴더로 Ollama 를 다시 켜기 (읽기 권한 필요):")
+                print(f"        pkill -x ollama; OLLAMA_MODELS={d} ollama serve")
             else:
                 print("     모델 파일을 찾지 못했어요(/mnt/hdd/ollama/models, ~/.ollama/models, /usr/share/ollama/.ollama/models).")
                 print(f"     → 새로 받으세요(약 8GB): `ollama pull {model}`")
+            if names:
+                print(f"     (또는 config/settings.yaml 의 ollama.model 을 설치된 모델 {', '.join(names[:4])} 중 하나로 바꿔도 되지만 말투/속도가 달라지고, 12GB VRAM 에는 26b 급이 너무 커요)")
 
     import importlib.util
     if importlib.util.find_spec("ddgs") or importlib.util.find_spec("duckduckgo_search"):
