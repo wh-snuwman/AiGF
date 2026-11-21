@@ -203,6 +203,7 @@ diversity:
 #  사용자가 '검색/최신/요즘 뭐' 라고 물을 때만 실시간 1회 조회 (제한 시간, 분당 횟수 제한).
 #  패키지 설치: pip install ddgs   (없거나 오프라인이면 조용히 꺼짐) / provider: searxng 이면 searxng_url 지정
 web:
+  allowed: false               # false = 검색 기능 전체 끔 (코드/설정은 보존, /웹 켜기로도 안 켜짐). 다시 쓰려면 true 후 재시작
   enabled: true
   provider: ddgs               # ddgs | searxng
   searxng_url: ""
@@ -247,6 +248,15 @@ trace:
   max_text: 4000               # 문자열 하나의 최대 저장 길이
 
 # 글 모양 (디코 채팅처럼 짧고 담백하게)
+# 유행어 (bot/slang.py): config/slang_dict.txt 에서 상황(상대 말·기분)에 맞는 말 몇 개를 골라 '어울리면 하나 정도' 쓰라고 힌트를 준다.
+#  인터넷 검색과 무관. 사전 파일은 고치면 재시작 없이 반영된다.
+slang:
+  enabled: true
+  file: "slang_dict.txt"
+  chance: 0.22                 # 답변마다 힌트를 넣을 확률 (조금씩 쓰게 낮게). 슬픔/진지한 기분이면 1/4 로 줄어듦
+  per_hint: 3                  # 힌트로 보여 줄 후보 수 (그중 하나를 쓸지 말지는 모델이 판단)
+  cooldown_lines: 6            # 최근 자기 말 이 줄 수 안에 힌트로 받은 유행어를 썼으면 힌트를 쉰다 (남발 방지)
+
 style:
   short_bias: 1.6              # 1.0=기존, 클수록 짧은 답(초단문/한 줄) 비중이 커짐
   trim: true                   # 말풍선이 길이 모드의 글자 수 상한(10/30/45/60자)을 넘으면 문장 단위로 잘라냄 (싸움 중엔 x1.4)

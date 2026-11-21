@@ -448,7 +448,12 @@ class WebInfo:
     # ---------- 설정/상태 ----------
     @property
     def enabled(self) -> bool:
-        return bool(self.cfg.get("enabled", True))
+        return self.allowed and bool(self.cfg.get("enabled", True))
+
+    @property
+    def allowed(self) -> bool:
+        """settings.yaml 의 web.allowed: false 면 검색 기능 전체가 꺼진다 (/웹 켜기로도 켜지지 않음). 코드는 그대로 둔다."""
+        return bool(self.cfg.get("allowed", True))
 
     def set_enabled(self, on: bool) -> None:
         self.cfg["enabled"] = on

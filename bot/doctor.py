@@ -96,28 +96,31 @@ async def run() -> int:
             if names:
                 print(f"     (또는 config/settings.yaml 의 ollama.model 을 설치된 모델 {', '.join(names[:4])} 중 하나로 바꿔도 되지만 말투/속도가 달라지고, 12GB VRAM 에는 26b 급이 너무 커요)")
 
-    from .web import ipv6_reachable
-    v6 = await asyncio.to_thread(ipv6_reachable)
-    if v6 is False:
-        print(f"{WARN}IPv6 로 나갈 수 없는 서버예요 → 검색 엔진 일부가 간헐적으로 실패할 수 있어요(봇이 자동으로 다른 엔진으로 전환). 근본 해결은 README '문제 해결'의 IPv6 안내")
-    elif v6:
-        print(f"{OK} IPv6 사용 가능")
-
-    import importlib.util
-    if importlib.util.find_spec("ddgs") or importlib.util.find_spec("duckduckgo_search"):
-        from .web import ddgs_version
-        print(f"{OK} ddgs {ddgs_version() or ''} 설치됨 (무료 검색 엔진)")
+    if not settings.get("web", {}).get("allowed", True):
+        print(f"{OK} 웹 검색: 설정에서 꺼짐 (web.allowed: false)")
     else:
-        print(f"{WARN}ddgs 가 없어요 → 무료 검색 엔진은 꺼집니다 (`pip install ddgs`). 봇 동작에는 영향 없음")
-    try:
-        from .web import WebInfo
-        chain, skipped = WebInfo(settings.get("web", {}), None).chain()
-        names = [n if n == u else f"{n}[{u}]" for n, u in chain]
-        print(f"{OK if chain else WARN}검색 순서: {' > '.join(names) or '없음'}" + (f"  (제외: {', '.join(skipped)})" if skipped else ""))
-        if not any(n in ("naver", "searxng") for n, _u in chain):
-            print("     무료 엔진은 서버 요청을 자주 막아요. 안정적으로 쓰려면 .env 에 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET (README '인터넷 정보')")
-    except Exception as e:  # noqa: BLE001
-        print(f"{WARN}검색 설정 확인 실패: {type(e).__name__}")
+        from .web import ipv6_reachable
+        v6 = await asyncio.to_thread(ipv6_reachable)
+        if v6 is False:
+            print(f"{WARN}IPv6 로 나갈 수 없는 서버예요 → 검색 엔진 일부가 간헐적으로 실패할 수 있어요(봇이 자동으로 다른 엔진으로 전환). 근본 해결은 README '문제 해결'의 IPv6 안내")
+        elif v6:
+            print(f"{OK} IPv6 사용 가능")
+
+        import importlib.util
+        if importlib.util.find_spec("ddgs") or importlib.util.find_spec("duckduckgo_search"):
+            from .web import ddgs_version
+            print(f"{OK} ddgs {ddgs_version() or ''} 설치됨 (무료 검색 엔진)")
+        else:
+            print(f"{WARN}ddgs 가 없어요 → 무료 검색 엔진은 꺼집니다 (`pip install ddgs`). 봇 동작에는 영향 없음")
+        try:
+            from .web import WebInfo
+            chain, skipped = WebInfo(settings.get("web", {}), None).chain()
+            names = [n if n == u else f"{n}[{u}]" for n, u in chain]
+            print(f"{OK if chain else WARN}검색 순서: {' > '.join(names) or '없음'}" + (f"  (제외: {', '.join(skipped)})" if skipped else ""))
+            if not any(n in ("naver", "searxng") for n, _u in chain):
+                print("     무료 엔진은 서버 요청을 자주 막아요. 안정적으로 쓰려면 .env 에 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET (README '인터넷 정보')")
+        except Exception as e:  # noqa: BLE001
+            print(f"{WARN}검색 설정 확인 실패: {type(e).__name__}")
 
     try:
         from .persona import Persona

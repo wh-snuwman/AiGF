@@ -655,7 +655,8 @@ async def on_ready() -> None:
     await prepare_guilds()
     await sync_commands()
     refresh_emojis()
-    asyncio.create_task(check_ipv6())          # IPv6 가 막힌 서버인지 알려 둔다 (검색 엔진 일부가 간헐적으로 실패하는 원인)
+    if settings.get("web", {}).get("allowed", True):
+        asyncio.create_task(check_ipv6())      # IPv6 가 막힌 서버인지 알려 둔다 (검색 엔진 일부가 간헐적으로 실패하는 원인)
     asyncio.create_task(warmup_and_report())   # 첫 응답이 느리지 않도록 모델을 미리 올리고 GPU 적재 상태를 점검한다
 
 
@@ -2245,6 +2246,9 @@ async def idle_cmd(
 async def web_cmd(interaction: discord.Interaction, action: Optional[app_commands.Choice[str]] = None) -> None:
     w = engine.web
     act = action.value if action else "show"
+    if not w.allowed:
+        await interaction.response.send_message("웹 검색은 설정에서 꺼져 있어요 (config/settings.yaml 의 web.allowed: true 로 바꾸고 재시작하면 다시 쓸 수 있어요).", ephemeral=True)
+        return
     if act in ("on", "off"):
         w.set_enabled(act == "on")
         await memory.kv_set("web_enabled", "1" if w.enabled else "0")
