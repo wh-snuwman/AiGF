@@ -71,6 +71,18 @@ GHOST_AMBIGUOUS = {"하나", "지우", "나래", "하늘", "보람"}        # �
 _PART = r"(?:이랑|한테|에게|이가|야|아|이|가|는|은|를|을|의|도|랑|와|과|님|씨)?"
 
 
+# 12B 모델이 가끔 한국어 사이에 다른 언어 토큰을 섞는다 ('응 뭐 спец'). 캐릭터 파일/공통 규칙에 이런 글자는 쓰지 않으므로 출력에서 걷어낸다.
+#  그리스·키릴·아르메니아·히브리·아랍·데바나가리·태국·조지아 문자, 일본 가나, 한자
+_F = (r"Ͱ-ϿЀ-ԯ԰-֏֐-׿؀-ۿऀ-ॿ"
+      r"฀-๿Ⴀ-ჿ぀-ヿ㐀-䶿一-鿿")
+FOREIGN_RE = re.compile(rf"[A-Za-z'-]*[{_F}][{_F}A-Za-z'-]*")      # 붙어 있는 한글은 지우지 않는다
+
+
+def strip_foreign(text: str) -> str:
+    """다른 언어 글자가 섞인 낱말을 통째로 지운다 (한글·영어·숫자·자모는 그대로)."""
+    return re.sub(r"[ \t]{2,}", " ", FOREIGN_RE.sub("", text)).strip()
+
+
 def humanize(text: str, lively: bool = False) -> str:
     """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)
     lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다."""
@@ -936,7 +948,7 @@ class ChatEngine:
         if maxc and self.s.get("style", {}).get("trim", True):
             cap = int(maxc * (1.4 if lively else 1.0))
             text = "\n".join(self._trim(p, cap) for p in re.split(r"\n+", text) if p.strip())
-        parts = [self.mood.filter_text(humanize(p, lively)) for p in re.split(r"\n+", text)]
+        parts = [self.mood.filter_text(humanize(strip_foreign(p), lively)) for p in re.split(r"\n+", text)]
         parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])
         if len(parts) > limit:

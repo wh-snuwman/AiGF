@@ -9,7 +9,7 @@ import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -658,6 +658,33 @@ async def on_ready() -> None:
     if settings.get("web", {}).get("allowed", True):
         asyncio.create_task(check_ipv6())      # IPv6 가 막힌 서버인지 알려 둔다 (검색 엔진 일부가 간헐적으로 실패하는 원인)
     asyncio.create_task(warmup_and_report())   # 첫 응답이 느리지 않도록 모델을 미리 올리고 GPU 적재 상태를 점검한다
+    if not getattr(bot, "_caught_up", False):  # 재연결 때마다 하지 않고 처음 켜질 때 한 번만
+        bot._caught_up = True
+        asyncio.create_task(catch_up_missed())
+
+
+async def catch_up_missed(minutes: int = 15) -> None:
+    """봇이 꺼져 있던(재시작하던) 동안 봇을 멘션/답장한 메시지는 디스코드가 다시 보내 주지 않는다.
+    켜질 때 등록 채널마다 최근 기록을 보고, 아직 봇이 대답하지 않은 마지막 멘션 하나만 처리 대기열에 넣는다."""
+    since = discord.utils.utcnow() - timedelta(minutes=minutes)
+    for g in list(bot.guilds):
+        hub.use(g.id)
+        for ch_id in list(bot.channels):
+            ch = bot.get_channel(ch_id)
+            if ch is None or not hasattr(ch, "history"):
+                continue
+            try:
+                last = None
+                async for m in ch.history(limit=20, after=since, oldest_first=True):
+                    if m.author.bot or is_our_webhook(m):
+                        last = None                         # 봇(캐릭터)이 그 뒤에 말했으면 이미 대답한 것
+                    elif is_priority(m):
+                        last = m
+                if last is not None:
+                    log.info("꺼져 있던 동안 온 멘션에 대답: channel=%s user=%s", ch_id, last.author.display_name)
+                    await on_message(last)
+            except Exception:  # noqa: BLE001  (권한 없음 등: 이 채널만 건너뜀)
+                log.debug("놓친 멘션 확인 실패: channel=%s", ch_id, exc_info=True)
 
 
 @bot.event
@@ -675,6 +702,8 @@ async def on_typing(channel: discord.abc.Messageable, user: discord.abc.User, wh
 
 def trace_recv(message: discord.Message, text: str, outcome: str, **kw) -> None:
     """받은 메시지를 처리 결과와 함께 기록한다 (디버깅용)."""
+    if (outcome.startswith("dropped") or outcome == "recorded:paused") and is_priority(message):
+        log.info("멘션에 대답하지 않음(%s): channel=%s user=%s", outcome, message.channel.id, message.author.display_name)
     if not engine.tracer.enabled:
         return
     ch = message.channel
