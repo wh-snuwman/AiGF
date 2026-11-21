@@ -45,6 +45,10 @@ def _backend_searxng(base: str, query: str, n: int) -> list[tuple[str, str]]:
     return [(str(x.get("title", "")), str(x.get("content", ""))) for x in (data.get("results") or [])[:n]]
 
 
+# 유행어 검색 결과는 서버/캐릭터가 여럿이어도 같으므로 프로세스 전체에서 한 번만 받아 나눠 쓴다 (검색 서비스 차단/429 방지)
+_SHARED: dict[str, dict] = {}
+
+
 class WebInfo:
     def __init__(self, cfg: dict | None, memory, guard=None, backend: Callable[[str, int], list] | None = None,
                  kv_key: str = "web_cache") -> None:
@@ -61,6 +65,8 @@ class WebInfo:
         self._calls: deque[float] = deque(maxlen=20)
         self._lock = asyncio.Lock()
         self.last_error = ""
+        self.next_try = 0.0                        # 검색이 연달아 실패하면 한동안 쉰다 (차단/429 방지)
+        self.fail_streak = 0
 
     # ---------- 설정/상태 ----------
     @property
@@ -131,8 +137,17 @@ class WebInfo:
         if not self.enabled:
             return 0
         n = 0
+        used_shared = False
         async with self._lock:
-            qs = [("slang", q) for q in self.cfg["slang_queries"]] + list(topics)
+            ttl = float(self.cfg["refresh_hours"]) * 3600
+            shared = _SHARED.get("slang")
+            if shared and time.time() - shared["ts"] < ttl:      # 다른 서버/캐릭터가 방금 받아 둔 유행어는 그대로 쓴다
+                self.cache["slang"] = dict(shared)
+                qs = list(topics)
+                n += 1
+                used_shared = True
+            else:
+                qs = [("slang", q) for q in self.cfg["slang_queries"]] + list(topics)
             by_key: dict[str, list[str]] = {}
             for key, q in qs:
                 items = await self._search(q, float(self.cfg["refresh_timeout_sec"]))
@@ -141,7 +156,16 @@ class WebInfo:
                 await asyncio.sleep(0.5)                    # 서버/검색 서비스에 부담을 주지 않는다
             for key, items in by_key.items():
                 self.cache[key] = {"ts": time.time(), "items": items[:12]}
+                if key == "slang":
+                    _SHARED["slang"] = dict(self.cache[key])
                 n += 1
+            if by_key or used_shared:
+                self.fail_streak = 0
+            else:                                           # 전부 실패: 30분 → 1시간 → … 최대 6시간까지 늘려 가며 쉰다
+                self.fail_streak += 1
+                self.next_try = time.time() + min(6 * 3600, 1800 * 2 ** (self.fail_streak - 1))
+                log.warning("웹 검색이 모두 실패해 %d분 뒤 다시 시도합니다 (마지막 오류: %s)",
+                            int((self.next_try - time.time()) // 60), self.last_error or "결과 없음")
             if n:
                 await self._save()
         log.info("웹 정보 갱신: %d개 항목 (%s)", n, ", ".join(by_key) or "없음")
@@ -150,6 +174,8 @@ class WebInfo:
     def stale(self, keys: list[str]) -> bool:
         ttl = float(self.cfg["refresh_hours"]) * 3600
         now = time.time()
+        if now < self.next_try:
+            return False
         return any(now - self.cache.get(k, {}).get("ts", 0) > ttl for k in keys)
 
     # ---------- 대화에 곁들이기 ----------

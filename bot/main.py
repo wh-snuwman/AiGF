@@ -25,7 +25,7 @@ from .config import discord_token, load_settings
 from .emoji import Emojis
 from .fight import Fight
 from .guilds import DM, Hub, Proxy, char_uid
-from .llm import LLM
+from .llm import LLM, ModelMissing
 from .mood import EMO, EMOTIONS
 from .persona import Persona
 
@@ -41,6 +41,10 @@ class _RedactFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
+            if record.exc_info and isinstance(record.exc_info[1], ModelMissing):
+                note = str(record.exc_info[1])
+                record.exc_info = None                          # 모델 없음은 해결 방법이 메시지에 있으니 긴 트레이스백은 생략
+                record.msg, record.args = f"{record.getMessage()} → {note}", ()
             msg = record.getMessage()
             red = redact(msg)
             if red != msg:
@@ -52,6 +56,8 @@ class _RedactFilter(logging.Filter):
 
 for _h in logging.getLogger().handlers:
     _h.addFilter(_RedactFilter())
+for _noisy in ("primp", "ddgs", "ddgs.ddgs", "httpcore", "hpack"):       # 검색 라이브러리가 요청마다 INFO 를 쏟아내서 로그가 묻힌다
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 dcfg = settings["discord"]
@@ -177,6 +183,7 @@ class GirlBot(discord.Client):
         self.pending: dict[int, list[Pending]] = {}
         self.next_ok: dict[int, float] = {}      # 채널별 다음 발언 가능 시각 (monotonic)
         self.busy: set[int] = set()
+        self.model_warned = 0.0                       # 모델 없음 오류 로그를 1분에 한 번만 찍기 위한 시각
         self.typing_until: dict[tuple[int, int], float] = {}   # (채널, 유저) -> 입력 중 표시가 끝나는 시각
         self.dm_buffer: dict[int, list[str]] = {}
         self.dm_tasks: dict[int, asyncio.Task] = {}
@@ -490,7 +497,21 @@ async def gpu_lines() -> list[tuple[str, float, float, float]]:
     return out
 
 
+async def check_model() -> bool:
+    """시작할 때 Ollama 연결/모델 설치 여부를 확인하고, 문제가 있으면 해결 방법을 크게 알린다."""
+    ok, note = await llm.check()
+    if ok:
+        (log.warning if "대신 씁니다" in note else log.info)("모델 점검: %s", note)
+    else:
+        log.error("=" * 70)
+        log.error("모델 점검 실패 → 봇이 대답하지 못합니다.\n  %s", note)
+        log.error("=" * 70)
+    return ok
+
+
 async def warmup_and_report() -> None:
+    if not await check_model():
+        return                                   # 모델이 없는데 웜업하면 오류만 쌓인다 (이후 호출 때 자동으로 다시 점검한다)
     seen: set[str] = set()
     for g in list(hub.ctxs.values()):             # 고정 프롬프트를 미리 계산해 KV 캐시에 올린다 (캐릭터가 다른 서버/캐릭터는 각각)
         for c in list(g.chars.values()):
@@ -887,6 +908,10 @@ async def respond_group(channel_id: int, target: Pending) -> None:
                      t_end - target.ts, t0 - target.ts, t_gen - t0, t_end - t_gen)
         elif engine.last_skip and target.kind == "msg":
             await maybe_react(msg, ecfg.get("react_on_skip", 0.5), target.text)   # 글로 안 답하면 이모지로라도 반응
+    except ModelMissing as e:
+        if time.monotonic() - bot.model_warned > 60:                   # 같은 오류가 메시지마다 길게 찍히지 않게 1분에 한 번만
+            bot.model_warned = time.monotonic()
+            log.error("모델을 쓸 수 없어 대답하지 못했어요 (channel=%s): %s", channel_id, e)
     except Exception:  # noqa: BLE001
         log.exception("서버 응답 생성 실패 (channel=%s)", channel_id)
     finally:
@@ -1835,6 +1860,7 @@ async def status(interaction: discord.Interaction, action: Optional[app_commands
         f"**봇 상태** {'⏸ 일시정지' if bot.paused else '▶ 동작 중'}\n"
         f"- 캐릭터 **{persona.name}** (`{persona.char_id}`) · 모델 `{llm.model}` · 기분 {engine.mood.current().label}\n"
         f"- 서버 캐릭터({len(hub.ctx().chars)}명): {chars_line}\n"
+        f"- 모델 점검: {'✅' if llm.model_ok else '⚠' if llm.model_ok is False else '(미확인)'} {trunc(llm.model_note, 300)}\n"
         f"- 응답 속도: {speed}\n"
         f"- 적극성 {engine.mood.engage:g} · 쿨다운 {bot.cooldown:g}초 · 채팅 비율(현재/목표): {ratios}\n"
         f"- 먼저 말걸기: {'켜짐' if bot.init_enabled else '꺼짐'} (10~24시) · 혼잣말 이벤트 {'켜짐' if bot.idle_enabled else '꺼짐'}\n"

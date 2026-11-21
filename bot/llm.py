@@ -35,10 +35,23 @@ def _secs(resp: Any, name: str) -> float:
     return float(getattr(resp, name, 0) or 0) / 1e9
 
 
+class ModelMissing(RuntimeError):
+    """Ollama 서버는 떠 있는데 설정한 모델이 없다 (보통 서버를 모델 폴더가 다른 설정으로 켠 경우)."""
+
+
+def fix_hint(model: str) -> str:
+    return (f"해결: ① 모델 폴더가 HDD 라면 `bash scripts/run_ollama.sh` 로 Ollama 를 다시 켜세요(모델 경로 자동 설정). "
+            f"② 정말 없으면 `ollama pull {model}`. ③ 진단: `python -m bot.doctor`")
+
+
 class LLM:
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.client = AsyncClient(host=cfg.get("host", "http://127.0.0.1:11434"))
+        self.host = cfg.get("host", "http://127.0.0.1:11434")
         self.model = cfg["model"]
+        self.installed: list[str] = []
+        self.model_ok: bool | None = None          # None=아직 확인 안 함
+        self.model_note = ""                        # 마지막 점검 결과 (/상태 에 표시)
         self.keep_alive = cfg.get("keep_alive", "24h")
         self.options = cfg.get("options", {})
         self.temp_jitter = float(cfg.get("temp_jitter", 0.0))     # 호출마다 temperature 를 ±흔들어 말투 고착을 막는다
@@ -51,8 +64,33 @@ class LLM:
         n = len(self.stats)
         return tuple(sum(s[i] for s in self.stats) / n for i in range(4))   # type: ignore[return-value]
 
+    async def check(self) -> tuple[bool, str]:
+        """Ollama 연결과 모델 설치 여부를 점검한다. 설정한 모델이 없고 같은 계열(예: gemma3:*) 모델이 있으면 그걸로 대신한다."""
+        try:
+            resp = await self.client.list()
+        except Exception as e:  # noqa: BLE001
+            self.model_ok, self.model_note = False, f"Ollama 서버({self.host})에 연결할 수 없어요: {type(e).__name__}. `ollama serve` 가 떠 있는지 확인하세요."
+            return False, self.model_note
+        names = [str(getattr(m, "model", "") or "") for m in (resp.models or [])]
+        self.installed = names
+        base = lambda n: n[:-7] if n.endswith(":latest") else n          # noqa: E731
+        if any(base(n) == base(self.model) for n in names):
+            self.model_ok, self.model_note = True, f"모델 {self.model} 사용 가능"
+            return True, self.model_note
+        fam = self.model.split(":")[0]
+        alt = [n for n in names if n.split(":")[0] == fam]
+        if alt:
+            old, self.model = self.model, alt[0]
+            self.model_ok = True
+            self.model_note = f"설정한 모델 '{old}' 이(가) 없어 같은 계열 '{alt[0]}' 을(를) 대신 씁니다 (정식으로 쓰려면 `ollama pull {old}`)"
+            return True, self.model_note
+        have = ", ".join(names[:8]) or "(설치된 모델 없음)"
+        self.model_ok = False
+        self.model_note = f"모델 '{self.model}' 이(가) Ollama 에 없어요. 설치된 모델: {have}. " + fix_hint(self.model)
+        return False, self.model_note
+
     async def chat(self, messages: list[dict[str, Any]], images: Optional[list[bytes]] = None,
-                   **override: Any) -> LLMResult:
+                   _retry: bool = True, **override: Any) -> LLMResult:
         opts = {**self.options, **override}
         if self.temp_jitter and "temperature" not in override and "temperature" in opts:
             opts["temperature"] = max(0.5, min(1.3, float(opts["temperature"]) + random.uniform(-self.temp_jitter, self.temp_jitter)))
@@ -64,6 +102,12 @@ class LLM:
             resp = await self.client.chat(
                 model=self.model, messages=msgs, options=opts, keep_alive=self.keep_alive)
         except Exception as e:  # noqa: BLE001
+            if getattr(e, "status_code", None) == 404:                 # 모델이 없다 → 점검하고(같은 계열이 있으면 대체) 한 번 다시 시도
+                old = self.model
+                ok, note = await self.check()
+                if ok and self.model != old and _retry:
+                    return await self.chat(messages, images, _retry=False, **override)
+                raise ModelMissing(note) from None
             if not images:
                 raise
             log.warning("이미지 포함 호출 실패, 이미지 없이 재시도: %s", e)

@@ -140,6 +140,12 @@ config/people/<서버id>.txt       그 서버의 사람 이름/인식 (처음엔
 - 설정 `multi:` — `webhook`, `webhook_name`, `chain_chance`(0이면 캐릭터끼리 대화 끔), `chain_decay`, `max_chain`, `chain_delay_sec`, `human_window_sec`.
 - 한계: 웹훅 메시지에는 봇의 이모지 리액션을 달 수 없고(리액션은 봇 계정으로 달립니다), 답장 표시(↪) 없이 보냅니다. 사용자가 캐릭터 메시지에 답장하면 그 캐릭터가 우선 대답합니다.
 
+### 문제 해결: 봇이 대답을 못 할 때
+- 먼저 진단: `python -m bot.doctor` (토큰/Ollama 연결/모델 설치/캐릭터 파일/쓰기 권한을 점검하고 해결 명령을 알려 줍니다).
+- 로그에 `model 'gemma3:12b' not found (404)` → Ollama 가 모델이 없는 폴더를 보고 있는 경우가 대부분입니다(모델을 HDD 로 옮겼는데 `ollama serve` 를 그냥 켠 경우). 켜져 있는 ollama 를 끄고 `bash scripts/run_ollama.sh` 로 다시 켜세요(모델 경로 자동 설정). 정말 없으면 `ollama pull gemma3:12b`.
+- 봇은 시작할 때 모델을 점검하고(`모델 점검` 로그, `/상태` 에도 표시), 같은 계열 모델(예: `gemma3:4b`)이 설치돼 있으면 그걸로 대신 씁니다.
+- 인터넷 정보(`ddgs`)는 검색 서비스가 막거나 429 를 주면 쉬었다 다시 시도합니다(30분→최대 6시간). 실패해도 대화에는 영향이 없고, 유행어 검색 결과는 서버/캐릭터가 공유합니다.
+
 ### 캐릭터 만들기 / 다른 모델에게 맡기기
 - 작성 요령(필드 설명, 예시 작성법, 체크리스트, **모델에게 줄 지시문**): [`docs/캐릭터_작성_가이드.md`](docs/캐릭터_작성_가이드.md), 폴더 안내: [`config/characters/README.md`](config/characters/README.md)
 - 템플릿 `python scripts/new_character.py <id> "<이름>" [프리셋]` → 작성 → 검사 `python scripts/check_character.py <id>` → 디스코드 `/캐릭터 동작:부르기` 또는 `/상태 동작:리로드`
