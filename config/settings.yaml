@@ -206,13 +206,25 @@ web:
   enabled: true
   provider: ddgs               # ddgs | searxng
   searxng_url: ""
+  # 무료 검색 엔진은 서버 요청을 자주 막는다(429/403). 서버에서 `python scripts/web_probe.py` 로 잘 되는 엔진을 찾아
+  # 위에서부터 적으면 순서대로 시도한다. ["auto"] = ddgs 가 알아서 (기본).  예) ["yahoo", "duckduckgo"]
+  backends: ["auto"]
+  region: "kr-kr"
+  proxy: ""                    # (선택) 예: socks5://127.0.0.1:9050 (로그에 찍지 않음)
+  engine_timeout_sec: 4        # 엔진 한 번 접속 제한
+  refresh_timeout_sec: 12      # 백그라운드 갱신 한 번의 전체 제한
+  max_per_min: 6               # 프로세스 전체 검색 분당 상한 (서버/캐릭터가 많아도 합산)
+  min_gap_sec: 1.5             # 검색 사이 최소 간격
   chance: 0.12                 # 답변마다 캐시된 정보를 곁들일 확률
-  refresh_hours: 6             # 캐시 갱신 주기
-  realtime: true               # '검색/최신' 질문일 때 실시간 조회
+  refresh_hours: 12            # 캐시 갱신 주기
+  realtime: true               # '검색/최신' 질문일 때 실시간 조회 (연속 실패로 쉬는 중이면 안 함)
   timeout_sec: 2.5             # 실시간 조회 제한 시간
   per_min: 2                   # 실시간 조회 분당 최대
   max_items: 3
   item_chars: 100
+  wiki_fallback: true          # 검색이 모두 실패하면 캐릭터 소식은 위키백과(공식 API)로 채운다
+  slang_file: "slang.txt"      # 검색이 모두 실패하면 유행어는 config/slang.txt (직접 편집). 비우면 끔
+  file_ttl_hours: 1            # 폴백으로 채운 항목은 이 시간 뒤 다시 검색을 시도 (검색이 살아나면 교체)
   slang_queries: ["요즘 유행어 신조어", "요즘 유행하는 밈"]
 
 # 디버깅/개선용 상세 기록 (bot/trace.py): 받은 메시지, 대답 대상 선정 과정(후보와 점수), 프롬프트에 들어간 정보,

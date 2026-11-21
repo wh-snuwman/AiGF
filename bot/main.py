@@ -2242,13 +2242,12 @@ async def web_cmd(interaction: discord.Interaction, action: Optional[app_command
     if act == "refresh":
         await interaction.response.defer(ephemeral=True)
         n = await w.refresh(engine.web_topics())
-        await interaction.followup.send(f"새로 받은 항목 {n}개. {w.summary()}" + (f"\n오류: {w.last_error}" if w.last_error else ""),
-                                        ephemeral=True)
+        await interaction.followup.send(f"새로 받은 항목 {n}개. {w.summary()}\n{w.status()}", ephemeral=True)
         return
     await interaction.response.send_message(
         f"**웹 정보** {'켜짐' if w.enabled else '꺼짐'} · 방식 {w.cfg['provider']} · 캐시: {w.summary()}\n"
         f"사용 확률 {int(w.cfg['chance'] * 100)}% · 실시간 조회 {'허용' if w.cfg.get('realtime') else '안 함'}"
-        f" (제한 {w.cfg['timeout_sec']}초, 분당 {w.cfg['per_min']}회)" + (f"\n최근 오류: {w.last_error}" if w.last_error else ""), ephemeral=True)
+        f" (제한 {w.cfg['timeout_sec']}초, 분당 {w.cfg['per_min']}회)\n{w.status()}", ephemeral=True)
 
 
 # ---- 13. 로그 (디버깅용 상세 기록) ----
