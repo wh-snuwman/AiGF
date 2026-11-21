@@ -131,7 +131,9 @@ fight:
 emoji:
   enabled: true
   custom: true                 # 서버 커스텀 이모지를 글에 섞어 씀
-  max_custom_in_prompt: 6
+  max_custom_in_prompt: 4
+  text_rate: 0.2              # 글에 서버 이모지가 들어갈 수 있는 답의 비율 (답 하나에 최대 1개, 나머지는 코드가 지움)
+  min_gap_sec: 300            # 서버 이모지를 한 번 쓰면 이 시간 동안은 글에 쓰지 않음
   react_chance: 0.12           # 대답하지 않기로 한 메시지에 리액션만 달 확률
   trivial_react_chance: 0.5    # ㅋㅋ 같은 짧은 말에는 LLM 없이 리액션만 달 확률
   respond_to_reaction: 0.6     # 봇 메시지에 누가 리액션을 달면 한마디 할 확률

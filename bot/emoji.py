@@ -55,7 +55,7 @@ class Emojis:
         if not self.custom:
             return ""
         names = " ".join(f":{n}:" for n in list(self.custom)[:limit])
-        return f"서버이모지(:이름: 형식 그대로, 가끔만): {names}"
+        return f"서버이모지(:이름: 형식, 아주 드물게만·대부분의 답엔 쓰지 않음): {names}"
 
     # ---------- 출력 변환 ----------
     def render(self, text: str) -> str:

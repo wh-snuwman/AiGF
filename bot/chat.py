@@ -78,6 +78,10 @@ _F = (r"Ͱ-ϿЀ-ԯ԰-֏֐-׿؀-ۿऀ-ॿ"
 FOREIGN_RE = re.compile(rf"[A-Za-z'-]*[{_F}][{_F}A-Za-z'-]*")      # 붙어 있는 한글은 지우지 않는다
 
 
+# 서버 커스텀 이모지 토큰 (:이름: 또는 이미 변환된 <:이름:id>). 12:30:45 같은 시각은 건드리지 않게 이름은 숫자로 시작하지 않는다
+CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_가-힣]+:\d+>|(?<![\w:]):[A-Za-z_가-힣][\w가-힣]*:(?![\w])")
+
+
 def strip_foreign(text: str) -> str:
     """다른 언어 글자가 섞인 낱말을 통째로 지운다 (한글·영어·숫자·자모는 그대로)."""
     return re.sub(r"[ \t]{2,}", " ", FOREIGN_RE.sub("", text)).strip()
@@ -230,6 +234,7 @@ class ChatEngine:
         self.mood.s = self.mood.baseline()
         self.fights = FightManager(settings.get("fight", {}))      # 말싸움
         self.emoji_hint = ""                                       # 서버 이모지 안내 (main 이 갱신)
+        self._custom_emoji_ts = 0.0                                # 마지막으로 서버 이모지를 글에 쓴 시각 (빈도 제한)
         self.busy_check = lambda: False                            # 대화가 바쁜지 (기억 추출 보류용, main 이 설정)
         self.last_skip = False
         self.evader = Evader()                             # 거절/회피 표현 다양화
@@ -955,7 +960,31 @@ class ChatEngine:
             parts = parts[: limit - 1] + [" ".join(parts[limit - 1:])]
         n = len(parts)
         parts = [self.mood.decorate(p, i == n - 1) for i, p in enumerate(parts)]   # 감정별 이모티콘/늘임/느낌표
+        parts = [p for p in self._limit_custom_emoji(parts) if p]
         return [self.guard.clip(p) for p in parts]
+
+    def _limit_custom_emoji(self, parts: list[str]) -> list[str]:
+        """서버 커스텀 이모지(:이름:)는 모델과 감정 장식이 둘 다 붙여서 너무 잦아진다.
+        답 하나에 최대 1개, 확률(emoji.text_rate)로만, 직전 사용 후 emoji.min_gap_sec 동안은 쓰지 않는다. 나머지는 지운다."""
+        found = [bool(CUSTOM_EMOJI_RE.search(p)) for p in parts]
+        if not any(found):
+            return parts
+        ecfg = self.s.get("emoji", {})
+        now = time.time()
+        allow = (now - self._custom_emoji_ts >= float(ecfg.get("min_gap_sec", 300))
+                 and random.random() < float(ecfg.get("text_rate", 0.2)))
+        out, kept = [], False
+        for p in parts:
+            def sub(m: re.Match) -> str:
+                nonlocal kept
+                if allow and not kept:
+                    kept = True
+                    return m.group(0)
+                return ""
+            out.append(re.sub(r"[ \t]{2,}", " ", CUSTOM_EMOJI_RE.sub(sub, p)).strip())
+        if kept:
+            self._custom_emoji_ts = now
+        return out
 
     # ---------- 장기 기억 ----------
     def _schedule_extract(self, channel_id: int, user_id: int, user_name: str) -> None:
