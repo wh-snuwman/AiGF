@@ -33,8 +33,8 @@ class RatioControl:
     def __init__(self, cfg: dict | None = None) -> None:
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", True))
-        self.center = float(cfg.get("target", 1.25))
-        self.spread = float(cfg.get("spread", 0.25))
+        self.center = float(cfg.get("target", 1.0))
+        self.spread = float(cfg.get("spread", 0.65))
         self.window = float(cfg.get("window_min", 20)) * 60
         self.reroll = float(cfg.get("reroll_min", 8)) * 60
         self.min_human = int(cfg.get("min_human", 3))
@@ -67,10 +67,10 @@ class RatioControl:
     def target(self, channel_id: int) -> float:
         now = time.time()
         t = self._t.get(channel_id)
-        if t is None or now - t[0] > self.reroll:
+        if t is None or now > t[0]:
             lo = max(0.2, self.center - self.spread)
             hi = max(lo, self.center + self.spread)
-            t = (now, random.uniform(lo, hi))
+            t = (now + self.reroll * random.uniform(0.5, 1.5), random.uniform(lo, hi))   # (다음에 다시 뽑을 시각, 목표) — 주기도 랜덤
             self._t[channel_id] = t
         return t[1]
 

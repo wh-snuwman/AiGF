@@ -1145,6 +1145,28 @@ def maybe_chain(channel, speaker_cid: str, bubbles: list[str], depth: int) -> No
     asyncio.create_task(respond_chain(channel, ctx.gid, cid, speaker_cid, " ".join(bubbles), depth))
 
 
+def peer_note(pname: str, topic: str = "") -> str:
+    """캐릭터가 다른 캐릭터 말에 답할 때의 지시. 서로 질문만 되돌려주며 같은 틀을 반복하는 핑퐁을 막는다."""
+    return (f"방금 같은 방 친구 캐릭터 {pname}이(가) 한 말에 대한 반응이다. 사람이 아니라 친구 캐릭터에게 하는 말이다. "
+            "네 말투(반말/존댓말)를 그대로 지키고 상대의 말투나 문장 틀을 따라 하지 마라. "
+            "질문을 되돌려주지 말고 구체적인 의견이나 제안이나 경험 하나를 말해서 대화를 앞으로 진행시켜라."
+            + (f" (주제: {topic})" if topic else ""))
+
+
+def _bigrams(s: str) -> set[str]:
+    t = re.sub(r"[^가-힣A-Za-z0-9]", "", s)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def stale_talk(new: str, recent: list[str], th: float = 0.6) -> bool:
+    """새 말이 최근 캐릭터 대화와 거의 같은 내용이면 True (같은 질문을 주고받는 핑퐁 감지).
+    짧은 쪽 글자쌍의 th 이상이 겹치면 같은 말로 본다 ('그럼 뭘 하고 싶은데' ~ '이번엔 뭘 하고 싶은데 정하든가')."""
+    a = _bigrams(new)
+    if len(a) < 3:
+        return False
+    return any(len(a & b) / max(1, min(len(a), len(b))) >= th for b in (_bigrams(r) for r in recent[-4:]) if len(b) >= 3)
+
+
 async def respond_chain(channel, gid: int, cid: str, from_cid: str, text: str, depth: int) -> None:
     """캐릭터 cid 가 같은 방 캐릭터 from_cid 의 말에 반응한다 (사람 메시지가 기다리고 있으면 사람이 먼저)."""
     hub.use(gid)
@@ -1161,8 +1183,9 @@ async def respond_chain(channel, gid: int, cid: str, from_cid: str, text: str, d
             async with channel.typing():
                 bubbles = await engine.reply(
                     ch, char_uid(from_cid), from_name, text, can_skip=True, priority=False,
-                    extra_note=f"방금 같은 방 친구 캐릭터 {from_name}이(가) 한 말에 대한 반응이다. 사람이 아니라 친구 캐릭터에게 하는 말이니 "
-                               "자기 말투 그대로 가볍게 받아치거나 한마디 덧붙여라.")
+                    extra_note=peer_note(from_name))
+        if bubbles and stale_talk(" ".join(bubbles), [text]):
+            bubbles = []                                      # 상대 말을 거의 그대로 되돌려주는 말이면 보내지 않는다
         if bubbles:
             await send_bubbles(channel, bubbles)
             bot.last_char[ch] = cid
@@ -1766,6 +1789,8 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
     talking.add(ch)
     prev: str | None = None
     last_text = ""
+    said: list[str] = []                                      # 이번 캐릭터 대화에서 나온 말 (핑퐁 감지)
+    stale = 0
     try:
         for i in range(rounds):
             hub.use(gid)
@@ -1794,17 +1819,21 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
                 else:
                     pname = ctx.chars[prev].persona.name
                     text = last_text
-                    note = (f"방금 같은 방 친구 캐릭터 {pname}이(가) 한 말에 대한 반응이다. 사람이 아니라 친구 캐릭터에게 하는 말이니 "
-                            "자기 말투 그대로 받아치고, 대화가 이어지게 한마디 덧붙이거나 되물어라."
-                            + (f" (주제: {topic})" if topic else ""))
+                    note = peer_note(pname, topic)
                     from_uid, from_name = char_uid(prev), pname
                 async with bot.gpu_lock:
                     async with channel.typing():
                         bubbles = await engine.reply(ch, from_uid, from_name, text, can_skip=False, priority=True, extra_note=note)
                 if bubbles:
+                    joined = " ".join(bubbles)
+                    stale = stale + 1 if stale_talk(joined, said) else 0
+                    if stale >= 2:                                 # 같은 말을 두 번 연속 주고받으면 대화를 자연스럽게 끝낸다
+                        log.info("캐릭터 대화가 같은 말을 반복해서 멈춤 (channel=%s)", ch)
+                        break
                     await send_bubbles(channel, bubbles)
                     bot.last_char[ch] = cid
-                    prev, last_text = cid, " ".join(bubbles)
+                    prev, last_text = cid, joined
+                    said.append(joined)
             finally:
                 bot.busy.discard(ch)
             await asyncio.sleep(random.uniform(*[float(x) for x in mcfg["chain_delay_sec"]]))
