@@ -1448,6 +1448,8 @@ async def _idle_tick() -> None:
             bot.last_char[ch_id] = hub.ctx().char().cid
             hub.use_char(None)
             log.info("혼잣말 이벤트 (channel=%s, stage=%s): %s", ch_id, st.stage, result)
+            if result == "채널을 찾을 수 없음":          # 지워졌거나 봇이 못 보는 채널: 매 분 다시 시도해 로그만 쌓이지 않게 1시간 쉰다
+                st.next_at = time.time() + 3600
         except Exception:  # noqa: BLE001
             log.exception("혼잣말 이벤트 실패 (channel=%s)", ch_id)
             st.next_at = time.time() + 600

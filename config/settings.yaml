@@ -207,8 +207,9 @@ web:
   provider: ddgs               # ddgs | searxng
   searxng_url: ""
   # 무료 검색 엔진은 서버 요청을 자주 막는다(429/403). 서버에서 `python scripts/web_probe.py` 로 잘 되는 엔진을 찾아
-  # 위에서부터 적으면 순서대로 시도한다. ["auto"] = ddgs 가 알아서 (기본).  예) ["yahoo", "duckduckgo"]
-  backends: ["auto"]
+  # 위에서부터 적으면 순서대로 시도한다. ["auto"] = ddgs 가 알아서(차단된 엔진까지 다 두드려 느림).
+  # (2026-11 서버 probe 결과: yahoo 만 성공, duckduckgo/bing/brave/mojeek/yandex 는 결과 없음(차단), auto/google 은 IPv6 불가)
+  backends: ["yahoo", "duckduckgo"]
   region: "kr-kr"
   proxy: ""                    # (선택) 예: socks5://127.0.0.1:9050 (로그에 찍지 않음)
   engine_timeout_sec: 4        # 엔진 한 번 접속 제한
