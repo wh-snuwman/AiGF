@@ -281,6 +281,9 @@ def clean_text(message: discord.Message) -> str:
     text = message.clean_content.strip()
     if bot.user:
         text = text.replace(f"@{bot.user.display_name}", "").strip()
+    for cid in at_chars(text):           # '@케이' → '케이' (모델에게는 이름을 부른 것으로 보이게)
+        for n in set(char_names()[cid]) - {""}:
+            text = re.sub(r"@\s?" + re.escape(n), n, text)
     for m in message.mentions:          # 다른 사람 멘션은 진짜 이름으로 바꿔서 보여준다
         if bot.user and m.id == bot.user.id:
             continue
@@ -321,6 +324,17 @@ def replied_char(message: discord.Message | None) -> str | None:
     return None
 
 
+def at_chars(text: str) -> list[str]:
+    """'@케이' 처럼 글자로 쓴 캐릭터 멘션 (웹훅 캐릭터는 디스코드 멘션을 걸 수 없어서). 이름/별명 모두 인식, 띄어쓰기 허용."""
+    out = []
+    for cid, (name, nick) in char_names().items():
+        for n in {name, nick} - {""}:
+            if re.search(r"(?<![\w@])@\s?" + re.escape(n), text or ""):
+                out.append(cid)
+                break
+    return out
+
+
 def named_chars(text: str) -> list[str]:
     """글에서 이름(또는 별명)으로 불린 캐릭터들"""
     body = re.sub(r"^\(.*?에 답장\)\s*", "", text)
@@ -347,7 +361,7 @@ def pick_speaker(channel_id: int, text: str, uid: int, message: discord.Message 
     rc = replied_char(message)
     if rc in ctx.chars:
         return rc
-    named = named_chars(text)
+    named = at_chars(message.content if message is not None else text) or named_chars(text)   # '@이름' 으로 부른 캐릭터가 최우선
     pool = named or list(ctx.chars)
     weights = []
     for cid in pool:
@@ -371,6 +385,8 @@ def pick_free_speaker(channel_id: int) -> str:
 def is_priority(message: discord.Message) -> bool:
     """봇을 멘션했거나, 봇(또는 캐릭터)의 메시지에 답장한 경우"""
     if bot.user and bot.user in message.mentions:
+        return True
+    if at_chars(message.content):                        # '@케이' 글자 멘션도 멘션으로 본다
         return True
     ref = message.reference
     if ref and isinstance(ref.resolved, discord.Message):
@@ -802,10 +818,11 @@ async def on_message(message: discord.Message) -> None:
     await memory.add_message(ch, uid, display, "user", stored)
     mark_human_activity(ch)
     directed = bool(mentioned) or is_directed(text)
-    hits = named_chars(text)                                    # 이름이 불린 캐릭터들
+    ats = at_chars(message.content)                             # '@이름' 으로 부른 캐릭터들
+    hits = ats or named_chars(text)                             # 이름이 불린 캐릭터들
     rc = replied_char(message)                                  # 답장한 캐릭터
     for cid, c in hub.ctx().chars.items():                      # 모든 캐릭터가 듣고 기분이 움직이지만, '나한테 한 말'은 해당 캐릭터만
-        d = (bool(mentioned) and rc is None) or cid in hits or cid == rc
+        d = (bool(mentioned) and rc is None and not ats) or cid in hits or cid == rc
         c.engine.mood.observe(stored, directed=d, uid=uid, who=who)
     bot.last_human_ts[ch] = time.time()
     bot.chan_events.setdefault(ch, deque(maxlen=300)).append((time.time(), uid))
