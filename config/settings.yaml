@@ -251,7 +251,7 @@ trace:
 # 유행어 (bot/slang.py): config/slang_dict.txt 에서 상황(상대 말·기분)에 맞는 말 몇 개를 골라 '어울리면 하나 정도' 쓰라고 힌트를 준다.
 #  인터넷 검색과 무관. 사전 파일은 고치면 재시작 없이 반영된다.
 slang:
-  enabled: true
+  enabled: false               # 꺼 둠 (2026-11-22). 다시 쓰려면 true
   file: "slang_dict.txt"
   chance: 0.22                 # 답변마다 힌트를 넣을 확률 (조금씩 쓰게 낮게). 슬픔/진지한 기분이면 1/4 로 줄어듦
   per_hint: 3                  # 힌트로 보여 줄 후보 수 (그중 하나를 쓸지 말지는 모델이 판단)
