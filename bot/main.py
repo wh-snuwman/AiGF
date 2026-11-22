@@ -431,34 +431,36 @@ async def get_webhook(channel, cid: str | None = None) -> discord.Webhook | None
     key = (pid, cid or "")
     wh = bot.webhooks.get(key)
     ver = avatar_version(cid) if cid else 0.0
-    if wh is not None:
-        if cid and bot.webhook_ver.get(key) != ver:                # 프로필 사진이 바뀌었다 → 웹훅 아바타 갱신
-            try:
-                p = avatar_file(cid)
-                wh = await wh.edit(avatar=p.read_bytes() if p else None, reason="캐릭터 프로필 변경")
-                bot.webhooks[key] = wh
+    if wh is None:
+        if time.time() - bot.webhook_failed.get(pid, 0) < 600:
+            return None
+        try:
+            name = f"{mcfg['webhook_name']}-{cid}"[:80] if cid else mcfg["webhook_name"]
+            hooks = await parent.webhooks()
+            wh = next((h for h in hooks if h.name == name and h.user and bot.user and h.user.id == bot.user.id), None)
+            if wh is None:
+                p = avatar_file(cid) if cid else None
+                wh = await parent.create_webhook(name=name, avatar=p.read_bytes() if p else None,
+                                                 reason="캐릭터마다 다른 이름/아바타로 말하기")
                 bot.webhook_ver[key] = ver
-            except (discord.HTTPException, OSError) as e:
-                log.warning("웹훅 프로필 갱신 실패 (채널 %s, %s): %s", pid, cid, e)
-        return wh
-    if time.time() - bot.webhook_failed.get(pid, 0) < 600:
-        return None
-    try:
-        name = f"{mcfg['webhook_name']}-{cid}"[:80] if cid else mcfg["webhook_name"]
-        hooks = await parent.webhooks()
-        wh = next((h for h in hooks if h.name == name and h.user and bot.user and h.user.id == bot.user.id), None)
-        if wh is None:
-            p = avatar_file(cid) if cid else None
-            wh = await parent.create_webhook(name=name, avatar=p.read_bytes() if p else None,
-                                             reason="캐릭터마다 다른 이름/아바타로 말하기")
+                log.info("캐릭터 웹훅 생성: 채널=%s 캐릭터=%s 프로필사진=%s", pid, cid, "있음" if ver else "없음")
+            bot.webhooks[key] = wh
+            bot.our_webhooks.add(wh.id)
+        except (discord.Forbidden, discord.HTTPException, AttributeError, OSError) as e:
+            bot.webhook_failed[pid] = time.time()
+            log.warning("웹훅을 만들 수 없어요 (채널 %s): %s → 웹훅 관리 권한을 주세요. 그동안은 이름 앞붙임으로 말해요.", pid, e)
+            return None
+    if cid and bot.webhook_ver.get(key) != ver:                    # 예전에 사진 없이 만든 웹훅이거나 사진이 바뀜 → 웹훅 아바타를 맞춘다
+        try:
+            p = avatar_file(cid)
+            wh = await wh.edit(avatar=p.read_bytes() if p else None, reason="캐릭터 프로필 적용")
+            bot.webhooks[key] = wh
             bot.webhook_ver[key] = ver
-        bot.webhooks[key] = wh
-        bot.our_webhooks.add(wh.id)
-        return wh
-    except (discord.Forbidden, discord.HTTPException, AttributeError, OSError) as e:
-        bot.webhook_failed[pid] = time.time()
-        log.warning("웹훅을 만들 수 없어요 (채널 %s): %s → 웹훅 관리 권한을 주세요. 그동안은 이름 앞붙임으로 말해요.", pid, e)
-        return None
+            log.info("캐릭터 웹훅 프로필 적용: 채널=%s 캐릭터=%s (%s)", pid, cid, p.name if p else "사진 없음")
+        except Exception as e:  # noqa: BLE001
+            bot.webhook_ver[key] = ver                              # 같은 오류를 매 메시지마다 반복하지 않는다 (사진을 바꾸면 다시 시도)
+            log.warning("웹훅 프로필 적용 실패 (채널 %s, %s): %s: %s", pid, cid, type(e).__name__, e)
+    return wh
 
 
 async def send_bubbles(
