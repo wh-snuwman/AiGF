@@ -586,6 +586,7 @@ async def warmup_and_report() -> None:
             if c.persona.char_id not in seen:
                 seen.add(c.persona.char_id)
                 await llm.warmup(c.engine.warm_messages())
+    await engine.corrector.warmup()               # 문법 교정용 작은 모델도 VRAM 에 올려 둔다 (없으면 알리고 자동으로 꺼짐)
     try:
         for name, size, vram, pct in await gpu_lines():
             if pct < 99:
@@ -2691,7 +2692,7 @@ async def stats_cmd(interaction: discord.Interaction, mode: app_commands.Choice[
         return
     if act == "latency":
         rep = await asyncio.to_thread(statslib.latency_report, engine.tracer.files(), float(hours))
-        await interaction.response.send_message(statslib.format_latency(rep)[:1990], ephemeral=True)
+        await interaction.response.send_message((statslib.format_latency(rep) + "\n" + engine.corrector.summary())[:1990], ephemeral=True)
         return
     if act == "queue":
         c = await memory.msg_counts(time.time() - hours * 3600)

@@ -24,6 +24,7 @@ from . import trace
 from .persona import Persona
 from .trace import Tracer
 from .budget import fit as budget_fit
+from .corrector import Corrector, declared_register
 from .slang import Slang
 from .web import WebInfo
 
@@ -223,6 +224,7 @@ class ChatEngine:
         self.s = settings
         self.persona = persona
         self.llm = llm
+        self.corrector = Corrector(settings.get("corrector"), settings.get("ollama", {}).get("host", "http://127.0.0.1:11434"))   # 문법 교정용 작은 모델
         self.mem = memory
         self.tz = ZoneInfo(settings.get("timezone", "Asia/Seoul"))
         self.people = People(CONFIG_DIR / "people.txt", memory)   # 호칭/이미지 (서버의 텍스트 파일)
@@ -415,6 +417,17 @@ class ChatEngine:
                 banned.append(o)
         return text, banned
 
+    async def _say(self, msgs: list[dict[str, str]], fix: bool = True, **kw):
+        """메인 모델로 생성한 뒤, 작은 한국어 모델로 문법을 한 번 교정한다 (싸움 중이거나 SKIP 이면 건너뜀, 문제가 있으면 원문)."""
+        res = await self.llm.chat(msgs, **kw)
+        if fix and self.corrector.enabled and res.text:
+            t0 = time.perf_counter()
+            fixed = await self.corrector.fix(res.text, declared_register(self.persona.data.get("speech_style", "")))
+            if fixed != res.text:
+                trace.cur().event("corrector", before=res.text[:200], after=fixed[:200], sec=round(time.perf_counter() - t0, 2))
+                res.text = fixed
+        return res
+
     async def _generate(
         self, msgs: list[dict[str, str]], mode: LengthMode, banned: list[str],
         known: set[str], can_skip: bool = False, temperature: float | None = None,
@@ -423,7 +436,7 @@ class ChatEngine:
     ) -> tuple[LLMResult, list[str] | None]:
         """생성 → 후처리. 반복 표현이 2개 이상 섞이면 한 번만 다시 생성한다. SKIP 이면 (res, None)."""
         extra = {"temperature": temperature} if temperature else {}
-        res = await self.llm.chat(msgs, images=images, num_predict=mode.num_predict, **extra)
+        res = await self._say(msgs, fix=not lively, images=images, num_predict=mode.num_predict, **extra)
         if can_skip and re.match(r"^\W*\[?SKIP\]?\W*$", res.text.strip(), re.I):
             trace.cur().set(outcome="skip")
             return res, None
@@ -436,7 +449,7 @@ class ChatEngine:
             if not stripped:                       # 반복어뿐이었다 → 그 말을 빼고 한 번만 다시 생성, 또 그러면 말하지 않는다
                 retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
                                     + "\n방금 답이 최근에 계속 쓴 말뿐이었다. 그 말은 빼고 전혀 다른 표현으로 다시 대답해라."}]
-                res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict, temperature=1.0)
+                res2 = await self._say(retry, fix=not lively, images=images, num_predict=mode.num_predict, temperature=1.0)
                 b2 = self._strip_overused(self.to_bubbles(res2.text, known, mode.max_bubbles, lively, maxc=mode.max_chars), set(banned))
                 res2.prompt_tokens += res.prompt_tokens
                 res2.completion_tokens += res.completion_tokens
@@ -453,8 +466,8 @@ class ChatEngine:
                   "이 표현들을 빼고 완전히 다른 말로 다시 대답해라.",
             }]
             base_t = self.llm.options.get("temperature", 1.0)
-            res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict,
-                                       temperature=min(1.2, base_t + 0.15))
+            res2 = await self._say(retry, fix=not lively, images=images, num_predict=mode.num_predict,
+                                   temperature=min(1.2, base_t + 0.15))
             b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, maxc=mode.max_chars)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens
@@ -480,7 +493,7 @@ class ChatEngine:
         retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
                               + f'\n방금 답("{bubbles[0][:30]}")이 최근에 한 말과 거의 같다. 내용도 표현도 전혀 다르게 다시 대답해라.'}]
         base_t = self.llm.options.get("temperature", 1.0)
-        res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict,
+        res2 = await self._say(retry, fix=not lively, images=images, num_predict=mode.num_predict,
                                    temperature=min(1.25, base_t + 0.2))
         b2 = self.div.drop_duplicates(self.to_bubbles(res2.text, known, mode.max_bubbles, lively, maxc=mode.max_chars), lines)
         res2.prompt_tokens += res.prompt_tokens
@@ -679,7 +692,7 @@ class ChatEngine:
                 + "\n\n[재작성 지시] 방금 답에 금지된 표현(가족/외모/성적/장애/지역/혐오 비하, 위협, "
                   "또는 현재 수위에서 허용되지 않는 욕설)이 있었다. 그런 표현 없이 다시 대답해라.",
             }]
-            res2 = await self.llm.chat(retry, images=images, num_predict=mode.num_predict)
+            res2 = await self._say(retry, fix=fight is None, images=images, num_predict=mode.num_predict)
             b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, fight is not None, maxc=mode.max_chars)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens
@@ -820,7 +833,7 @@ class ChatEngine:
         if bubbles and self._too_similar(channel_id, bubbles, own):
             retry = msgs[:-1] + [{"role": "user", "content": msgs[-1]["content"]
                                 + "\n방금 만든 말이 최근에 한 말과 비슷하다. 화제도 표현도 완전히 다르게 다시 말해라."}]
-            res2 = await self.llm.chat(retry, num_predict=mode.num_predict, temperature=1.0)
+            res2 = await self._say(retry, num_predict=mode.num_predict, temperature=1.0)
             b2 = self.to_bubbles(res2.text, known, mode.max_bubbles, maxc=mode.max_chars)
             res2.prompt_tokens += res.prompt_tokens
             res2.completion_tokens += res.completion_tokens

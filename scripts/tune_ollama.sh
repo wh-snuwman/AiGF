@@ -5,7 +5,7 @@
 #  - OLLAMA_KV_CACHE_TYPE=q8_0    : KV 캐시를 8비트로 (VRAM 절반, 속도 비슷, 품질 영향 거의 없음)
 #  - OLLAMA_KEEP_ALIVE=24h        : 모델을 VRAM 에 계속 상주 (다시 로드하는 시간 제거)
 #  - OLLAMA_NUM_PARALLEL=1        : 동시 처리 1개 (이 봇은 한 번에 하나만 생성하므로 VRAM 낭비 방지)
-#  - OLLAMA_MAX_LOADED_MODELS=1   : 모델 하나만 상주
+#  - OLLAMA_MAX_LOADED_MODELS=2   : 메인 + 문법 교정 소형 모델 동시 상주
 #
 # 사용법: bash scripts/tune_ollama.sh
 set -euo pipefail
@@ -27,7 +27,7 @@ Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 Environment="OLLAMA_KEEP_ALIVE=24h"
 Environment="OLLAMA_NUM_PARALLEL=1"
-Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=2"
 EOF
 
 systemctl daemon-reload

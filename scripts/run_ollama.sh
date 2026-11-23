@@ -17,7 +17,7 @@ export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"        # Flash Atte
 export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"          # KV 캐시 8비트 (VRAM 절약)
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-24h}"                 # 모델 상주
 export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"               # 동시 처리 1개
-export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"     # 모델 하나만 상주
+export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-2}"     # 메인 모델 + 문법 교정 소형 모델 동시 상주 (1이면 호출마다 서로 교체돼 매우 느려짐)
 
 if pgrep -x ollama >/dev/null 2>&1; then
   echo "이미 실행 중인 ollama 를 종료하고 새 설정으로 다시 시작합니다."
