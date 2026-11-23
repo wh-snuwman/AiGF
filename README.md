@@ -42,6 +42,7 @@
 ### 캐릭터 생성 파이프라인 (스킬 + `scripts/character_pipeline.py`)
 - 새 캐릭터는 메인 스킬 `character-pipeline` 이 `character-research`, `character-profile`, `character-prompt`, `character-visual`, `character-emotion`, `character-schedule`, `character-integration`, `character-validation` 8개 하위 스킬을 순서대로 조정해 만듭니다(`.claude/skills/`). 파일 하나만 빠르게 고치는 일은 기존 `character-writer` 를 씁니다.
 - 단계 사이에는 자연어가 아니라 `data/character_work/<id>/` 의 yaml 파일(`research`, `profile`, `prompt`, `visual`, `emotion`, `schedule`)로만 넘기고, profile/visual/schedule 은 research 만 읽으므로 병렬로 만들 수 있습니다. 중간 보고 없이 마지막에 통합 보고서 하나만 냅니다.
+- **Codex 에서도 같은 스킬을 씁니다**: 원본은 `.claude/skills/` 이고 `python scripts/sync_codex_skills.py` 가 `.agents/skills/`(Codex 가 저장소에서 읽는 위치)로 복사합니다(`--check` 는 차이만 확인). 루트의 `AGENTS.md` 가 Codex 에 프로젝트 구조/명령/규칙과 스킬 사용법을 알려 줍니다. 개인 전체용으로 쓰려면 `.agents/skills/*` 를 `~/.codex/skills/` 로 복사하세요. 스킬이 안 보이면 Codex 를 재시작하고 `/skills` 로 확인합니다.
 - 합치기와 검증은 코드가 결정적으로 합니다: `python scripts/character_pipeline.py init|assemble|validate <id>`. `assemble` 은 이미 있는 캐릭터를 `--force` 없이는 덮어쓰지 않고(덮어쓰면 `.bak` 백업), `--avatar` 로 얼굴 위치를 맞춘 프로필 사진도 만듭니다. `validate` 는 yaml 형식/분량, 말투 격식 일치(설명이 반말인데 예시가 존댓말이면 오류), 다른 캐릭터와 예시 겹침(말투 구분), 스케줄 24시간 빈틈, 감정 프리셋, 프롬프트 크기, 프로필 사진을 한 번에 검사합니다.
 
 ### 성능 측정과 프롬프트 토큰 예산 (`scripts/bench.py`, `bot/budget.py`)
