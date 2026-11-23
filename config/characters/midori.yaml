@@ -66,6 +66,8 @@ fight_replies:
 talk_weight: 0.86
 web_topics:
 - 블루 아카이브 미도리 공식 소개
+style:
+  laugh: none
 emotion_preset: gentle
 visual:
   appearance: blonde hair, green eyes, green-accented headset, halo

@@ -24,6 +24,8 @@ from . import trace
 from .persona import Persona
 from .trace import Tracer
 from .budget import fit as budget_fit
+from .textstyle import Style, flavor, strip_laugh
+from .textstyle import from_data as style_from_data
 from .corrector import Corrector, declared_register
 from .slang import Slang
 from .web import WebInfo
@@ -46,7 +48,7 @@ EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u231A\u23
 _PROTECT = re.compile(r"<[@#!&]\w+>|:[\w가-힣]{2,32}:|///|\^\^|ㅡㅡ|\d[.,:]\d")
 
 
-def strip_symbols(t: str, lively: bool = False) -> str:
+def strip_symbols(t: str, lively: bool = False, tilde: bool = False, exclaim: bool = False) -> str:
     """디코 채팅처럼 보이도록 특수문자를 걷어낸다: 쉼표/마침표/따옴표/괄호/물결/대시/느낌표 제거(물음표와 ㅋㅋ ㅠㅠ 같은 자모 표현은 유지).
     lively(싸움)에서는 느낌표를 살린다. 멘션과 서버 이모지, 숫자 속 점/쉼표, ^^ ;; /// ㅡㅡ 는 보호한다."""
     keep: list[str] = []
@@ -60,9 +62,9 @@ def strip_symbols(t: str, lively: bool = False) -> str:
     t = re.sub(r"(?:^|\s)-+(?=\s|$)|^-+|-+$", " ", t)
     t = re.sub(r"[,，、]+", " ", t)
     t = re.sub(r"[.。]+", " ", t)
-    t = re.sub(r"~+", "", t)
+    t = re.sub(r"~{3,}", "~~", t) if tilde else re.sub(r"~+", "", t)      # 물결을 허용하는 캐릭터는 최대 두 개까지
     t = re.sub(r";{2,}|[:：;]+(?=\s|$)|^[:：;]+", " ", t)         # ';;' 같은 땀 이모티콘도 모델이 따라 하므로 걷어낸다
-    if not lively:
+    if not lively and not exclaim:
         t = re.sub(r"[!！]+", "", t)
     return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], t)
 
@@ -89,16 +91,26 @@ def strip_foreign(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", FOREIGN_RE.sub("", text)).strip()
 
 
-def humanize(text: str, lively: bool = False) -> str:
+def humanize(text: str, lively: bool = False, style: "Style | None" = None) -> str:
     """디스코드 사람처럼 보이도록 과한 특수문자를 정리한다. (말줄임표, 반복 물음표/느낌표, 문장 끝 마침표 등)
-    lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다."""
-    t = re.sub(r"[…⋯]+|\.{2,}", " ", text)                     # 말줄임표 제거 ("…뭐," → "뭐,")
+    lively=True(말싸움처럼 감정이 격한 상황)에서는 ?, ! 를 두 번까지 살린다.
+    style(캐릭터 글 스타일)이 말줄임표/느낌표/물결을 허용하면 그 기호는 지우지 않고 정리만 한다."""
+    ell = bool(style and style.ellipsis)
+    exc = bool(style and style.exclaim)
+    if ell:                                                     # 말줄임표를 쓰는 캐릭터(소심함 등)는 '...' 하나로 정리해 살린다
+        t = re.sub(r"[…⋯]+|\.{2,}", "\x02", text)
+    else:
+        t = re.sub(r"[…⋯]+|\.{2,}", " ", text)                 # 말줄임표 제거 ("…뭐," → "뭐,")
     if lively:
         t = re.sub(r"([?!？！])\1{2,}", r"\1\1", t)              # ???? → ??  (두 번까지 허용)
+    elif exc:                                                   # 느낌표를 쓰는 캐릭터: 느낌표는 최대 두 개, ?! 는 ?
+        t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)
+        t = re.sub(r"[!！]{3,}", "!!", t)
+        t = re.sub(r"([?？])\1+", "?", t)
     else:
         t = re.sub(r"[?？]\s*[!！]|[!！]\s*[?？]", "?", t)       # ?! → ?
         t = re.sub(r"([?!？！])\1+", r"\1", t)                  # ??? → ?
-    t = strip_symbols(t, lively)
+    t = strip_symbols(t, lively, tilde=bool(style and style.tilde), exclaim=exc)
     t = re.sub(r"([ㅠㅜㅋㅎㅡ]) (?=[ㅠㅜㅋㅎㅡ]\b)", r"\1", t)           # 'ㅠ ㅠ' 처럼 띄어 쓴 이모티콘을 붙인다
     t = re.sub(r"[ \t]+", " ", t).strip(" -—–·")
     t = re.sub(r"\s+([,?!])", r"\1", t)
@@ -106,6 +118,9 @@ def humanize(text: str, lively: bool = False) -> str:
     t = re.sub(r"^[,\s]+", "", t)
     # 말끝에 습관처럼 붙는 군더더기 '뭐' ('왜 그래 뭐' → '왜 그래'). '이게 뭐' 같은 진짜 질문은 앞말이 서술형 어미일 때만 건드린다.
     t = re.sub(r"(?<=[어아야지래해네데까요다나])\s+뭐$", "", t.strip())
+    if ell:
+        t = re.sub(r"\x02+(?=[^\s\x02?？!！])", "... ", t)
+        t = re.sub(r"\s*\x02+", "...", t)
     return t.strip()
 
 
@@ -338,11 +353,11 @@ class ChatEngine:
                     text = f"(약 {int((h['ts'] - prev_ts) // 60)}분 지남)\n" + text
             elif h.get("author") in self.peers:
                 # 같은 방의 다른 캐릭터가 한 말: 내 말(assistant)이 아니라 이름이 붙은 상대의 말로 보여 준다
-                cleaned = [humanize(ln) for ln in h["content"].split("\n")]
+                cleaned = [humanize(ln, style=self.cstyle) for ln in h["content"].split("\n")]
                 role, text = "user", f"{h['author']}: " + ("\n".join(ln for ln in cleaned if ln) or h["content"])
             else:
                 # 예전에 남은 '…' 같은 버릇이 모델에게 전염되지 않도록 기록도 정리해서 보여준다
-                cleaned = [humanize(ln) for ln in h["content"].split("\n")]
+                cleaned = [humanize(ln, style=self.cstyle) for ln in h["content"].split("\n")]
                 role, text = "assistant", "\n".join(ln for ln in cleaned if ln) or h["content"]
             prev_ts = h["ts"]
             if role == "assistant":
@@ -362,7 +377,7 @@ class ChatEngine:
             else:
                 merged.append({"role": role, "content": text})
 
-        own = [humanize(ln) for h in hist if h["role"] == "assistant" and h.get("author") not in self.peers
+        own = [humanize(ln, style=self.cstyle) for h in hist if h["role"] == "assistant" and h.get("author") not in self.peers
                for ln in h["content"].split("\n")]
         own = [ln for ln in own if ln]
         scene, activity = await self._scene(hist)
@@ -416,6 +431,15 @@ class ChatEngine:
             if o not in banned and o not in ignore:
                 banned.append(o)
         return text, banned
+
+    @property
+    def cstyle(self) -> Style:
+        """이 캐릭터의 글 스타일(yaml style:). persona.data 가 바뀌면(스왑/리로드) 다시 읽는다."""
+        d = self.persona.data
+        if getattr(self, "_cs_key", None) != id(d):
+            self._cs = style_from_data(d.get("style"))
+            self._cs_key = id(d)
+        return self._cs
 
     async def _say(self, msgs: list[dict[str, str]], fix: bool = True, **kw):
         """메인 모델로 생성한 뒤, 작은 한국어 모델로 문법을 한 번 교정한다 (싸움 중이거나 SKIP 이면 건너뜀, 문제가 있으면 원문)."""
@@ -972,11 +996,17 @@ class ChatEngine:
         if maxc and self.s.get("style", {}).get("trim", True):
             cap = int(maxc * (1.4 if lively else 1.0))
             text = "\n".join(self._trim(p, cap) for p in re.split(r"\n+", text) if p.strip())
-        parts = [self.mood.filter_text(humanize(strip_foreign(p), lively)) for p in re.split(r"\n+", text)]
+        st = self.cstyle
+        parts = [self.mood.filter_text(humanize(strip_foreign(p), lively, st)) for p in re.split(r"\n+", text)]
         parts = [p for p in parts if p]
         limit = min(limit or 99, self.s["typing"]["max_bubbles"])
         if len(parts) > limit:
             parts = parts[: limit - 1] + [" ".join(parts[limit - 1:])]
+        if not st.plain and not lively:                               # 캐릭터 고유의 글 스타일(소심하면 말줄임표/머뭇거림, 순진하면 느낌표 등)
+            if st.laugh == "none":
+                parts = [p for p in (strip_laugh(p) for p in parts) if p]
+            emo = self.mood.current().id
+            parts = [flavor(p, st, emo, i == 0, i == len(parts) - 1) for i, p in enumerate(parts)]
         n = len(parts)
         parts = [self.mood.decorate(p, i == n - 1) for i, p in enumerate(parts)]   # 감정별 이모티콘/늘임/느낌표
         parts = [p for p in self._limit_custom_emoji(parts) if p]

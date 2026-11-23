@@ -22,6 +22,26 @@ def flat(v) -> str:
     return " ".join(str(v or "").split())
 
 
+def _style(d: dict):
+    sys.path.insert(0, str(ROOT))
+    from bot.textstyle import from_data
+    return from_data(d.get("style"))
+
+
+def _symbols(d: dict) -> "re.Pattern":
+    """캐릭터 style: 이 허용한 기호(느낌표/물결)는 경고하지 않는다."""
+    st = _style(d)
+    chars = ",.~…\"'“”‘’()（）[]*_`<>"
+    chars = chars + ("" if st.exclaim else "!")
+    chars = chars.replace("~", "") if st.tilde else chars
+    return re.compile("[" + re.escape(chars) + "]" + ("" if st.ellipsis else r"|\.\."))
+
+
+def _allowed(ln: str, d: dict) -> str:
+    """말줄임표를 허용하는 캐릭터는 '...' 를 지우고 검사한다."""
+    return ln.replace("...", "").replace("…", "") if _style(d).ellipsis else ln
+
+
 def check(path: Path) -> tuple[list[str], list[str]]:
     errs: list[str] = []
     warns: list[str] = []
@@ -62,7 +82,7 @@ def check(path: Path) -> tuple[list[str], list[str]]:
         for ln in a.splitlines():
             if len(ln.strip()) > 45:
                 warns.append(f"examples[{i}] 답이 길어요(45자 초과): {ln.strip()[:20]}…")
-            if SYMBOLS.search(ln):
+            if _symbols(d).search(_allowed(ln, d)):
                 warns.append(f"examples[{i}] 답에 기호(, . ! ~ … 따옴표 괄호)가 있어요 — 모델이 따라 해요: {ln.strip()[:24]}")
             if re.search(r";;|ㅡㅡ", ln):
                 warns.append(f"examples[{i}] 답에 ;; ㅡㅡ 가 있어요")

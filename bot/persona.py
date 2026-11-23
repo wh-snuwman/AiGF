@@ -15,6 +15,8 @@ from typing import Any
 import yaml
 
 from .config import CONFIG_DIR, load_yaml
+from .textstyle import from_data as style_from_data
+from .textstyle import symbol_rule
 
 CHAR_DIR = CONFIG_DIR / "characters"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
@@ -163,7 +165,8 @@ class Persona:
         )
         tpl = system_template()
         if tpl:                                                   # 모든 캐릭터 공통: config/system_prompt.txt
-            out = (tpl.replace("{character_rules}", f"- {extra}" if extra else "")
+            out = (tpl.replace("{symbol_rule}", symbol_rule(style_from_data(d.get("style"))))
+                   .replace("{character_rules}", f"- {extra}" if extra else "")
                    .replace("{character}", card).replace("{nickname}", self.nickname).replace("{name}", name))
             self._static_cache = re.sub(r"\n{2,}", "\n", out).strip()
             return self._static_cache
