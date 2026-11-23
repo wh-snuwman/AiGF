@@ -4,4 +4,5 @@ PyYAML>=6.0
 python-dotenv>=1.0
 aiosqlite>=0.20
 Pillow>=10.0
+matplotlib>=3.8   # (선택) 호감도·감정 그래프. 없으면 그래프만 꺼짐
 ddgs>=9.0   # (선택) 인터넷 정보. 없어도 봇은 동작함

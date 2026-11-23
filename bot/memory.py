@@ -69,6 +69,42 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- 호감도 변경 이력 (그래프/원인 조회용). aff 값은 내부값(-1~1)
+CREATE TABLE IF NOT EXISTS affinity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    character TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    old REAL NOT NULL,
+    new REAL NOT NULL,
+    reason TEXT,
+    emotion TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_aff_log ON affinity_log(character, user_id, ts);
+
+-- 감정 변화 이력 (캐릭터별)
+CREATE TABLE IF NOT EXISTS emotion_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    character TEXT NOT NULL,
+    emotion TEXT NOT NULL,
+    intensity REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_emo_log ON emotion_log(character, ts);
+
+-- 메시지 처리 상태 (재시작 복구 / 중복 제거). status: RECEIVED QUEUED PROCESSING RESPONDED SKIPPED FAILED
+CREATE TABLE IF NOT EXISTS msg_status (
+    message_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    ts REAL NOT NULL,
+    updated REAL NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_msg_status ON msg_status(status, updated);
 """
 
 
@@ -290,6 +326,80 @@ class Memory:
             "UPDATE users SET proactive_day=?, proactive_count=? WHERE user_id=?",
             (day, count, user_id),
         )
+        await self.db.commit()
+
+    # ---------- 호감도/감정 이력 ----------
+    async def log_affinity(self, character: str, user_id: int, old: float, new: float, reason: str, emotion: str) -> None:
+        assert self.db
+        await self.db.execute(
+            "INSERT INTO affinity_log(ts, character, user_id, old, new, reason, emotion) VALUES (?,?,?,?,?,?,?)",
+            (time.time(), character, user_id, old, new, reason[:80], emotion))
+        await self.db.execute("DELETE FROM affinity_log WHERE ts < ?", (time.time() - 90 * 86400,))     # 90일 보존
+        await self.db.commit()
+
+    async def affinity_history(self, character: str, user_id: int, since: float = 0.0, limit: int = 2000) -> list[tuple]:
+        """[(ts, old, new, reason, emotion)] 오래된 순"""
+        assert self.db
+        cur = await self.db.execute(
+            "SELECT ts, old, new, reason, emotion FROM affinity_log WHERE character=? AND user_id=? AND ts>=? ORDER BY ts DESC LIMIT ?",
+            (character, user_id, since, limit))
+        return list(reversed(await cur.fetchall()))
+
+    async def log_emotion(self, character: str, emotion: str, intensity: float) -> None:
+        assert self.db
+        await self.db.execute("INSERT INTO emotion_log(ts, character, emotion, intensity) VALUES (?,?,?,?)",
+                              (time.time(), character, emotion, round(intensity, 3)))
+        await self.db.execute("DELETE FROM emotion_log WHERE ts < ?", (time.time() - 30 * 86400,))      # 30일 보존
+        await self.db.commit()
+
+    async def emotion_history(self, character: str, since: float = 0.0, limit: int = 3000) -> list[tuple]:
+        """[(ts, emotion, intensity)] 오래된 순"""
+        assert self.db
+        cur = await self.db.execute(
+            "SELECT ts, emotion, intensity FROM emotion_log WHERE character=? AND ts>=? ORDER BY ts DESC LIMIT ?",
+            (character, since, limit))
+        return list(reversed(await cur.fetchall()))
+
+    async def affinity_users(self, character: str) -> list[int]:
+        assert self.db
+        cur = await self.db.execute("SELECT DISTINCT user_id FROM affinity_log WHERE character=?", (character,))
+        return [r[0] for r in await cur.fetchall()]
+
+    # ---------- 메시지 상태 (재시작 복구 / 중복 제거) ----------
+    async def msg_seen(self, message_id: int, channel_id: int, user_id: int) -> bool:
+        """처음 보는 메시지면 RECEIVED 로 등록하고 False, 이미 있으면 True (중복)."""
+        assert self.db
+        now = time.time()
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO msg_status(message_id, channel_id, user_id, status, ts, updated) VALUES (?,?,?,?,?,?)",
+            (message_id, channel_id, user_id, "RECEIVED", now, now))
+        await self.db.commit()
+        return cur.rowcount == 0
+
+    async def msg_set(self, message_id: int, status: str, note: str = "", attempt: bool = False) -> None:
+        assert self.db
+        await self.db.execute(
+            "UPDATE msg_status SET status=?, updated=?, note=?, attempts=attempts+? WHERE message_id=?",
+            (status, time.time(), note[:80], 1 if attempt else 0, message_id))
+        await self.db.commit()
+
+    async def msg_unfinished(self, max_age_sec: float = 900, max_attempts: int = 3) -> list[tuple[int, int, int, int]]:
+        """재시작 뒤 이어서 처리할 메시지: [(message_id, channel_id, user_id, attempts)] 오래된 순"""
+        assert self.db
+        cur = await self.db.execute(
+            "SELECT message_id, channel_id, user_id, attempts FROM msg_status "
+            "WHERE status IN ('QUEUED','PROCESSING') AND ts>=? AND attempts<? ORDER BY ts",
+            (time.time() - max_age_sec, max_attempts))
+        return list(await cur.fetchall())
+
+    async def msg_counts(self, since: float = 0.0) -> dict[str, int]:
+        assert self.db
+        cur = await self.db.execute("SELECT status, COUNT(*) FROM msg_status WHERE ts>=? GROUP BY status", (since,))
+        return {r[0]: r[1] for r in await cur.fetchall()}
+
+    async def msg_cleanup(self, days: int = 7) -> None:
+        assert self.db
+        await self.db.execute("DELETE FROM msg_status WHERE ts < ?", (time.time() - days * 86400,))
         await self.db.commit()
 
     # ---------- 토큰 사용량 ----------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import random
@@ -28,6 +29,8 @@ from .guilds import DM, Hub, Proxy, char_uid
 from .llm import LLM, ModelMissing
 from .web import ipv6_reachable
 from .mood import EMO, EMOTIONS
+from . import stats as statslib
+from .mood import Mood
 from .persona import Persona
 
 settings = load_settings()
@@ -722,8 +725,27 @@ async def catch_up_missed(minutes: int = 15) -> None:
     """봇이 꺼져 있던(재시작하던) 동안 봇을 멘션/답장한 메시지는 디스코드가 다시 보내 주지 않는다.
     켜질 때 등록 채널마다 최근 기록을 보고, 아직 봇이 대답하지 않은 마지막 멘션 하나만 처리 대기열에 넣는다."""
     since = discord.utils.utcnow() - timedelta(minutes=minutes)
+    done: set[int] = set()
     for g in list(bot.guilds):
         hub.use(g.id)
+        # 1) 처리 도중에 꺼져서 끝내지 못한 메시지(QUEUED/PROCESSING)를 DB 상태표에서 찾아 다시 대기열에 넣는다
+        try:
+            await memory.msg_cleanup(7)
+            for mid, cid_, _uid, _att in await memory.msg_unfinished(minutes * 60):
+                ch = bot.get_channel(cid_)
+                try:
+                    m = await ch.fetch_message(mid) if ch is not None else None
+                except discord.HTTPException:
+                    m = None
+                if m is None:
+                    await memory.msg_set(mid, "SKIPPED", "gone")
+                    continue
+                log.info("재시작 전에 끝내지 못한 메시지를 다시 처리해요: channel=%s message=%s", cid_, mid)
+                _replay_ids.add(mid)
+                done.add(mid)
+                await on_message(m)
+        except Exception:  # noqa: BLE001
+            log.debug("미처리 메시지 복구 실패", exc_info=True)
         for ch_id in list(bot.channels):
             ch = bot.get_channel(ch_id)
             if ch is None or not hasattr(ch, "history"):
@@ -735,7 +757,8 @@ async def catch_up_missed(minutes: int = 15) -> None:
                         last = None                         # 봇(캐릭터)이 그 뒤에 말했으면 이미 대답한 것
                     elif is_priority(m):
                         last = m
-                if last is not None:
+                if last is not None and last.id not in done:
+                    _replay_ids.add(last.id)
                     log.info("꺼져 있던 동안 온 멘션에 대답: channel=%s user=%s", ch_id, last.author.display_name)
                     await on_message(last)
             except Exception:  # noqa: BLE001  (권한 없음 등: 이 채널만 건너뜀)
@@ -755,8 +778,36 @@ async def on_typing(channel: discord.abc.Messageable, user: discord.abc.User, wh
         bot.typing_until[(cid, user.id)] = time.monotonic() + 8
 
 
+_replay_ids: set[int] = set()          # 재시작 복구로 다시 넣는 메시지 (중복 제거 건너뜀)
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def mstat(ids, status: str, note: str = "", attempt: bool = False) -> None:
+    """메시지 처리 상태를 서버별 DB 에 기록한다 (RECEIVED QUEUED PROCESSING RESPONDED SKIPPED FAILED). 실패해도 대화는 계속된다."""
+    try:
+        mem = hub.ctx().memory
+    except Exception:  # noqa: BLE001
+        return
+    if mem is None or getattr(mem, "db", None) is None:
+        return
+
+    async def run() -> None:
+        for mid in ([ids] if isinstance(ids, int) else list(ids)):
+            try:
+                await mem.msg_set(mid, status, note, attempt)
+            except Exception:  # noqa: BLE001
+                log.debug("메시지 상태 기록 실패", exc_info=True)
+    t = asyncio.get_running_loop().create_task(run())
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
 def trace_recv(message: discord.Message, text: str, outcome: str, **kw) -> None:
     """받은 메시지를 처리 결과와 함께 기록한다 (디버깅용)."""
+    if outcome == "recorded":
+        mstat(message.id, "QUEUED")
+    elif outcome.startswith("dropped") or outcome.startswith("recorded:"):
+        mstat(message.id, "SKIPPED", outcome)
     if (outcome.startswith("dropped") or outcome == "recorded:paused") and is_priority(message):
         log.info("멘션에 대답하지 않음(%s): channel=%s user=%s", outcome, message.channel.id, message.author.display_name)
     if not engine.tracer.enabled:
@@ -781,6 +832,15 @@ async def on_message(message: discord.Message) -> None:
     await hub.ensure(gid, getattr(message.guild, "name", "DM"))
     hub.use(gid)                                   # 이후 engine/memory/persona/ratio 는 이 서버의 것
     hub.chan_guild[message.channel.id] = gid
+    if message.id in _replay_ids:
+        _replay_ids.discard(message.id)                     # 재시작 복구로 다시 들어온 메시지는 중복으로 보지 않는다
+    elif gid != DM:
+        try:
+            if await memory.msg_seen(message.id, message.channel.id, message.author.id):
+                log.debug("중복 메시지 무시: %s", message.id)   # 게이트웨이 재연결 등으로 같은 메시지가 두 번 오는 경우
+                return
+        except Exception:  # noqa: BLE001
+            log.debug("메시지 중복 확인 실패", exc_info=True)
     if not user_allowed(message.author.id):
         trace_recv(message, message.content or "", "dropped:not_allowed")
         return
@@ -956,6 +1016,11 @@ async def dm_worker(channel: discord.DMChannel, author: discord.abc.User) -> Non
         log.exception("DM 응답 실패 (uid=%s)", uid)
 
 
+def _requeue(channel_id: int, target: Pending) -> None:
+    target.ts = time.monotonic()
+    bot.pending.setdefault(channel_id, []).append(target)
+
+
 async def respond_group(channel_id: int, target: Pending) -> None:
     msg = target.message
     channel = msg.channel
@@ -963,6 +1028,9 @@ async def respond_group(channel_id: int, target: Pending) -> None:
     uname = target.uname or msg.author.display_name
     bot.busy.add(channel_id)
     t0 = time.monotonic()
+    ids = target.meta.get("merged_ids") or [msg.id]
+    if target.kind == "msg":
+        mstat(ids, "PROCESSING", attempt=True)
     try:
         fight = engine.fights.get(channel_id, uid)
         async with bot.gpu_lock:
@@ -997,18 +1065,30 @@ async def respond_group(channel_id: int, target: Pending) -> None:
             cur = hub.ctx().char().cid
             bot.last_char[channel_id] = cur
             maybe_chain(channel, cur, bubbles, 1)                  # 다른 캐릭터가 그 말에 받아칠 수도 있다
+            mstat(ids, "RESPONDED")
             t_end = time.monotonic()
             # 어디서 시간이 걸리는지 로그로 남긴다: 수신 후 대기(묶음/쿨다운/GPU 대기) · 생성(LLM) · 전송
             log.info("응답 완료: 메시지 수신 후 %.1fs (대기 %.1fs · 생성 %.1fs · 전송 %.1fs)",
                      t_end - target.ts, t0 - target.ts, t_gen - t0, t_end - t_gen)
         elif engine.last_skip and target.kind == "msg":
+            mstat(ids, "SKIPPED", "model_skip")
             await maybe_react(msg, ecfg.get("react_on_skip", 0.5), target.text)   # 글로 안 답하면 이모지로라도 반응
+        elif target.kind == "msg":
+            mstat(ids, "SKIPPED", "no_output")
     except ModelMissing as e:
+        mstat(ids, "FAILED", "model_missing")
         if time.monotonic() - bot.model_warned > 60:                   # 같은 오류가 메시지마다 길게 찍히지 않게 1분에 한 번만
             bot.model_warned = time.monotonic()
             log.error("모델을 쓸 수 없어 대답하지 못했어요 (channel=%s): %s", channel_id, e)
     except Exception:  # noqa: BLE001
         log.exception("서버 응답 생성 실패 (channel=%s)", channel_id)
+        attempt = int(target.meta.get("attempt", 0))
+        if target.kind == "msg" and attempt < 2:                 # 일시적 오류: 백오프(3초, 6초) 뒤 다시 대기열에 넣는다
+            target.meta["attempt"] = attempt + 1
+            mstat(ids, "QUEUED", f"retry{attempt + 1}")
+            asyncio.get_running_loop().call_later(3 * (attempt + 1), _requeue, channel_id, target)
+        else:
+            mstat(ids, "FAILED", "exception")
     finally:
         # 대답이 완전히 끝난 시점부터 쿨다운 타이머 시작 (싸움 중에는 거의 바로, 인원이 많으면 짧게)
         in_fight = engine.fights.get(channel_id, uid) is not None
@@ -1038,6 +1118,7 @@ async def group_loop() -> None:
             continue
         for p in [p for p in items if now - p.ts > gcfg["max_pending_age_sec"]]:
             park_unaddressed(channel_id, p)             # 오래 기다려도 대답 못 한 메시지는 능동 대화가 챙긴다
+            mstat(p.message.id, "SKIPPED", "expired")
         items[:] = [p for p in items if now - p.ts <= gcfg["max_pending_age_sec"]]
         if not items or channel_id in bot.busy:
             continue
@@ -1070,6 +1151,7 @@ async def group_loop() -> None:
                 engine.tracer.log("decision", action="trivial_react_only", channel_id=channel_id, user_id=p.uid,
                                   user_name=p.uname, detail=p.text or clean_text(p.message))
                 asyncio.create_task(maybe_react(p.message, ecfg.get("trivial_react_chance", 0.5)))
+                mstat(p.message.id, "SKIPPED", "trivial_react")
             ready = [p for p in ready if p not in trivial]
             items[:] = [p for p in items if p not in trivial]
             if not ready:
@@ -1096,6 +1178,7 @@ async def group_loop() -> None:
                 for p in ready:
                     asyncio.create_task(maybe_react(p.message, ecfg.get("react_chance", 0.12)))
                     park_unaddressed(channel_id, p)
+                    mstat(p.message.id, "SKIPPED", "skip_chance")
                 items[:] = [p for p in items if p not in ready]
                 continue
             pool = ready
@@ -1133,6 +1216,7 @@ async def group_loop() -> None:
             images=imgs, kind=target.kind, bubbles=adj.bubbles,
             meta={**sel_meta, "merged_count": len(same),
                   "merged_texts": [(p.text or clean_text(p.message))[:100] for p in same],
+                  "merged_ids": [p.message.id for p in same],
                   "left_pending": [{"user_id": p.uid, "text": (p.text or clean_text(p.message))[:60]}
                                    for p in items if p not in same][:5]},
         )
@@ -1648,7 +1732,7 @@ def trunc(s: str, n: int) -> str:
 
 
 # ---- 1. 사용량 (전체 + 유저별 통합) ----
-@bot.tree.command(name="사용량", description="토큰 사용량을 보여줘요. 유저를 고르면 그 유저에게 한 답변 내역까지, 생략하면 전체 + 유저 순위")
+@bot.tree.command(name="사용량", description="(별칭: /통계 동작:토큰) 토큰 사용량을 보여줘요. 유저를 고르면 그 유저에게 한 답변 내역까지, 생략하면 전체 + 유저 순위")
 @app_commands.describe(user="특정 유저를 고르면 그 유저에게 한 답변 내역을 보여줘요 (생략하면 전체 요약 + 순위)")
 @app_commands.rename(user="유저")
 async def usage_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None) -> None:
@@ -1715,7 +1799,7 @@ async def guild_char_autocomplete(interaction: discord.Interaction, current: str
     ][:25]
 
 
-@bot.tree.command(name="캐릭터스왑", description="이 서버의 캐릭터를 교체하거나, 캐릭터를 더 추가/제거해요 (여러 명이면 웹훅으로 각자 이름/아바타로 말해요)")
+@bot.tree.command(name="캐릭터스왑", description="(별칭: /캐릭터 로 통합됨) 이 서버의 캐릭터를 교체하거나, 캐릭터를 더 추가/제거해요 (여러 명이면 웹훅으로 각자 이름/아바타로 말해요)")
 @app_commands.describe(character="대상 캐릭터 (목록일 땐 생략)", mode="교체(기본) / 추가(같이 활동) / 제거 / 목록",
                        old="교체할 기존 캐릭터 (생략하면 기본 캐릭터)",
                        clear_history="교체할 때 대화 기록을 지울지 (기본: 지움)",
@@ -1919,6 +2003,7 @@ async def set_avatar(interaction: discord.Interaction, character: Optional[str],
 @app_commands.choices(mode=[
     app_commands.Choice(name="부르기", value="add"),
     app_commands.Choice(name="내보내기", value="remove"),
+    app_commands.Choice(name="교체", value="replace"),
     app_commands.Choice(name="목록", value="list"),
     app_commands.Choice(name="대화시작", value="talk"),
     app_commands.Choice(name="대화중지", value="stop"),
@@ -1938,7 +2023,7 @@ async def character_cmd(
     if act == "avatar":
         await set_avatar(interaction, character, image)
         return
-    if act in ("add", "remove", "list"):
+    if act in ("add", "remove", "list", "replace"):
         if act != "list" and not character:
             await interaction.response.send_message("캐릭터를 골라 주세요. (`/캐릭터 동작:목록`으로 확인)", ephemeral=True)
             return
@@ -2437,6 +2522,164 @@ async def web_cmd(interaction: discord.Interaction, action: Optional[app_command
         f"**웹 정보** {'켜짐' if w.enabled else '꺼짐'} · 방식 {w.cfg['provider']} · 캐시: {w.summary()}\n"
         f"사용 확률 {int(w.cfg['chance'] * 100)}% · 실시간 조회 {'허용' if w.cfg.get('realtime') else '안 함'}"
         f" (제한 {w.cfg['timeout_sec']}초, 분당 {w.cfg['per_min']}회)\n{w.status()}", ephemeral=True)
+
+
+# ---- 12.5 통계 (응답 속도 · 메시지 처리 · 호감도/감정 그래프) ----
+def _user_name(guild: discord.Guild | None, cid: str, uid: int) -> str:
+    c = hub.ctxs.get(guild.id if guild else DM)
+    ch = c.chars.get(cid) if c else None
+    m = guild.get_member(uid) if guild else None
+    nm = m.display_name if m else (ch.engine.names.get(uid, (None, None))[0] if ch else None)
+    return str(nm or uid)
+
+
+class StatsView(discord.ui.View):
+    """관리자 전용 그래프 화면: 캐릭터/유저/기간을 고르고 버튼으로 호감도·감정 그래프와 변화 원인을 본다.
+    응답은 전부 ephemeral(본인에게만 보임)이라 관계 정보가 공개 채널에 노출되지 않는다."""
+
+    def __init__(self, gid: int, guild: discord.Guild | None, owner: int) -> None:
+        super().__init__(timeout=300)
+        self.gid, self.guild, self.owner = gid, guild, owner
+        ctx = hub.ctxs.get(gid)
+        self.chars = {cid: c.persona.name for cid, c in (ctx.chars.items() if ctx else [])}
+        self.cid = next(iter(self.chars), "")
+        self.uid: int | None = None
+        self.days = 7
+        self.add_item(self._char_select())
+        self.add_item(self._days_select())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner or interaction.user.id not in ADMIN_IDS:
+            await interaction.response.send_message("관리자만 쓸 수 있어요.", ephemeral=True)
+            return False
+        return True
+
+    def _char_select(self) -> discord.ui.Select:
+        opts = [discord.SelectOption(label=n[:90], value=cid, default=(cid == self.cid)) for cid, n in list(self.chars.items())[:25]]
+        sel = discord.ui.Select(placeholder="캐릭터", options=opts or [discord.SelectOption(label="(캐릭터 없음)", value="-")], row=0)
+
+        async def cb(i: discord.Interaction) -> None:
+            self.cid, self.uid = sel.values[0], None
+            await self.refresh_users(i)
+        sel.callback = cb
+        return sel
+
+    def _days_select(self) -> discord.ui.Select:
+        sel = discord.ui.Select(placeholder="기간", options=[
+            discord.SelectOption(label=f"최근 {d}일", value=str(d), default=(d == self.days)) for d in (1, 3, 7, 14, 30)], row=2)
+
+        async def cb(i: discord.Interaction) -> None:
+            self.days = int(sel.values[0])
+            await i.response.defer()
+        sel.callback = cb
+        return sel
+
+    async def refresh_users(self, i: discord.Interaction) -> None:
+        """선택한 캐릭터의 기록이 있는 유저 목록(최대 25)으로 유저 선택 메뉴를 다시 만든다."""
+        ctx = hub.ctxs[self.gid]
+        ids = await ctx.memory.affinity_users(self.cid)
+        c = ctx.chars.get(self.cid)
+        ids = list(dict.fromkeys(ids + (list(c.engine.mood.aff) if c else [])))[:25]
+        for it in list(self.children):
+            if isinstance(it, discord.ui.Select) and it.row == 1:
+                self.remove_item(it)
+        opts = [discord.SelectOption(label=_user_name(self.guild, self.cid, u)[:90], value=str(u)) for u in ids]
+        usel = discord.ui.Select(placeholder="유저" if ids else "기록 있는 유저가 아직 없어요", row=1,
+                                 options=opts or [discord.SelectOption(label="(없음)", value="0")])
+
+        async def ucb(ii: discord.Interaction) -> None:
+            self.uid = int(usel.values[0]) or None
+            await ii.response.defer()
+        usel.callback = ucb
+        self.add_item(usel)
+        for it in self.children:                                  # 캐릭터 선택 표시 갱신
+            if isinstance(it, discord.ui.Select) and it.row == 0:
+                for o in it.options:
+                    o.default = (o.value == self.cid)
+        await i.response.edit_message(view=self)
+
+    def _since(self) -> float:
+        return time.time() - self.days * 86400
+
+    async def _need_user(self, i: discord.Interaction) -> bool:
+        if not self.uid or not self.cid:
+            await i.response.send_message("먼저 캐릭터와 유저를 골라 주세요.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="호감도 그래프", style=discord.ButtonStyle.primary, row=3)
+    async def aff_btn(self, i: discord.Interaction, _b: discord.ui.Button) -> None:
+        if not await self._need_user(i):
+            return
+        await i.response.defer(ephemeral=True, thinking=True)
+        ctx = hub.ctxs[self.gid]
+        hist = await ctx.memory.affinity_history(self.cid, self.uid, self._since())
+        who = _user_name(self.guild, self.cid, self.uid)
+        png = await asyncio.to_thread(statslib.affinity_graph, hist, f"{self.chars.get(self.cid, self.cid)} -> {who} 호감도", Mood.aff100)
+        if png is None:
+            await i.followup.send("그래프를 만들 수 없어요 (`pip install matplotlib` 필요).", ephemeral=True)
+            return
+        c = ctx.chars.get(self.cid)
+        now = Mood.aff100(c.engine.mood.affinity(self.uid)) if c else None
+        head = f"현재 호감도 **{now}** ({Mood.aff_stage(now)}) · " if now is not None else ""
+        await i.followup.send(f"{head}기록 {len(hist)}건", file=discord.File(io.BytesIO(png), "affinity.png"), ephemeral=True)
+
+    @discord.ui.button(label="감정 그래프", style=discord.ButtonStyle.primary, row=3)
+    async def emo_btn(self, i: discord.Interaction, _b: discord.ui.Button) -> None:
+        if not self.cid:
+            await i.response.send_message("먼저 캐릭터를 골라 주세요.", ephemeral=True)
+            return
+        await i.response.defer(ephemeral=True, thinking=True)
+        hist = await hub.ctxs[self.gid].memory.emotion_history(self.cid, self._since())
+        png = await asyncio.to_thread(statslib.emotion_graph, hist, f"{self.chars.get(self.cid, self.cid)} 감정 변화",
+                                      lambda e: EMO[e].label if e in EMO else e)
+        if png is None:
+            await i.followup.send("그래프를 만들 수 없어요 (`pip install matplotlib` 필요).", ephemeral=True)
+            return
+        await i.followup.send(f"감정 변화 {len(hist)}건", file=discord.File(io.BytesIO(png), "emotion.png"), ephemeral=True)
+
+    @discord.ui.button(label="변화 원인", style=discord.ButtonStyle.secondary, row=3)
+    async def why_btn(self, i: discord.Interaction, _b: discord.ui.Button) -> None:
+        if not await self._need_user(i):
+            return
+        hist = await hub.ctxs[self.gid].memory.affinity_history(self.cid, self.uid, self._since(), limit=400)
+        rows = []
+        for ts, o, n, why, emo in hist[-15:]:
+            d = Mood.aff100(n) - Mood.aff100(o)
+            rows.append(f"`{kst(ts)}` {Mood.aff100(o)}->{Mood.aff100(n)} ({'+' if d >= 0 else ''}{d}) {why} · {EMO[emo].label if emo in EMO else emo}")
+        await i.response.send_message("**최근 호감도 변화 원인**\n" + ("\n".join(rows) or "기록이 없어요")[:1900], ephemeral=True)
+
+
+@bot.tree.command(name="통계", description="응답 속도/메시지 처리 통계, 호감도·감정 그래프 (관리자, 본인에게만 보임)")
+@app_commands.describe(mode="응답속도(P50/P95) · 메시지처리(상태별 건수) · 그래프(호감도/감정 화면) · 토큰(=/사용량)",
+                       hours="응답속도/메시지처리: 최근 몇 시간 (기본 24)")
+@app_commands.rename(mode="동작", hours="시간")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="응답속도", value="latency"),
+    app_commands.Choice(name="메시지처리", value="queue"),
+    app_commands.Choice(name="그래프", value="graph"),
+    app_commands.Choice(name="토큰", value="usage"),
+])
+async def stats_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str],
+                    hours: app_commands.Range[int, 1, 720] = 24) -> None:
+    act = mode.value
+    if act == "usage":
+        await usage_cmd.callback(interaction, None)
+        return
+    if act == "latency":
+        rep = await asyncio.to_thread(statslib.latency_report, engine.tracer.files(), float(hours))
+        await interaction.response.send_message(statslib.format_latency(rep)[:1990], ephemeral=True)
+        return
+    if act == "queue":
+        c = await memory.msg_counts(time.time() - hours * 3600)
+        total = sum(c.values()) or 1
+        lines = [f"**최근 {hours}시간 메시지 처리**"] + [f"{k}: {v}건 ({v * 100 // total}%)" for k, v in sorted(c.items(), key=lambda kv: -kv[1])]
+        await interaction.response.send_message("\n".join(lines) if c else "기록이 아직 없어요.", ephemeral=True)
+        return
+    gid = interaction.guild_id or DM
+    view = StatsView(gid, interaction.guild, interaction.user.id)
+    await interaction.response.send_message(
+        "캐릭터를 고르면 유저 목록이 나와요. 유저와 기간을 고른 뒤 버튼을 눌러 주세요. (나에게만 보여요)", view=view, ephemeral=True)
 
 
 # ---- 13. 로그 (디버깅용 상세 기록) ----

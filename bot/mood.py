@@ -305,6 +305,8 @@ class Mood:
         self.recent: deque[tuple[float, str]] = deque(maxlen=8)      # 도배 감지용
         self.thoughts: deque[tuple[float, str]] = deque(maxlen=6)    # (시각, 마음속 심정)
         self.aff: dict[int, float] = {}                              # 유저별 호감도
+        self._aff_recent: dict[int, deque] = {}                      # 유저별 최근 호감도 변화 사유 (반복 감쇠용)
+        self._last_logged_emo = ""
         self._atm_ts = 0.0
         self._tasks: set[asyncio.Task] = set()
         self.engage = 1.0                 # 적극성 (1.0=기본, 높을수록 대화에 적극적). settings.yaml engagement.level
@@ -444,13 +446,27 @@ class Mood:
     def current(self) -> Emotion:
         self._tick()
         if self.override:
+            self._note_emotion(self.override[0])
             return EMO[self.override[0]]
         vec = self._vec()
         dists = {e.id: self._dist(vec, e.anchor) for e in EMOTIONS if not e.special}
         best = min(dists, key=dists.get)
         cur = self.cur_id if self.cur_id in dists else None
         self.cur_id = cur if cur and dists[cur] <= dists[best] + 0.008 else best   # 깜빡임 방지
+        self._note_emotion(self.cur_id)
         return EMO[self.cur_id]
+
+    def _note_emotion(self, eid: str) -> None:
+        """감정이 바뀐 순간만 이력에 남긴다 (그래프용)."""
+        if eid == self._last_logged_emo:
+            return
+        self._last_logged_emo = eid
+        self._log_task(self.mem.log_emotion(self._cid(), eid, self._intensity_raw()))
+
+    def _intensity_raw(self) -> float:
+        base = self.baseline()
+        dev = math.sqrt(sum((self.s[d] - base[d]) ** 2 for d in DIMS) / len(DIMS))
+        return _clamp(dev * 2.4, 0.0, 1.0)
 
     def intensity(self) -> float:
         """기준값에서 얼마나 벗어났는가 (0~1). 이벤트 감정은 최소 0.5."""
@@ -476,10 +492,64 @@ class Mood:
             return "서먹하고 불편함", "거리를 두고 조금 퉁명스럽게 대한다"
         return "싫어함", "차갑고 시큰둥하게 대하며 말을 길게 섞지 않는다"
 
-    def _adj_aff(self, uid: Optional[int], delta: float) -> None:
+    @staticmethod
+    def aff100(a: float) -> int:
+        """내부 호감도(-1~1, 기본 0.1)를 0~100(기본 50)으로 보여 준다. 기본값이 정확히 50 이 되게 구간별로 늘린다."""
+        a = _clamp(a, -1.0, 1.0)
+        v = 50 + (a - AFF_BASE) / (1 - AFF_BASE) * 50 if a >= AFF_BASE else 50 - (AFF_BASE - a) / (AFF_BASE + 1) * 50
+        return int(round(v))
+
+    @staticmethod
+    def aff_stage(score: int) -> str:
+        """0~100 점수의 관계 이름"""
+        if score <= 0:
+            return "극단적 혐오"
+        if score < 25:
+            return "매우 나쁨"
+        if score < 40:
+            return "서먹하고 불편함"
+        if score < 60:
+            return "평범한 친구"
+        if score < 80:
+            return "친밀함"
+        if score < 100:
+            return "매우 친밀함"
+        return "썸에 가까운 사이"
+
+    def _adj_aff(self, uid: Optional[int], delta: float, reason: str = "") -> None:
         if uid is None or not delta:
             return
-        self.aff[uid] = _clamp(self.affinity(uid) + delta, -1.0, 1.0)
+        # 도배/반복으로 호감도를 올리거나 내리는 걸 막는다: 같은 사유가 10분 안에 반복되면 변화량이 절반씩 줄고,
+        # 상승은 하락보다 조금 어렵게(x0.9) 한다.
+        now = time.time()
+        hist = self._aff_recent.setdefault(uid, deque(maxlen=40))
+        while hist and now - hist[0][0] > 600:
+            hist.popleft()
+        n = sum(1 for _, r in hist if r == reason)
+        delta *= max(0.2, 0.5 ** n)
+        if delta > 0:
+            delta *= 0.9
+        hist.append((now, reason))
+        old = self.affinity(uid)
+        self.aff[uid] = _clamp(old + delta, -1.0, 1.0)
+        if abs(self.aff[uid] - old) >= 0.002:                          # 의미 있는 변화만 이력에 남긴다
+            self._log_task(self.mem.log_affinity(self._cid(), uid, old, self.aff[uid], reason or "대화",
+                                                 self.cur_id))
+
+    def _cid(self) -> str:
+        return self.persona.char_id if self.persona else ""
+
+    def _log_task(self, coro) -> None:
+        if getattr(self.mem, "db", None) is None:           # 저장소가 아직 안 열렸거나(시작 중) 없으면 이력은 건너뛴다
+            coro.close()
+            return
+        try:
+            t = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
 
     # ---------- 마음속 심정 ----------
     def add_thought(self, text: str, who: str = "") -> None:
@@ -621,7 +691,7 @@ class Mood:
                 continue
             sc = 1.0 if directed else (0.6 if rule.contagion else 0.25)
             self._apply(rule.effects, sc)
-            self._adj_aff(uid, rule.aff * sc)
+            self._adj_aff(uid, rule.aff * sc, (rule.reason or "대화 반응")[:40])
             if (directed or rule.contagion) and rule.reason:
                 self.add_thought(rule.reason, who)
             changed = True
@@ -632,7 +702,7 @@ class Mood:
             ids, ws = zip(*first_special.specials)
             self._set_override(random.choices(ids, weights=ws, k=1)[0], first_special.minutes)
         if directed:
-            self._adj_aff(uid, 0.004)               # 말을 걸어주는 것 자체로 조금씩 친해진다
+            self._adj_aff(uid, 0.004, "말을 걸어줌")               # 말을 걸어주는 것 자체로 조금씩 친해진다
             changed = True
 
         # 같은 말을 여러 번 도배하면 짜증
@@ -643,7 +713,7 @@ class Mood:
         if norm and dup >= 3:
             self._apply({"irritation": 10, "mood": -3}, 1.0 if directed else 0.6)
             self.add_thought("같은 말을 계속 도배해서 짜증 난다", who)
-            self._adj_aff(uid, -0.03)
+            self._adj_aff(uid, -0.03, "도배")
             if directed:
                 self._set_override("annoyed", 5)
             changed = True
@@ -654,7 +724,7 @@ class Mood:
         """명령/프롬프트 주입 시도를 받았을 때"""
         self._tick()
         self._apply({"irritation": 10, "mood": -4, "interest": 3})
-        self._adj_aff(uid, -0.05)
+        self._adj_aff(uid, -0.05, "명령/주입 시도")
         self.add_thought("이상한 명령/지시를 해서 어이가 없고 조금 질린다", who)
         self._set_override(random.choice(["dumbfounded", "dumbfounded", "annoyed", "smug"]), 5)
         self._save()
@@ -664,11 +734,11 @@ class Mood:
         self._tick()
         if sign > 0:
             self._apply({"mood": 3, "lonely": -3})
-            self._adj_aff(uid, 0.01)
+            self._adj_aff(uid, 0.01, "좋은 리액션")
             self.add_thought("내 말에 호의적인 리액션이 달려서 기분이 좋다", who)
         elif sign < 0:
             self._apply({"mood": -3, "irritation": 4})
-            self._adj_aff(uid, -0.015)
+            self._adj_aff(uid, -0.015, "나쁜 리액션")
             self.add_thought("내 말에 비웃는 듯한 리액션이 달려서 기분이 상한다", who)
         else:
             return
@@ -694,12 +764,12 @@ class Mood:
             self._apply({"mood": -10, "irritation": 8, "lonely": 6, "energy": -6})
             self.add_thought("말싸움에서 져서 억울하고 서럽다", who)
             self._set_override(random.choice(["hurt", "sulky"]), 12)
-            self._adj_aff(uid, -0.03)
+            self._adj_aff(uid, -0.03, "말싸움 패배")
         elif result == "calmed":
             self._apply({"irritation": -25, "mood": -2})
             self.add_thought("상대가 진심으로 속상해 보여서 미안하다", who)
             self._set_override("caring", 8)
-            self._adj_aff(uid, 0.05)
+            self._adj_aff(uid, 0.05, "싸움 뒤 화해")
         else:                                  # draw
             self._apply({"energy": -8, "irritation": -12})
             self._set_override("tired", 6)
