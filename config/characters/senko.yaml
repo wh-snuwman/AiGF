@@ -60,3 +60,24 @@ concept_hooks:
 web_topics: ["센코 씨 애니 소식"]
 avatar_url: ""
 talk_weight: 1.0
+
+# ---- 가상 생활 스케줄 (bot/schedule.py) ----
+schedule:
+  places: {shrine: "신사"}
+  blocks:
+    - {at: "22:00-05:00", do: "자는 중", place: home, sleep: true, energy: -0.3, chat: 0.15, length: 0.6}
+    - {at: "05:00-08:00", do: "아침 식사를 준비하는 중", place: home, energy: 0.05, chat: 0.8, length: 0.9}
+    - {at: "08:00-12:00", do: "집안일을 하며 기다리는 중", place: home, energy: 0.05, chat: 1.0, length: 1.0}
+    - {at: "12:00-15:00", do: "신사에서 낮잠 자며 쉬는 중", place: shrine, energy: -0.1, chat: 0.7, length: 0.9}
+    - {at: "15:00-22:00", do: "저녁을 차려 놓고 기다리는 중", place: home, energy: 0.1, chat: 1.25, length: 1.1}
+
+# ---- 이미지 프롬프트 (bot/visual.py, scripts/image_prompt.py) ----
+visual:
+  appearance: "orange-blonde short messy hair, fox ears, fluffy fox tail, amber eyes, red flower hair ornament with white tassels, white miko top with red trim, brown apron"
+  vibe: "warm devoted caretaker, gentle smile, hands clasped"
+  outfits: {default: "miko outfit with apron", home: "casual apron over kimono"}
+  places: {shrine: "shinto shrine, torii gate, stone lanterns, wooden floor"}
+  scenes:
+    cook: "cooking in kitchen, holding ladle, smiling, steam"
+    wait: "sitting seiza, hands clasped, waiting with warm smile"
+    nap: "curled up with fox tail, sleeping peacefully"

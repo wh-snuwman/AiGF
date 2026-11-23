@@ -375,8 +375,9 @@ class ChatEngine:
                   uid: int | None = None) -> list[dict[str, str]]:
         # 속도: 고정 프롬프트(system) + 예시는 매번 같아서 Ollama 가 KV 캐시를 재사용한다.
         # 매번 바뀌는 정보(시각/기분/상황/기억)는 마지막 사용자 턴에 붙인다.
+        act = self.mood.schedule.line(self.now())                  # 지금 캐릭터의 활동/장소 (시각으로 계산, LLM 호출 없음)
         dyn = self.persona.dynamic_block(
-            target_label, facts, self.now(), scene, view, self.mood.describe(uid, target_label))
+            target_label, facts, self.now(), (scene + "\n" + act) if act else scene, view, self.mood.describe(uid, target_label))
         tail = dyn + "\n\n" + hint
         if merged and merged[-1]["role"] == "user":
             merged[-1]["content"] += "\n\n" + tail

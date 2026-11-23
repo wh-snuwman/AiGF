@@ -107,3 +107,25 @@ web_topics: ["붕괴 스타레일 최신 소식", "붕괴 스타레일 업데이
 
 # 감정 표현 프리셋 (config/emotions.yaml). 바꾸고 싶은 감정만 `emotions:` 로 덮어쓸 수 있다
 emotion_preset: cool
+
+# ---- 가상 생활 스케줄 (bot/schedule.py): 시각으로 현재 활동을 계산한다. 자는 시간엔 대답/먼저 말하기가 크게 줄고 능동 말걸기는 없다 ----
+schedule:
+  places: {hideout: "해킹 아지트(게임 방)"}
+  blocks:
+    - {at: "06:00-14:00", do: "자는 중", place: home, sleep: true, energy: -0.3, chat: 0.15, length: 0.6}
+    - {at: "14:00-17:00", do: "막 일어나 에너지 드링크 마시는 중", place: home, energy: -0.15, chat: 0.6, length: 0.8}
+    - {at: "17:00-18:00", do: "야식거리 사러 나온 중", place: store, energy: 0.0, chat: 0.8, length: 0.9}
+    - {at: "18:00-23:00", do: "신작 게임에 빠져 있는 중", place: hideout, energy: 0.1, chat: 1.2, length: 1.1}
+    - {at: "23:00-06:00", do: "새벽 랭크전과 보스전에 몰입한 중", place: hideout, energy: 0.1, chat: 0.9, length: 0.85}
+
+# ---- 이미지 프롬프트 (bot/visual.py, scripts/image_prompt.py) ----
+# 외형은 한 번만 적고 감정/장소/장면은 공통 파일(config/visual_common.yaml)과 합쳐진다. 성격 분위기와 모순되지 않게 쓴다.
+visual:
+  appearance: "silver-gray ponytail hair, purple eyes, futuristic visor goggles on head, black choker, blue fur-trimmed jacket, hair clip, ear piercing"
+  vibe: "carefree gamer hacker, smug and playful, laid-back posture"
+  outfits: {default: "blue fur-trimmed jacket, white tank top", home: "oversized hoodie, headphones around neck"}
+  places: {hideout: "dark room, multiple glowing monitors, gaming chair, energy drink cans, neon lights"}
+  scenes:
+    game: "holding a game controller, glowing screen reflected on face, leaning forward"
+    hack: "typing on holographic keyboard, green code reflections, smirking"
+    snack: "eating chips, energy drink in hand, relaxed"

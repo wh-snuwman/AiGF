@@ -1,0 +1,53 @@
+# 캐릭터 이미지 프롬프트 공통 부분 (bot/visual.py). 캐릭터 yaml 의 `visual:` 과 합쳐서 이미지 생성 모델용 태그 문자열을 만든다.
+# 외형은 캐릭터 yaml 에만 적고, 여기에는 모든 캐릭터에 공통인 품질/스타일/표정/장소 태그만 둔다.
+quality: "masterpiece, best quality, anime style, 1girl, solo"
+negative: "lowres, bad anatomy, bad hands, extra fingers, text, watermark, signature, blurry, deformed, nsfw"
+
+# 감정 id(30종) -> 표정/자세 태그
+expressions:
+  calm: "calm expression, relaxed eyes"
+  content: "soft smile, satisfied expression"
+  joy: "bright smile, happy, open mouth"
+  excited: "excited, sparkling eyes, wide smile"
+  playful: "mischievous grin, one eye closed"
+  relaxed: "relaxed, gentle smile, half-closed eyes"
+  bored: "bored expression, half-lidded eyes, chin resting on hand"
+  sleepy: "sleepy, drowsy eyes, yawning"
+  tired: "tired eyes, slumped shoulders"
+  listless: "expressionless, vacant eyes"
+  lazy: "lazy expression, lying down"
+  annoyed: "annoyed, furrowed brows, side glance"
+  angry: "angry, glaring, clenched teeth"
+  sulky: "sulking, pouting, looking away"
+  hurt: "hurt expression, teary eyes, lowered gaze"
+  lonely: "lonely, looking away, wistful"
+  sad: "sad, tears, downcast eyes"
+  gloomy: "gloomy, shadowed face, downcast"
+  cold: "cold stare, expressionless, narrowed eyes"
+  smug: "smug smirk, half-closed eyes, confident"
+  proud: "proud expression, chin up, confident smile"
+  shy: "blush, embarrassed, looking away"
+  flutter: "blushing, heart-shaped pupils, shy smile"
+  caring: "gentle smile, concerned eyes, soft expression"
+  curious: "curious, wide eyes, head tilt"
+  focused: "focused eyes, serious expression"
+  worried: "worried, furrowed brows, hand on chest"
+  anxious: "anxious, sweat drop, trembling"
+  flustered: "flustered, blushing, wavy mouth"
+  dumbfounded: "dumbfounded, wide eyes, blank stare"
+
+# 장소 id -> 배경 태그 (공통 장소 + 캐릭터 전용 장소는 캐릭터 yaml visual.places 에 추가)
+places:
+  home: "indoors, bedroom, cozy room"
+  school: "school classroom, desk, window"
+  office: "office, desk, computer"
+  store: "convenience store, shelves, night lights"
+  street: "city street, outdoors, buildings"
+  park: "park, trees, outdoors, sunlight"
+
+# 시간대 보정
+time_tags:
+  morning: "morning light, soft sunlight"
+  day: "daylight"
+  evening: "evening, orange sunset light"
+  night: "night, dim lighting, city lights"

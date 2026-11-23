@@ -87,6 +87,23 @@ def check(path: Path) -> tuple[list[str], list[str]]:
         errs.append("avatar_url 은 http(s) 주소여야 해요")
     if "talk_weight" in d and not (0.1 <= float(d["talk_weight"]) <= 5):
         warns.append("talk_weight 는 0.1~5 권장")
+    sch = d.get("schedule")
+    if sch:
+        sys.path.insert(0, str(ROOT))
+        from bot.schedule import Schedule, _minutes
+        blocks = sch.get("blocks") or []
+        ok = 0
+        for i, b in enumerate(blocks, 1):
+            try:
+                a, c = str(b["at"]).split("-")
+                _minutes(a), _minutes(c)
+                ok += 1
+            except (KeyError, ValueError, TypeError):
+                errs.append(f"schedule.blocks[{i}] 형식 오류 (at: 'HH:MM-HH:MM' 필요)")
+            if b.get("place") and b["place"] not in Schedule(sch).places:
+                warns.append(f"schedule.blocks[{i}] 장소 '{b['place']}' 가 places 나 공통 장소에 없어요")
+        if ok and not any(Schedule(sch).current(__import__("datetime").datetime(2026, 1, 1, h, 0)).sleep for h in range(24)):
+            warns.append("schedule 에 자는 시간(sleep: true)이 없어요")
     return errs, warns
 
 

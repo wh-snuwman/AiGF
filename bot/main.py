@@ -1423,7 +1423,10 @@ async def _initiative_tick() -> None:
             continue
         snap = build_snapshot(ch_id)
         adj = ratio.adjust(ch_id)
-        dec = initiative.decide(snap, inicfg, engine.mood.engage, adj.initiate)
+        if engine.mood.schedule.asleep():
+            continue                                        # 자는 시간이면 먼저 말을 걸지 않는다
+        sched = engine.mood.schedule.effects()[1]           # 바쁜 시간대엔 덜 한다
+        dec = initiative.decide(snap, inicfg, engine.mood.engage, adj.initiate * sched)
         if dec.fire:
             hub.use_char(pick_free_speaker(ch_id))          # 캐릭터가 여럿이면 그중 하나가 먼저 말을 꺼낸다
             await run_initiative(ch_id, dec, snap, adj)
@@ -2217,10 +2220,11 @@ async def people_cmd(
         view = ppl.views.get(user.id)
         aff = engine.mood.affinity(user.id)
         label, _ = engine.mood.aff_label(aff)
+        score = engine.mood.aff100(aff)
         nfacts = len(await memory.get_facts(user.id, 200))
         await interaction.response.send_message(
             f"**{user.display_name}** (`{user.id}`)\n- 부르는 이름: {name[0] if name else '(없음, 닉네임 사용)'}\n"
-            f"- 이미지: {view or '(없음)'}\n- 호감도: {label} ({aff:+.2f}) · 기억 {nfacts}개", ephemeral=True)
+            f"- 이미지: {view or '(없음)'}\n- 호감도: {score}점 {label} · 기억 {nfacts}개", ephemeral=True)
         return
     ids = sorted(set(ppl.names) | set(ppl.views))
     if not ids:

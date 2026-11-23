@@ -24,6 +24,7 @@ from typing import Optional
 from .config import load_yaml
 from .emotion_profile import EmotionProfile, build_profile
 from .memory import Memory
+from .schedule import Schedule
 
 log = logging.getLogger("mood")
 
@@ -336,6 +337,19 @@ class Mood:
                 log.warning("감정 설정: %s", w)
         return self._prof
 
+    @property
+    def schedule(self) -> Schedule:
+        """캐릭터 yaml 의 schedule(시간표/장소). persona.data 가 바뀌면 다시 만든다."""
+        data = self.persona.data if self.persona else {}
+        key = (getattr(self.persona, "char_id", ""), id(data))
+        if getattr(self, "_sched_key", None) != key:
+            cfg = dict(data.get("schedule") or {})
+            if data.get("places") and not cfg.get("places"):
+                cfg["places"] = data["places"]
+            self._sched = Schedule(cfg, self.tz)
+            self._sched_key = key
+        return self._sched
+
     def tone_of(self, emo_id: str) -> str:
         return self.profile.tone(emo_id, EMO[emo_id].tone)
 
@@ -345,7 +359,7 @@ class Mood:
         hour = datetime.now(self.tz).hour
         b = {k: float(cfg.get(k, v)) for k, v in DEFAULT_BASE.items()}
         e = _clamp(self.engage_amount(), 0.0, 1.0)      # 0(기본)~1(매우 적극)
-        energy = ENERGY_BY_HOUR[hour] + float(cfg.get("energy_bias", 0.0))
+        energy = ENERGY_BY_HOUR[hour] + float(cfg.get("energy_bias", 0.0)) + self.schedule.effects()[0]   # 스케줄(자는 중/막 일어남 등) 보정
         h = self.hype()                                 # 1.5~4.0 구간의 '폭주' 정도 (0~1)
         energy = max(energy, self.energy_floor * e + 0.25 * h)   # 새벽에도 졸림/귀찮음 감정으로 빠지지 않게 바닥을 깐다
         b["energy"] = _clamp(energy, 0.02, 1.0)
@@ -456,12 +470,22 @@ class Mood:
         self._note_emotion(self.cur_id)
         return EMO[self.cur_id]
 
+    def secondary(self) -> Optional[str]:
+        """주 감정 다음으로 가까운(비슷한 거리의) 보조 감정 id. 이벤트 감정(override) 중이면 그 직전 상태의 주 감정. 없으면 None."""
+        vec = self._vec()
+        dists = sorted(((self._dist(vec, e.anchor), e.id) for e in EMOTIONS if not e.special))
+        main = self.override[0] if self.override else (dists[0][1] if dists else "")
+        for d, eid in dists:
+            if eid != main and d <= dists[0][0] + 0.12:
+                return eid
+        return None
+
     def _note_emotion(self, eid: str) -> None:
         """감정이 바뀐 순간만 이력에 남긴다 (그래프용)."""
         if eid == self._last_logged_emo:
             return
         self._last_logged_emo = eid
-        self._log_task(self.mem.log_emotion(self._cid(), eid, self._intensity_raw()))
+        self._log_task(lambda: self.mem.log_emotion(self._cid(), eid, self._intensity_raw()))
 
     def _intensity_raw(self) -> float:
         base = self.baseline()
@@ -480,17 +504,25 @@ class Mood:
     def affinity(self, uid: Optional[int]) -> float:
         return self.aff.get(uid, AFF_BASE) if uid is not None else AFF_BASE
 
-    @staticmethod
-    def aff_label(a: float) -> tuple[str, str]:
-        if a >= 0.6:
-            return "아주 친함", "허물없이 편하게 대하고 장난도 많이 친다"
-        if a >= 0.3:
-            return "친함", "편하고 다정하게 대한다"
-        if a >= -0.1:
-            return "보통", "평범하게 대한다"
-        if a >= -0.4:
-            return "서먹하고 불편함", "거리를 두고 조금 퉁명스럽게 대한다"
-        return "싫어함", "차갑고 시큰둥하게 대하며 말을 길게 섞지 않는다"
+    # 호감도 0~100 단계별 대화 지침 (캐릭터 성격은 그대로 두고 태도만 조절한다. 절대 규칙이 아니라 반응에 영향을 주는 변수)
+    AFF_GUIDES = (
+        (1, "극단적 혐오", "적대적이고 냉소적이다. 대화를 피하거나 불편함을 드러내고 말을 섞기 싫어한다. 심하게 화나면 거친 말이 나온다"),
+        (25, "매우 나쁨", "차갑고 시큰둥하다. 짧게 대꾸하고 웃지 않으며 경계한다"),
+        (40, "서먹하고 불편함", "거리를 두고 조금 퉁명스럽게 대한다. 농담은 거의 받아 주지 않는다"),
+        (60, "평범한 친구", "평범한 친구처럼 자연스럽게 대한다. 적당히 농담하고 친근하다"),
+        (80, "친밀함", "편하고 다정하게 대한다. 먼저 관심을 보이고 장난도 자주 친다"),
+        (100, "매우 친밀함", "아주 다정하고 마음을 연다. 관심과 걱정을 적극적으로 표현하고 상황에 맞게 애정 어린 말을 한다"),
+        (101, "서로 좋아함", "썸에 가까운 사이다. 쑥스러움과 설렘이 섞인 다정함을 보이되 캐릭터 성격에 맞게 표현한다"),
+    )
+
+    @classmethod
+    def aff_label(cls, a: float) -> tuple[str, str]:
+        """내부 호감도(-1~1)를 0~100 점수로 바꿔 단계 이름과 대화 지침을 돌려준다."""
+        score = cls.aff100(a)
+        for upper, label, guide in cls.AFF_GUIDES:
+            if score < upper:
+                return label, guide
+        return cls.AFF_GUIDES[-1][1], cls.AFF_GUIDES[-1][2]
 
     @staticmethod
     def aff100(a: float) -> int:
@@ -499,22 +531,13 @@ class Mood:
         v = 50 + (a - AFF_BASE) / (1 - AFF_BASE) * 50 if a >= AFF_BASE else 50 - (AFF_BASE - a) / (AFF_BASE + 1) * 50
         return int(round(v))
 
-    @staticmethod
-    def aff_stage(score: int) -> str:
+    @classmethod
+    def aff_stage(cls, score: int) -> str:
         """0~100 점수의 관계 이름"""
-        if score <= 0:
-            return "극단적 혐오"
-        if score < 25:
-            return "매우 나쁨"
-        if score < 40:
-            return "서먹하고 불편함"
-        if score < 60:
-            return "평범한 친구"
-        if score < 80:
-            return "친밀함"
-        if score < 100:
-            return "매우 친밀함"
-        return "썸에 가까운 사이"
+        for upper, label, _g in cls.AFF_GUIDES:
+            if score < upper:
+                return label
+        return cls.AFF_GUIDES[-1][1]
 
     def _adj_aff(self, uid: Optional[int], delta: float, reason: str = "") -> None:
         if uid is None or not delta:
@@ -533,20 +556,18 @@ class Mood:
         old = self.affinity(uid)
         self.aff[uid] = _clamp(old + delta, -1.0, 1.0)
         if abs(self.aff[uid] - old) >= 0.002:                          # 의미 있는 변화만 이력에 남긴다
-            self._log_task(self.mem.log_affinity(self._cid(), uid, old, self.aff[uid], reason or "대화",
-                                                 self.cur_id))
+            self._log_task(lambda: self.mem.log_affinity(self._cid(), uid, old, self.aff[uid], reason or "대화", self.cur_id))
 
     def _cid(self) -> str:
         return self.persona.char_id if self.persona else ""
 
-    def _log_task(self, coro) -> None:
-        if getattr(self.mem, "db", None) is None:           # 저장소가 아직 안 열렸거나(시작 중) 없으면 이력은 건너뛴다
-            coro.close()
+    def _log_task(self, make) -> None:
+        """이력 기록(비동기 DB 쓰기)을 백그라운드로 건다. 저장소가 아직 안 열렸거나 이벤트 루프가 없으면 건너뛴다."""
+        if getattr(self.mem, "db", None) is None:
             return
         try:
-            t = asyncio.get_running_loop().create_task(coro)
+            t = asyncio.get_running_loop().create_task(make())
         except RuntimeError:
-            coro.close()
             return
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
@@ -603,11 +624,12 @@ class Mood:
         e = self.current()
         it = self.intensity()
         level = "약" if it < 0.35 else "중" if it < 0.65 else "강" if it < 0.85 else "극"
-        lines = [f"기분:{e.label}({level})"]
+        sec = self.secondary()
+        lines = [f"기분:{e.label}({level})" + (f" 보조:{EMO[sec].label}" if sec and it >= 0.35 else "")]
         if uid is not None:
             label, guide = self.aff_label(self.affinity(uid))
-            if label != "보통":                                   # 평범한 사이는 굳이 적지 않는다
-                lines.append(f"{who or '상대'} 호감도:{label}→{guide}")
+            if label != "평범한 친구":                             # 평범한 사이는 굳이 적지 않는다
+                lines.append(f"{who or '상대'} 호감도:{self.aff100(self.affinity(uid))}점 {label}→{guide}")
         lines.append(f"말투:{self.tone_of(e.id)}")
         return "\n".join(lines)
 
@@ -644,7 +666,9 @@ class Mood:
     @property
     def length_bias(self) -> tuple[float, ...]:
         d = self.engage_amount() * 0.7          # 졸림/피곤 같은 감정의 '짧게 말하기' 쏠림을 적극성만큼 완화
-        return tuple(1.0 + (x - 1.0) * (1.0 - d) for x in self.current().length)
+        base = [1.0 + (x - 1.0) * (1.0 - d) for x in self.current().length]
+        f = self.schedule.effects()[2]          # 스케줄의 답변 길이 배수: 짧아지면 초단문/한 줄이 늘고 보통/길게가 줄어든다
+        return tuple(b * (1.0 / f if i < 2 else f) for i, b in enumerate(base))
 
     @property
     def speed(self) -> float:
@@ -653,7 +677,7 @@ class Mood:
     @property
     def reply_mult(self) -> float:
         v = self._soft(self.current().reply, lazy_side_below=True)
-        return v * (1.0 + 0.15 * _clamp(self.engage - 1.0, 0.0, 1.0) + 0.25 * self.hype())   # 적극적일수록 더 자주 끼어든다
+        return v * (1.0 + 0.15 * _clamp(self.engage - 1.0, 0.0, 1.0) + 0.25 * self.hype()) * self.schedule.effects()[1]   # 적극적일수록 더 자주 끼어들고, 스케줄(잠/바쁨)에 따라 줄어든다
 
     @property
     def cooldown_mult(self) -> float:
