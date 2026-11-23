@@ -291,6 +291,8 @@ def clean_text(message: discord.Message) -> str:
         if bot.user and m.id == bot.user.id:
             continue
         text = text.replace(f"@{m.display_name}", engine.label(m.id, m.display_name))
+    if not text and ((bot.user and bot.user in message.mentions) or at_chars(message.content)):
+        text = "(말없이 이름만 불렀다)"          # '@이름' 만 보낸 부름도 대답한다 (예전엔 빈 메시지로 보고 무시했다)
     ref = message.reference
     if text and ref and isinstance(ref.resolved, discord.Message):
         target = ref.resolved
@@ -1047,7 +1049,7 @@ async def respond_group(channel_id: int, target: Pending) -> None:
                 bubbles = await engine.reply(
                     channel_id, uid, uname, target.text or clean_text(msg),
                     # 멘션/답장/싸움이 아니고, 돌아온 상황 메모도 없을 때만 SKIP 가능
-                    can_skip=not target.priority and not note and fight is None and target.kind == "msg",
+                    can_skip=not target.priority and not note and fight is None and target.kind == "msg" and ignorable(uid),
                     priority=target.priority, extra_note=extra,
                     images=target.images or None, fight=fight, bubble_bias=target.bubbles,
                 )
@@ -1094,6 +1096,18 @@ async def respond_group(channel_id: int, target: Pending) -> None:
         in_fight = engine.fights.get(channel_id, uid) is not None
         bot.next_ok[channel_id] = time.monotonic() + (1.0 if in_fight else next_cooldown(channel_id))
         bot.busy.discard(channel_id)
+
+
+SKIP_AFF_BELOW = 10          # 호감도(0~100)가 이 미만인 상대에게만 '아예 대답하지 않는' 일이 가끔 생긴다
+
+
+def ignorable(uid: int | None) -> bool:
+    """이 상대의 말은 가끔 무시해도 되는가: 호감도가 10 미만일 때만 (그 외에는 말을 걸면 대답한다)."""
+    try:
+        m = engine.mood
+        return m.aff100(m.affinity(uid)) < SKIP_AFF_BELOW
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def to_candidate(p: Pending, now: float, channel_id: int) -> targeting.Candidate:
@@ -1169,6 +1183,11 @@ async def group_loop() -> None:
             chance = (gcfg["reply_chance"] + targeting.chance_boost(users, gcfg["crowd_chance_per_user"])
                       + 0.2 * (engine.mood.engage - 1.0))      # 적극성이 높을수록 더 많은 말에 대답한다
             p_reply = min(1.0, chance * engine.mood.reply_mult * adj.reply)
+            others_ok = [p for p in ready if not ignorable(p.uid or p.message.author.id)]
+            if others_ok and users <= 1 and not ratio.over_cap(channel_id) and not engine.mood.schedule.asleep():
+                p_reply = 1.0                              # 호감도 10 이상인 사람이 혼자 말하면 항상 대답한다 (무시는 호감도 10 미만일 때만)
+            elif not others_ok:
+                p_reply = min(p_reply, 0.5)                # 호감도 10 미만인 사람만 있으면 가끔 대답을 안 한다
             if random.random() > p_reply:
                 engine.tracer.log("decision", action="skip_chance", channel_id=channel_id,
                                   detail=f"대답 확률 {p_reply:.2f} 탈락 (사람 {users}명, 비율보정 x{adj.reply:.2f})",
