@@ -59,3 +59,23 @@ concept_hooks:
 web_topics: ["블루 아카이브 아로나 공식 영상"]
 avatar_url: ""
 talk_weight: 1.0
+
+visual:
+  appearance: "short pale blue hair, blue eyes, white bow, blue ring halo"
+  vibe: "bright smile, relaxed posture"
+  outfits:
+    default: "white and blue sailor-style outfit"
+  places:
+    shittim_classroom: "empty classroom, water reflections, blue sky"
+  scenes:
+    sky_watch: "sunlit classroom, water reflections, bright blue sky"
+    snack_break: "strawberry milk carton, classroom desk"
+
+schedule:
+  places:
+    shittim_classroom: "싯딤의 상자 속 교실"
+  blocks:
+    - {at: "00:00-08:00", do: "조용히 쉬는 중", place: shittim_classroom, sleep: true, energy: -0.28, chat: 0.15, length: 0.6}
+    - {at: "08:00-12:00", do: "교실에서 하루를 여는 중", place: shittim_classroom, energy: 0.02, chat: 0.7, length: 0.8}
+    - {at: "12:00-18:00", do: "교실 창가에서 하늘 보는 중", place: shittim_classroom, energy: 0.1, chat: 1.05, length: 1.05}
+    - {at: "18:00-00:00", do: "딸기 우유를 떠올리는 중", place: shittim_classroom, energy: 0.03, chat: 0.95, length: 0.95}
