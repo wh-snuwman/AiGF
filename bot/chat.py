@@ -23,6 +23,7 @@ from .people import People
 from . import trace
 from .persona import Persona
 from .trace import Tracer
+from .budget import fit as budget_fit
 from .slang import Slang
 from .web import WebInfo
 
@@ -387,6 +388,10 @@ class ChatEngine:
         examples = self.persona.example_messages(pc.get("max_examples", 4), pc.get("example_rotate_min", 25))
         system = self.persona.static_prompt()
         tr = trace.cur()
+        budget = int(pc.get("budget_tokens", 0) or 0)
+        if budget:                                                 # 토큰 예산을 넘으면 오래된 대화부터 줄인다 (프롬프트 처리 시간 절감)
+            merged, info = budget_fit(system, examples, merged, budget, int(pc.get("keep_last", 4)))
+            tr.set(token_budget=info)
         tr.set(system_chars=len(system), examples=len(examples) // 2,
                example_firsts=[e["content"][:30] for e in examples if e["role"] == "user"])
         if self.tracer.cfg.get("include_prompt", True):

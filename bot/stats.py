@@ -40,7 +40,7 @@ def latency_report(files: list[Path], hours: float = 24.0) -> dict:
     """trace JSONL 에서 지연/토큰 통계를 뽑는다.
     total: 메시지 처리 전체(생성~전송 직전), llm: 모델 호출 시간, load: 모델 로드 대기, queue: 수신 후 대기."""
     since = time.time() - hours * 3600
-    total, llm_sec, load, queue, ptok, ctok, tps = [], [], [], [], [], [], []
+    total, llm_sec, load, queue, ptok, ctok, tps, ttft = [], [], [], [], [], [], [], []
     outcomes: dict[str, int] = {}
     errors = 0
     for f in files:
@@ -77,6 +77,8 @@ def latency_report(files: list[Path], hours: float = 24.0) -> dict:
                         llm_sec.append(float(e["sec"]))
                     if isinstance(e.get("load_sec"), (int, float)):
                         load.append(float(e["load_sec"]))
+                        if isinstance(e.get("prompt_sec"), (int, float)):
+                            ttft.append(float(e["load_sec"]) + float(e["prompt_sec"]))   # 첫 토큰까지 ≈ 모델 로드 + 프롬프트 처리
                     pt, ct = e.get("prompt_tokens"), e.get("completion_tokens")
                     if isinstance(pt, (int, float)) and pt:
                         ptok.append(float(pt))
@@ -85,7 +87,7 @@ def latency_report(files: list[Path], hours: float = 24.0) -> dict:
                         if isinstance(e.get("sec"), (int, float)) and e["sec"] > 0:
                             tps.append(float(ct) / float(e["sec"]))
     return {"hours": hours, "outcomes": outcomes, "errors": errors, "total_sec": _dist(total), "llm_sec": _dist(llm_sec),
-            "load_sec": _dist(load), "queue_sec": _dist(queue), "prompt_tokens": _dist(ptok),
+            "load_sec": _dist(load), "ttft_sec": _dist(ttft), "queue_sec": _dist(queue), "prompt_tokens": _dist(ptok),
             "completion_tokens": _dist(ctok), "tokens_per_sec": _dist(tps)}
 
 
@@ -97,7 +99,7 @@ def format_latency(rep: dict) -> str:
     oc = ", ".join(f"{k} {v}" for k, v in sorted(rep["outcomes"].items(), key=lambda kv: -kv[1])[:6]) or "없음"
     return "\n".join([
         f"**최근 {rep['hours']:g}시간 응답 통계**",
-        row("응답 전체", rep["total_sec"]), row("모델 호출", rep["llm_sec"]), row("모델 로드 대기", rep["load_sec"]),
+        row("응답 전체", rep["total_sec"]), row("첫 토큰까지(TTFT 추정)", rep["ttft_sec"]), row("모델 호출", rep["llm_sec"]), row("모델 로드 대기", rep["load_sec"]),
         row("수신 후 대기", rep["queue_sec"]), row("입력 토큰", rep["prompt_tokens"], ""), row("출력 토큰", rep["completion_tokens"], ""),
         row("생성 속도(토큰/초)", rep["tokens_per_sec"], ""), f"결과: {oc}"])
 
