@@ -25,11 +25,13 @@ _F = (r"Ͱ-ϿЀ-ԯ԰-֏֐-׿؀-ۿऀ-ॿ"
 FOREIGN = re.compile(rf"[{_F}]")
 HANGUL = re.compile(r"[가-힣]")
 SKIP_RE = re.compile(r"^\W*\[?SKIP\]?\W*$", re.I)
+LATIN_WORD = re.compile(r"[a-z]{2,}")
 META = re.compile(r"(수정|교정|맞춤법|고쳐|입력|출력|문장입니다|결과)")
 PREFIX = re.compile(r"^\s*(?:입력|출력|수정|교정|결과)\s*[:：]\s*")
 
 SYSTEM = ("너는 한국어 채팅 문장 교정기다. 입력의 맞춤법, 띄어쓰기, 조사, 어미, 어색하거나 존재하지 않는 낱말, 번역투만 자연스럽게 고친다. "
           "뜻, 말투(반말/존댓말), 길이, ㅋㅋ 같은 표현은 바꾸지 않는다. 줄 수도 그대로 둔다. "
+          "모르는 낱말이나 감탄사는 건드리지 말고 영어 등 외국어 단어로 바꾸지 않는다. "
           "이미 자연스러우면 그대로 출력한다. 설명 없이 고친 문장만 출력한다.")
 SHOTS = [
     ("오늘 날씨가 좋아서 기분이 좋아 졌어", "오늘 날씨가 좋아서 기분이 좋아졌어"),
@@ -55,6 +57,8 @@ def accept(orig: str, fixed: str, min_sim: float = 0.55) -> bool:
         return False
     if FOREIGN.search(fixed) and not FOREIGN.search(orig):
         return False
+    if set(LATIN_WORD.findall(fixed.lower())) - set(LATIN_WORD.findall(orig.lower())):
+        return False                                         # 원문에 없던 영어 단어가 생겼다 (예: 풋 -> footage). 소형 모델이 모르는 말을 영어로 바꾸는 환각
     if HANGUL.search(orig) and not HANGUL.search(fixed):
         return False
     if META.search(fixed) and not META.search(orig):

@@ -52,6 +52,10 @@ class AcceptTests(unittest.TestCase):
         self.assertFalse(c.accept("뭐 해", "뭐 спец"))
         self.assertFalse(c.accept("뭐 해 지금", "수정한 문장: 뭐 해 지금?"))
 
+    def test_rejects_new_english_word(self):
+        self.assertFalse(c.accept("풋 내가 짝사랑했던 애는 엄청 낯을 가렸었지", "footage 내가 짝사랑했던 애는 엄청 낯을 가렸었지"))
+        self.assertTrue(c.accept("나 GG 쳤어 진짜 어이 없어", "나 GG 쳤어 진짜 어이없어"))      # 원문에 있던 영어는 괜찮다
+
     def test_rejects_line_count_change(self):
         self.assertFalse(c.accept("뭐 해\n지금 어디야", "뭐 해 지금 어디야"))
 
