@@ -2020,7 +2020,7 @@ async def set_avatar(interaction: discord.Interaction, character: Optional[str],
 @bot.tree.command(name="캐릭터", description="캐릭터를 부르거나 내보내고, 캐릭터끼리 대화를 시작/중지해요")
 @app_commands.describe(mode="부르기/내보내기/목록 · 대화시작/대화중지 · 상호작용켜기/끄기(캐릭터끼리 알아서 받아치기) · 상태",
                        character="부를/내보낼 캐릭터, 대화시작일 땐 먼저 말할 캐릭터 (생략하면 아무나)",
-                       topic="대화시작할 때 이야기 주제 (생략하면 자유)", rounds="대화시작: 말을 주고받을 횟수 (기본 6, 최대 20)",
+                       topic="대화시작할 때 이야기 주제 (생략하면 자유)", rounds="대화시작: 말을 주고받을 횟수 (기본 6, 최대 500)",
                        image="프로필: 새 프로필 사진 (png/jpg/webp/gif, 8MB 이하). 비우면 원래 사진으로 되돌림")
 @app_commands.rename(mode="동작", character="캐릭터", topic="주제", rounds="횟수", image="이미지")
 @app_commands.choices(mode=[
@@ -2038,7 +2038,7 @@ async def set_avatar(interaction: discord.Interaction, character: Optional[str],
 @app_commands.autocomplete(character=character_autocomplete)
 async def character_cmd(
     interaction: discord.Interaction, mode: app_commands.Choice[str], character: Optional[str] = None,
-    topic: Optional[str] = None, rounds: app_commands.Range[int, 2, 20] = 6,
+    topic: Optional[str] = None, rounds: app_commands.Range[int, 2, 500] = 6,
     image: Optional[discord.Attachment] = None,
 ) -> None:
     act = mode.value

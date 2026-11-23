@@ -48,7 +48,7 @@ group:
   cooldown_jitter: 0.6         # 쿨다운에 0~60% 랜덤 추가 (너무 기계적이지 않게)
   reply_chance: 0.9            # 쿨다운 후 올라온 메시지에 대답할 확률 (1.0이면 항상)
   mention_bypass_cooldown: true  # 멘션/답장은 쿨다운 무시하고 바로 대답 (끄면 멘션도 쿨다운 적용)
-  max_pending_age_sec: 90      # 이 시간보다 오래된 메시지는 대답 후보에서 제외
+  max_pending_age_sec: 180     # 이 시간보다 오래된 메시지는 대답 후보에서 제외
   # 한 사람이 말을 여러 줄로 끊어서 보낼 때 하나로 묶어서 이해하기 위한 설정
   settle_sec: 1.8              # 그 사람의 마지막 메시지 후 이 시간(초) 동안 새 메시지가 없어야 대답 시작
   max_settle_wait_sec: 15      # 입력 중 표시가 계속 떠 있어도 최대 이만큼만 기다림 (DM 포함)
@@ -67,8 +67,8 @@ idle:
   first_after_min: [15, 50]      # 마지막 사람 대화 후 첫 먼저 말걸기까지 (분, 이 범위에서 랜덤)
   followup_after_min: [12, 35]   # 답이 없을 때 다음 이벤트까지 (분, 랜덤)
   followup_growth: 1.6           # 단계가 오를수록 간격이 이 배수만큼 길어짐
-  max_unanswered: 3              # 이만큼 답이 없으면 더 이상 먼저 말하지 않음
-  max_per_day: 6                 # 채널당 하루 최대 먼저 말하기 횟수
+  max_unanswered: 6              # 이만큼 답이 없으면 더 이상 먼저 말하지 않음
+  max_per_day: 30                # 채널당 하루 최대 먼저 말하기 횟수
   active_hours: [10, 24]         # 이 시간대(KST)에만 (시작시, 끝시: 끝은 포함 안 함)
 
 memory:
@@ -83,14 +83,14 @@ typing:
   chars_per_second: 35         # 타이핑 속도 (글자/초)
   min_delay: 0.3
   max_delay: 2.0
-  max_bubbles: 3               # 한 번에 보낼 최대 말풍선 수
+  max_bubbles: 5               # 한 번에 보낼 최대 말풍선 수
   read_delay: [0.1, 0.5]       # DM에서 메시지를 읽는 척 하는 지연(초)
 
 proactive:                     # DM 에서 먼저 말 걸기 (서버 채팅 모드에서는 기본 꺼둠)
   enabled: false
   check_interval_min: 10
   idle_hours_min: 5
-  max_per_day: 2
+  max_per_day: 6
   active_hours: [9, 23]
   chance: 0.35
 
@@ -104,13 +104,13 @@ guard:
   enabled: true
   block_score: 3
   decline_score: 2
-  max_input_chars: 500         # 프롬프트/기록에 넣는 사용자 메시지 최대 길이 (넘으면 잘라냄)
-  max_bubble_chars: 300        # 말풍선 하나의 최대 길이 (긴 문서 출력 방지)
-  max_output_chars: 420        # 이보다 긴 답변은 폐기하고 대체 문구 사용
+  max_input_chars: 1500        # 프롬프트/기록에 넣는 사용자 메시지 최대 길이 (넘으면 잘라냄)
+  max_bubble_chars: 600        # 말풍선 하나의 최대 길이 (긴 문서 출력 방지)
+  max_output_chars: 900        # 이보다 긴 답변은 폐기하고 대체 문구 사용
   mute_after: 3                # mute_window_min 안에 차단 시도가 이만큼 쌓이면 잠시 무시
   mute_window_min: 10
   mute_minutes: 5
-  max_msgs_per_min: 15         # 한 사람이 1분에 이보다 많이 보내면 도배로 보고 무시 (GPU 독점 방지, 관리자 제외)
+  max_msgs_per_min: 60         # 한 사람이 1분에 이보다 많이 보내면 도배로 보고 무시 (GPU 독점 방지, 관리자 제외)
 
 # 말싸움 (bot/fight.py)  level: 1=순화(비꼼과 순한 표현), 2=가벼운 욕까지, 3=센 욕설까지
 #  (3 에서도 가족/외모/성적/장애/지역/정치·종교/인종 비하, 혐오, 위협, 자해, 개인정보는 코드로 계속 금지)
@@ -118,12 +118,12 @@ guard:
 fight:
   enabled: true
   level: 3
-  max_rounds: 8                # 이 라운드가 지나면 기세로 승패 판정
+  max_rounds: 20               # 이 라운드가 지나면 기세로 승패 판정
   timeout_sec: 120             # 상대가 이만큼 말이 없으면 종료
   start_chance: 0.7            # 도발을 받고 기분이 상했을 때 싸움이 붙을 확률
   cooldown_after_sec: 180      # 같은 사람과 싸움이 끝난 뒤 다시 붙기까지
   nudge_after_sec: 25          # 상대가 대꾸하지 않으면 봇이 이 시간 뒤에 먼저 다시 도발
-  max_nudges: 2                # 먼저 도발하는 최대 횟수
+  max_nudges: 4                # 먼저 도발하는 최대 횟수
   level_text: ""               # 기본 수위를 자유 텍스트로 (비우면 level 프리셋). /싸움 수위:"..." 로 저장
   filter: false                # 출력 금지어 필터+재생성. 앞단에 별도 검열이 있으면 이중 검열이라 꺼둠 (/싸움 동작:필터 로 전환)
 
@@ -177,7 +177,7 @@ ratio:
   window_min: 20
   reroll_min: 5                # 목표를 다시 뽑는 주기(분). 실제로는 이 값의 0.5~1.5배로 랜덤
   min_human: 3                 # 사람 메시지가 이보다 적으면 비율 보정은 하지 않음
-  allow: 3                     # 사람이 말하지 않아도 봇이 먼저 말할 수 있는 여유분. 봇 메시지가 (목표비율 x 사람 메시지 + allow) 이상이면 먼저 말하기를 막음
+  allow: 10                    # 사람이 말하지 않아도 봇이 먼저 말할 수 있는 여유분. 봇 메시지가 (목표비율 x 사람 메시지 + allow) 이상이면 먼저 말하기를 막음
 
 # 능동 대화 (bot/initiative.py): 아무도 말을 안 걸어도 침묵/대화 속도 감소/비율 부족/답 못 받은 사람/랜덤 쿨타임을
 #  종합해 스스로 먼저 말한다. (15분 이상 조용하면 idle 혼잣말 이벤트가 담당)
@@ -187,8 +187,8 @@ initiative:
   min_gap_sec: [90, 300]       # 먼저 말한 뒤 다음까지 랜덤 쿨타임 (적극성이 높으면 짧아지고, 답이 없을수록 길어짐)
   min_silence_sec: 35          # 이 시간 이상 조용해야 침묵 점수가 오름
   idle_handoff_sec: 900        # 이 시간 이상 조용하면 혼잣말 이벤트에게 넘김
-  max_per_hour: 8              # 채널당 시간당 최대 횟수
-  max_unanswered: 2            # 먼저 말했는데 답이 없으면 이 횟수까지만
+  max_per_hour: 30             # 채널당 시간당 최대 횟수
+  max_unanswered: 5            # 먼저 말했는데 답이 없으면 이 횟수까지만
 
 # 감정 표현 (이모티콘/글자 늘이기/느낌표): scale 로 전체 강도 조절 (0=끔, 1=기본, 1.5=더 많이)
 expression:
@@ -283,8 +283,8 @@ style:
 multi:
   webhook: true
   webhook_name: "AIGF"
-  chain_chance: 0.45
-  chain_decay: 0.5
-  max_chain: 2
+  chain_chance: 0.6
+  chain_decay: 0.8
+  max_chain: 8
   chain_delay_sec: [2.5, 6.0]
-  human_window_sec: 600
+  human_window_sec: 1800
