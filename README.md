@@ -34,6 +34,11 @@
 - **프롬프트 인젝션 방어** (`bot/guard.py`): 아래 "보안" 절을 보세요.
 
 
+### 캐릭터 생성 파이프라인 (스킬 + `scripts/character_pipeline.py`)
+- 새 캐릭터는 메인 스킬 `character-pipeline` 이 `character-research`, `character-profile`, `character-prompt`, `character-visual`, `character-emotion`, `character-schedule`, `character-integration`, `character-validation` 8개 하위 스킬을 순서대로 조정해 만듭니다(`.claude/skills/`). 파일 하나만 빠르게 고치는 일은 기존 `character-writer` 를 씁니다.
+- 단계 사이에는 자연어가 아니라 `data/character_work/<id>/` 의 yaml 파일(`research`, `profile`, `prompt`, `visual`, `emotion`, `schedule`)로만 넘기고, profile/visual/schedule 은 research 만 읽으므로 병렬로 만들 수 있습니다. 중간 보고 없이 마지막에 통합 보고서 하나만 냅니다.
+- 합치기와 검증은 코드가 결정적으로 합니다: `python scripts/character_pipeline.py init|assemble|validate <id>`. `assemble` 은 이미 있는 캐릭터를 `--force` 없이는 덮어쓰지 않고(덮어쓰면 `.bak` 백업), `--avatar` 로 얼굴 위치를 맞춘 프로필 사진도 만듭니다. `validate` 는 yaml 형식/분량, 말투 격식 일치(설명이 반말인데 예시가 존댓말이면 오류), 다른 캐릭터와 예시 겹침(말투 구분), 스케줄 24시간 빈틈, 감정 프리셋, 프롬프트 크기, 프로필 사진을 한 번에 검사합니다.
+
 ### 성능 측정과 프롬프트 토큰 예산 (`scripts/bench.py`, `bot/budget.py`)
 - **서버 벤치마크** (GPU/Ollama 가 있는 곳에서): `python scripts/bench.py` 가 실제 캐릭터 프롬프트로 20번 요청해 **TTFT**(스트리밍으로 첫 토큰까지), 전체 생성 시간, 입력/출력 토큰, 생성 속도를 평균, P50, P95, P99 로 측정하고 GPU/VRAM 상태와 함께 `data/bench/<시각>.json` 에 저장합니다. 설정이나 프롬프트를 바꾼 뒤 `--compare data/bench/이전파일.json` 으로 전후 변화율을 봅니다. 응답 지연 3초 목표는 TTFT 와 전체 시간 각각의 P95 로 판정해 같이 출력합니다.
 - **토큰 계수 보정**: `python scripts/bench.py --calibrate` 가 모델로 글자당 토큰 수(한글/영문)를 실측해 `data/bench/calib.json` 에 저장하고, 예산 계산이 그 값을 씁니다(측정 전에는 넉넉한 기본값).
