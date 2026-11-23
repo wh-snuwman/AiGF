@@ -72,7 +72,7 @@ async def run() -> int:
     base = lambda n: n[:-7] if n.endswith(":latest") else n          # noqa: E731
     cc = settings.get("corrector") or {}
     if cc.get("enabled"):                                             # 문법 교정용 작은 모델
-        cm = cc.get("model", "exaone3.5:2.4b")
+        cm = cc.get("model", "qwen2.5:3b")
         if any(base(n) == base(cm) for n in names):
             print(f"{OK} 문법 교정 모델 {cm} 설치됨 (OLLAMA_MAX_LOADED_MODELS 는 2 이상이어야 메인과 함께 상주해요: `bash scripts/run_ollama.sh`)")
         else:

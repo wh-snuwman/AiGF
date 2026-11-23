@@ -91,6 +91,16 @@ class FixTests(unittest.TestCase):
         self.assertEqual(run(x.fix("오늘 기분이 좋아 졌어")), "오늘 기분이 좋아 졌어")
         self.assertFalse(x.enabled)
 
+    def test_kv_cache_error_pauses_for_an_hour(self):
+        err = RuntimeError("llama_init_from_model: K cache type q8_0 with block size 32 does not divide n_embd_head_k=80")
+        x = make(FakeClient(exc=err))
+        self.assertTrue(run(x.warmup()) is False)
+        self.assertFalse(x.enabled)
+        self.assertGreater(x.disabled_until - __import__("time").time(), 3000)      # 거의 1시간
+        y = make(FakeClient(exc=err))
+        self.assertEqual(run(y.fix("오늘 기분이 좋아 졌어")), "오늘 기분이 좋아 졌어")   # 대화는 원문 그대로
+        self.assertFalse(y.enabled)
+
     def test_skips_short_skip_foreign_and_disabled(self):
         cli = FakeClient("x")
         x = make(cli)

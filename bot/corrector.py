@@ -67,7 +67,7 @@ def accept(orig: str, fixed: str, min_sim: float = 0.55) -> bool:
 
 class Corrector:
     def __init__(self, cfg: dict | None, host: str = "http://127.0.0.1:11434") -> None:
-        self.cfg = {"enabled": True, "model": "exaone3.5:2.4b", "timeout_sec": 1.5, "min_chars": 4, "max_chars": 240,
+        self.cfg = {"enabled": True, "model": "qwen2.5:3b", "timeout_sec": 1.5, "min_chars": 4, "max_chars": 240,
                     "keep_alive": "24h", "min_similarity": 0.55, **(cfg or {})}
         self.host = host
         self._client: Any = None
@@ -89,6 +89,16 @@ class Corrector:
         self.disabled_until = time.time() + sec
         log.warning("문법 교정을 %d분 쉽니다: %s (대화에는 영향 없음)", max(1, int(sec // 60)), why)
 
+    @staticmethod
+    def _kv_error(e: Exception) -> bool:
+        """KV 캐시 양자화(OLLAMA_KV_CACHE_TYPE=q8_0)와 모델의 헤드 크기가 안 맞아 로드에 실패한 경우 (예: exaone 의 head 80)"""
+        m = str(e)
+        return "does not divide" in m or "failed to create context" in m
+
+    def _pause_kv(self) -> None:
+        self._pause(3600, f"모델 {self.cfg['model']} 은 서버의 KV 캐시 설정(q8_0)과 맞지 않아 로드되지 않아요 → settings.yaml 의 "
+                          "corrector.model 을 qwen2.5:3b 처럼 헤드 크기가 128/256 인 모델로 바꾸세요")
+
     async def warmup(self) -> bool:
         """시작할 때 보조 모델을 VRAM 에 올려 둔다. 모델이 없으면 알려 주고 꺼 둔다."""
         if not self.cfg.get("enabled"):
@@ -101,6 +111,8 @@ class Corrector:
         except Exception as e:  # noqa: BLE001
             if getattr(e, "status_code", None) == 404:
                 self._pause(600, f"모델 {self.cfg['model']} 이 없어요 → `ollama pull {self.cfg['model']}`")
+            elif self._kv_error(e):
+                self._pause_kv()
             else:
                 self._pause(300, f"{type(e).__name__}")
             return False
@@ -133,6 +145,8 @@ class Corrector:
             self.stats["error"] += 1
             if getattr(e, "status_code", None) == 404:
                 self._pause(600, f"모델 {self.cfg['model']} 이 없어요 → `ollama pull {self.cfg['model']}`")
+            elif self._kv_error(e):
+                self._pause_kv()
             else:
                 self._fail_streak += 1
                 if self._fail_streak >= 3:

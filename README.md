@@ -35,9 +35,9 @@
 
 
 ### 문법 교정 보조 모델 (`bot/corrector.py`, `corrector:`)
-- 메인 모델(gemma3 12B)이 가끔 만드는 어색한 말(조사/어미 오류, 없는 낱말)을 작은 한국어 모델(기본 `exaone3.5:2.4b`, 약 1.6GB)이 한 번 더 고칩니다. 메인이 만든 원문에 대해, 의미/말투(반말·존댓말)/길이/ㅋㅋ/줄 수는 그대로 두고 틀린 부분만 고치게 하고, 캐릭터의 격식(반말/존댓말)도 알려 줍니다.
+- 메인 모델(gemma3 12B)이 가끔 만드는 어색한 말(조사/어미 오류, 없는 낱말)을 작은 한국어 모델(기본 `qwen2.5:3b`, 약 1.9GB)이 한 번 더 고칩니다. 메인이 만든 원문에 대해, 의미/말투(반말·존댓말)/길이/ㅋㅋ/줄 수는 그대로 두고 틀린 부분만 고치게 하고, 캐릭터의 격식(반말/존댓말)도 알려 줍니다.
 - **안전장치**: 1.5초 안에 못 끝나면 원문 사용, 결과가 원문과 너무 다르거나(유사도 55% 미만, 길이 0.6~1.5배 밖), 줄 수가 바뀌거나, 외국 문자/설명문이 섞이면 버립니다. 싸움 중에는 쓰지 않고, 모델이 없으면 알리고 자동으로 꺼지며(10분 뒤 재시도) 연속 시간 초과/오류면 5분 쉽니다. 대화는 항상 정상으로 이어집니다.
-- **서버 준비**: `ollama pull exaone3.5:2.4b` 로 모델을 받고, Ollama 를 `OLLAMA_MAX_LOADED_MODELS=2` 로 켜야 메인과 함께 VRAM 에 상주합니다(`bash scripts/run_ollama.sh` 가 이 값으로 켭니다. 1 이면 호출마다 두 모델이 서로 교체돼 매우 느려집니다). 지연/VRAM 은 `python scripts/bench.py --aux exaone3.5:2.4b` 로, 실사용 통계는 `/통계 동작:응답속도`(교정 호출/수정/버림/평균 시간 포함)로 봅니다. `python -m bot.doctor` 가 모델 설치 여부를 알려 줍니다.
+- **서버 준비**: `ollama pull qwen2.5:3b` 로 모델을 받고, Ollama 를 `OLLAMA_MAX_LOADED_MODELS=2` 로 켜야 메인과 함께 VRAM 에 상주합니다(`bash scripts/run_ollama.sh` 가 이 값으로 켭니다. 1 이면 호출마다 두 모델이 서로 교체돼 매우 느려집니다). 서버가 KV 캐시를 `q8_0` 으로 양자화하므로 헤드 크기가 32의 배수가 아닌 모델(예: exaone3.5, head 80)은 `K cache type q8_0 ... does not divide` 오류로 로드되지 않습니다 — 그럴 땐 모델을 바꾸세요(봇은 1시간 쉬고 원문을 그대로 씁니다). 지연/VRAM 은 `python scripts/bench.py --aux qwen2.5:3b` 로, 실사용 통계는 `/통계 동작:응답속도`(교정 호출/수정/버림/평균 시간 포함)로 봅니다. `python -m bot.doctor` 가 모델 설치 여부를 알려 줍니다.
 
 ### 캐릭터 생성 파이프라인 (스킬 + `scripts/character_pipeline.py`)
 - 새 캐릭터는 메인 스킬 `character-pipeline` 이 `character-research`, `character-profile`, `character-prompt`, `character-visual`, `character-emotion`, `character-schedule`, `character-integration`, `character-validation` 8개 하위 스킬을 순서대로 조정해 만듭니다(`.claude/skills/`). 파일 하나만 빠르게 고치는 일은 기존 `character-writer` 를 씁니다.
