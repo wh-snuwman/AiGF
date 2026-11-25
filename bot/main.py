@@ -74,7 +74,7 @@ emojis = Emojis()
 ecfg = settings.get("emoji", {})
 vcfg = settings.get("vision", {})
 inicfg = settings.get("initiative", {})
-# 한 서버에 캐릭터가 여럿일 때: 웹훅으로 캐릭터마다 이름/아바타를 바꿔 말하고, 캐릭터끼리도 가끔 주고받는다
+# 서버 채널에서는 웹훅으로 캐릭터 이름과 아바타를 표시한다. 여러 캐릭터는 가끔 서로 대화한다.
 mcfg = {"webhook": True, "webhook_name": "AIGF", "chain_chance": 0.45, "chain_decay": 0.5, "max_chain": 2,
         "chain_delay_sec": [2.5, 6.0], "human_window_sec": 600, **settings.get("multi", {})}
 
@@ -481,8 +481,8 @@ async def send_bubbles(
     t_send = time.time()
     sent_ids: list[int] = []
     rendered: list[str] = []
-    multi = len(hub.ctx().chars) > 1 and mcfg.get("webhook", True) and not isinstance(channel, discord.DMChannel)
-    wh = await get_webhook(channel, persona.char_id) if multi else None   # 캐릭터가 여럿이면 캐릭터별 웹훅으로 이름/아바타를 달고 말한다
+    use_webhook = mcfg.get("webhook", True) and not isinstance(channel, discord.DMChannel)
+    wh = await get_webhook(channel, persona.char_id) if use_webhook else None
     cname = persona.name
     avatar = None if avatar_file(persona.char_id) else (persona.data.get("avatar_url") or None)   # 올린 사진이 있으면 웹훅 자체 아바타를 쓴다
     if not avatar and not avatar_file(persona.char_id) and persona.char_id == hub.ctx().primary and bot.user:
@@ -510,14 +510,14 @@ async def send_bubbles(
             except discord.HTTPException as e:
                 log.warning("웹훅 전송 실패, 일반 메시지로 대체: %s", e)
                 bot.webhooks.pop((getattr(getattr(channel, "parent", channel), "id", 0), persona.char_id), None)
-        if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id) and not multi:
+        if i == 0 and reply_to is not None and not (bot.user and reply_to.author.id == bot.user.id) and not use_webhook:
             try:
                 m_ = await reply_to.reply(text, mention_author=False)
                 sent_ids.append(m_.id)
                 continue
             except discord.HTTPException:
                 pass
-        if multi and i == 0:
+        if use_webhook and i == 0:
             text = f"**{cname}** {text}"                          # 웹훅을 쓸 수 없을 때는 누가 말하는지 이름을 앞에 붙인다
         m_ = await channel.send(text)
         sent_ids.append(m_.id)
@@ -1827,7 +1827,7 @@ async def guild_char_autocomplete(interaction: discord.Interaction, current: str
     ][:25]
 
 
-@bot.tree.command(name="캐릭터스왑", description="(별칭: /캐릭터 로 통합됨) 이 서버의 캐릭터를 교체하거나, 캐릭터를 더 추가/제거해요 (여러 명이면 웹훅으로 각자 이름/아바타로 말해요)")
+@bot.tree.command(name="캐릭터스왑", description="(별칭: /캐릭터 로 통합됨) 이 서버의 캐릭터를 교체하거나, 캐릭터를 더 추가/제거해요")
 @app_commands.describe(character="대상 캐릭터 (목록일 땐 생략)", mode="교체(기본) / 추가(같이 활동) / 제거 / 목록",
                        old="교체할 기존 캐릭터 (생략하면 기본 캐릭터)",
                        clear_history="교체할 때 대화 기록을 지울지 (기본: 지움)",
@@ -2017,8 +2017,8 @@ async def set_avatar(interaction: discord.Interaction, character: Optional[str],
         await interaction.followup.send("이미지를 읽지 못했어요. 다른 사진으로 해 주세요.", ephemeral=True)
         return
     note = ""
-    if cid == hub.ctx().primary and len(hub.ctx().chars) < 2:
-        note = "\n-# 지금은 캐릭터가 한 명이라 봇 계정 프로필로 말해요. 캐릭터가 둘 이상이면 이 사진이 쓰여요 (봇 계정 사진은 디스코드 개발자 포털에서 바꿔요)."
+    if not mcfg.get("webhook", True):
+        note = "\n-# 웹훅 설정이 꺼져 있어요. 웹훅을 켜면 서버 채널에서 이 사진을 사용해요."
     await interaction.followup.send(f"**{name}** 프로필 사진을 바꿨어요. 다음 말부터 적용돼요.{note}", ephemeral=True)
 
 
