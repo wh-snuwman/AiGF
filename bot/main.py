@@ -160,6 +160,8 @@ class AdminTree(app_commands.CommandTree):
 
     async def _call(self, interaction: discord.Interaction) -> None:
         await super()._call(interaction)
+        if interaction.type is discord.InteractionType.autocomplete or interaction.user.id not in ADMIN_IDS:
+            return
         try:
             hub.sync_peers()          # 적극성/싸움 기본값/기록·웹 켜기 같은 서버 공통 설정을 같은 서버의 모든 캐릭터에 맞춘다
         except Exception:  # noqa: BLE001
@@ -171,7 +173,10 @@ class AdminTree(app_commands.CommandTree):
             await hub.ensure(gid, getattr(interaction.guild, "name", ""))
             hub.use(gid)                       # 이 명령은 이 서버의 데이터/설정만 바꾼다
             return True
-        await interaction.response.send_message("관리자만 사용할 수 있어요.", ephemeral=True)
+        if interaction.type is discord.InteractionType.autocomplete:
+            await interaction.response.autocomplete([])
+        else:
+            await interaction.response.send_message("관리자만 사용할 수 있어요.", ephemeral=True)
         return False
 
 
