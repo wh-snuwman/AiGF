@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Optional
 
 from .config import load_yaml
+from .corrector import declared_register
 from .emotion_profile import EmotionProfile, build_profile
 from .memory import Memory
 from .schedule import Schedule
@@ -614,7 +615,11 @@ class Mood:
             out.append("ㅋㅋ가끔")
         tension = 0.6 * s["energy"] + 0.4 * s["interest"]
         out.append("텐션↑" if tension > 0.75 else "텐션↓" if tension <= 0.45 else "텐션보통")
-        out.append("존댓말섞임" if (e.formal or aff < -0.4) else "반말")
+        speech = self.persona.data.get("speech_style", "") if self.persona else ""
+        register = declared_register(speech)
+        if register not in ("존댓말", "반말"):
+            register = "존댓말섞임" if (e.formal or aff < -0.4) else "반말"
+        out.append(register)
         if s["energy"] > 0.7 and s["mood"] > 0.3:
             out.append("!허용")
         return out

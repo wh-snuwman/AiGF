@@ -11,6 +11,7 @@ try:
     from bot.schedule import Schedule
     from bot.visual import build
     from bot.mood import EMO, Mood
+    from bot.persona import Persona
 except ImportError as _e:
     raise unittest.SkipTest(f"의존성 없음: {_e}")
 
@@ -65,6 +66,20 @@ class AffinityStageTests(unittest.TestCase):
         self.assertEqual(names[0], "극단적 혐오")
         self.assertEqual(Mood.aff_label(1.0)[0], "서로 좋아함")
         self.assertEqual(Mood.aff_label(0.1)[0], "평범한 친구")            # 기본값은 보통 관계
+
+
+class CharacterRelationshipTests(unittest.TestCase):
+    def test_relationship_is_reciprocal_and_matched_by_id(self):
+        kei, aris = Persona("kei"), Persona("aris")
+        self.assertIn("아리스", kei.peer_relationship("aris"))
+        self.assertIn("케이", aris.peer_relationship("kei"))
+        self.assertEqual(kei.peer_relationship("midori"), "")
+        self.assertEqual(Persona("midori").peer_relationship("kei"), "")
+
+    def test_kei_mood_displays_declared_register(self):
+        mood = Mood(None, Persona("kei"), None)
+        self.assertIn("존댓말", mood.knobs())
+        self.assertNotIn("반말", mood.knobs())
 
 
 class VisualTests(unittest.TestCase):

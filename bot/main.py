@@ -1273,12 +1273,11 @@ def maybe_chain(channel, speaker_cid: str, bubbles: list[str], depth: int) -> No
     asyncio.create_task(respond_chain(channel, ctx.gid, cid, speaker_cid, " ".join(bubbles), depth))
 
 
-def peer_note(pname: str, topic: str = "") -> str:
-    """캐릭터가 다른 캐릭터 말에 답할 때의 지시. 서로 질문만 되돌려주며 같은 틀을 반복하는 핑퐁을 막는다."""
-    return (f"방금 같은 방 친구 캐릭터 {pname}이(가) 한 말에 대한 반응이다. 사람이 아니라 친구 캐릭터에게 하는 말이다. "
-            "네 말투(반말/존댓말)를 그대로 지키고 상대의 말투나 문장 틀을 따라 하지 마라. "
-            "질문을 되돌려주지 말고 구체적인 의견이나 제안이나 경험 하나를 말해서 대화를 앞으로 진행시켜라."
-            + (f" (주제: {topic})" if topic else ""))
+def peer_note(pname: str, topic: str = "", relationship: str = "") -> str:
+    """다른 캐릭터와 대화할 때 직전 발화와 관계를 반영한다."""
+    return (f"친구 캐릭터 {pname}의 말에 네 말투로 답해라. 새 의견이나 제안 하나를 보태고 함께한 일을 지어내지 마라."
+            + (f" 주제: {topic}" if topic else "")
+            + (f" 관계: {relationship}" if relationship else ""))
 
 
 def _bigrams(s: str) -> set[str]:
@@ -1311,7 +1310,7 @@ async def respond_chain(channel, gid: int, cid: str, from_cid: str, text: str, d
             async with channel.typing():
                 bubbles = await engine.reply(
                     ch, char_uid(from_cid), from_name, text, can_skip=True, priority=False,
-                    extra_note=peer_note(from_name))
+                    extra_note=peer_note(from_name, relationship=persona.peer_relationship(from_cid)))
         if bubbles and stale_talk(" ".join(bubbles), [text]):
             bubbles = []                                      # 상대 말을 거의 그대로 되돌려주는 말이면 보내지 않는다
         if bubbles:
@@ -1950,7 +1949,7 @@ async def run_talk(channel, gid: int, starter: str, topic: str, rounds: int, uid
                 else:
                     pname = ctx.chars[prev].persona.name
                     text = last_text
-                    note = peer_note(pname, topic)
+                    note = peer_note(pname, topic, persona.peer_relationship(prev))
                     from_uid, from_name = char_uid(prev), pname
                 async with bot.gpu_lock:
                     async with channel.typing():

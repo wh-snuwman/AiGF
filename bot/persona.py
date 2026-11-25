@@ -132,6 +132,9 @@ class Persona:
     def fight_replies(self) -> list[str]:
         return list(self.data.get("fight_replies") or self.common.get("fight_replies") or ["뭐래"])
 
+    def peer_relationship(self, char_id: str) -> str:
+        return (self.data.get("peer_relationships") or {}).get(char_id, "")
+
     # ---------- 컨셉 훅 ----------
     def concept_hints(self, text: str, limit: int = 2) -> list[str]:
         """화제가 캐릭터 컨셉과 맞닿아 있으면 컨셉에 맞는 반응 힌트를 (확률적으로) 돌려준다.
